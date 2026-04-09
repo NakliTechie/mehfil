@@ -4,6 +4,11 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="color-scheme" content="light dark">
+<!-- CSP: no plugins, no base-tag injection, no external form targets.
+     Inline scripts are required for this single-file app architecture (no build step),
+     so script-src 'unsafe-inline' is unavoidable. The primary XSS defence is escapeHTML()
+     on all user content, plus sanitizeUrl() on any rendered links. -->
+<meta http-equiv="Content-Security-Policy" content="object-src 'none'; base-uri 'self'; form-action 'self';">
 <title>Mehfil</title>
 <style>
   :root {
@@ -764,6 +769,115 @@
     overflow-x: auto;
     font-size: 12px;
   }
+
+  /* ---- Search palette (Slice 5 / WT-18, WT-19) ---- */
+  .search-overlay {
+    position: fixed; inset: 0; z-index: 400;
+    background: rgba(0,0,0,0.45);
+    display: flex; align-items: flex-start; justify-content: center;
+    padding-top: 12vh;
+  }
+  .search-palette {
+    background: var(--bg-elev);
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    box-shadow: 0 8px 40px rgba(0,0,0,0.2);
+    width: 620px; max-width: calc(100vw - 48px);
+    overflow: hidden;
+  }
+  .search-input-row {
+    display: flex; align-items: center; gap: 10px;
+    padding: 14px 16px;
+    border-bottom: 1px solid var(--line);
+  }
+  .search-input-icon { font-size: 16px; color: var(--fg-dim); flex-shrink: 0; }
+  .search-input-row input {
+    flex: 1; font: inherit; font-size: 16px;
+    background: transparent; border: none; outline: none; color: var(--fg);
+  }
+  .search-kbd {
+    font-family: var(--mono); font-size: 11px; color: var(--fg-dim);
+    background: var(--bg-sunken); border: 1px solid var(--line);
+    border-radius: 4px; padding: 2px 5px; flex-shrink: 0;
+  }
+  .search-results { max-height: 420px; overflow-y: auto; }
+  .search-result {
+    padding: 10px 16px; cursor: pointer;
+    border-bottom: 1px solid var(--line);
+    transition: background 0.08s;
+  }
+  .search-result:hover, .search-result.focused { background: var(--bg-sunken); }
+  .search-result:last-child { border-bottom: none; }
+  .search-result-meta {
+    display: flex; gap: 8px; align-items: center;
+    font-size: 11px; color: var(--fg-dim); margin-bottom: 3px;
+  }
+  .search-result-body { font-size: 13px; color: var(--fg); white-space: pre-wrap; word-break: break-word; }
+  .search-result-body mark {
+    background: var(--accent); color: var(--accent-fg);
+    border-radius: 2px; padding: 0 2px; font-style: normal;
+  }
+  .search-ws-header {
+    padding: 6px 16px 4px;
+    font-size: 11px; font-weight: 600; color: var(--fg-dim);
+    text-transform: uppercase; letter-spacing: 0.05em;
+    background: var(--bg-sunken); border-bottom: 1px solid var(--line);
+  }
+  .search-empty { padding: 28px; text-align: center; color: var(--fg-dim); font-size: 13px; }
+
+  /* ---- Settings tabs (Slice 5 / WT-20, WT-21, WT-22) ---- */
+  .settings-tabs {
+    display: flex;
+    border-bottom: 1px solid var(--line);
+    margin: 0 -28px;
+    padding: 0 20px;
+  }
+  .settings-tab {
+    font: inherit; background: none; border: none;
+    border-bottom: 2px solid transparent;
+    padding: 10px 12px 9px; cursor: pointer;
+    color: var(--fg-mute); font-size: 13px;
+    margin-bottom: -1px; border-radius: 0;
+    transition: color 0.1s;
+  }
+  .settings-tab:hover { color: var(--fg); border-color: transparent; }
+  .settings-tab.active { color: var(--accent); border-bottom-color: var(--accent); font-weight: 500; }
+  .settings-tab-body { margin-top: 18px; }
+
+  /* ---- Admin member rows (Slice 5 / WT-22, WT-23) ---- */
+  .member-row {
+    display: flex; align-items: center; gap: 10px;
+    padding: 8px 0; border-bottom: 1px solid var(--line);
+  }
+  .member-row:last-child { border-bottom: none; }
+  .member-row-info { flex: 1; min-width: 0; }
+  .member-row-name { font-size: 13px; font-weight: 500; }
+  .member-row-fp { font-family: var(--mono); font-size: 10px; color: var(--fg-dim); }
+  .role-badge {
+    font-size: 10px; padding: 2px 7px; border-radius: 4px; font-weight: 600;
+    flex-shrink: 0;
+    background: var(--bg-sunken); color: var(--fg-dim);
+  }
+  .role-badge.owner { background: var(--accent); color: var(--accent-fg); }
+  .role-badge.admin { background: var(--ok); color: white; }
+
+  /* ---- Pending promotion card (Slice 5 / WT-23) ---- */
+  .promo-card {
+    background: var(--bg-sunken); border: 1px solid var(--line);
+    border-radius: 8px; padding: 12px 14px; margin-bottom: 10px;
+  }
+  .promo-card-title { font-size: 12px; font-weight: 600; margin-bottom: 4px; }
+  .promo-card-sub { font-size: 11px; color: var(--fg-dim); margin-bottom: 10px; }
+  .promo-card-actions { display: flex; gap: 8px; }
+
+  /* ---- Relay config rows (Slice 5 / WT-21) ---- */
+  .relay-row {
+    display: flex; align-items: center; gap: 10px;
+    padding: 8px 0; border-bottom: 1px solid var(--line);
+  }
+  .relay-row:last-child { border-bottom: none; }
+  .relay-row-info { flex: 1; min-width: 0; font-size: 12px; }
+  .relay-row-url { font-family: var(--mono); font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 </style>
 </head>
 <body>
@@ -1535,6 +1649,13 @@ async function idbGetAll(db, store) {
 async function idbDelete(db, store, key) {
   await reqAsPromise(txStore(db, store, "readwrite").delete(key));
 }
+// Return [{key, value}] pairs from a store that uses out-of-line keys.
+// Used by exportWorkspace to preserve the keys-store key names.
+async function idbGetAllEntries(db, store) {
+  const keys   = await reqAsPromise(txStore(db, store).getAllKeys());
+  const values = await reqAsPromise(txStore(db, store).getAll());
+  return keys.map((k, i) => ({ key: k, value: values[i] }));
+}
 
 // Dev-only multi-tab namespacing. When the URL carries `?as=<label>`, all
 // IndexedDB databases (global + per-workspace) get prefixed so multiple tabs
@@ -1970,7 +2091,10 @@ const Workspace = {
     // messages from Alice" banners.
     const gaps = new Map();   // Map<user_id, Map<device_id, max_known_counter>>
 
-    return { wsDB, meta, channels, members, channelKeys, rootKey, messages, presence, hwm, causalBuffer, doc, gaps };
+    // Load relay configs stored in meta (Slice 5 / WT-21).
+    const relays = meta.relays || [];
+
+    return { wsDB, meta, channels, members, channelKeys, rootKey, messages, presence, hwm, causalBuffer, doc, gaps, relays };
   },
 
   async sendMessage({ wsDB, meta, identity, channelId, channelKey, body, vectorClock, mentions, threadId }) {
@@ -3364,69 +3488,385 @@ function openRestoreModal() {
 }
 
 /* ------------------------------------------------------------
- *  §11  Settings modal (minimal — backup-only for Slice 1)
+ *  §11  Settings modal — Slice 5 full tabbed UI (WT-20, WT-21, WT-22)
+ *
+ *  Tabs:
+ *    Identity  — fingerprint, backup, re-download
+ *    Workspace — rename, export, relay configs
+ *    Admin     — member management (owner/admin only)
  * ------------------------------------------------------------ */
-function openSettings() {
+function openSettings(initialTab) {
+  State._settingsTab = initialTab || "identity";
   setState({ modal: "settings" });
 }
 
 function renderSettingsModal() {
-  const myUserId = bytesToB64Url(State.identity.pubkey);
-  const me = State.current.members.find(m => m.id === myUserId) || State.current.members[0];
-  const fp = me.fp;   // pre-computed during Workspace.open
-  const wsName = State.current.meta.name;
+  // Guard: avoid duplicating the modal on rapid re-renders.
+  if (document.querySelector('.modal-bg[data-settings]')) return;
+  const myUserId   = bytesToB64Url(State.identity.pubkey);
+  const current    = State.current;
+  const me         = current.members.find(m => m.id === myUserId) || current.members[0];
+  const isAdminUser = me && (me.role === "owner" || me.role === "admin");
+  const tab        = State._settingsTab || "identity";
+  const wsName     = current.meta.name;
+
   const wrap = document.createElement("div");
   wrap.className = "modal-bg";
+  wrap.dataset.settings = "1";
   wrap.innerHTML = `
-    <div class="card" style="max-width: 480px;">
-      <h1>Settings</h1>
-      <div class="field">
-        <label>Workspace name</label>
-        <div class="row" style="gap: 8px;">
-          <input type="text" id="ws-rename" value="${escapeHTML(wsName)}" maxlength="64" style="flex: 1;">
-          <button id="settings-rename">Rename</button>
-        </div>
-        <div class="err" id="rename-err"></div>
+    <div class="card" style="max-width: 540px; max-height: calc(100vh - 60px); overflow-y: auto;">
+      <div class="row" style="margin-bottom: 4px;">
+        <h1 style="margin: 0; font-size: 20px; flex: 1;">Settings</h1>
+        <button class="icon-btn" id="settings-close" style="font-size: 18px; padding: 2px 7px;">✕</button>
       </div>
-      <div class="field">
-        <label>Your fingerprint</label>
-        <div class="mono" style="background: var(--bg-sunken); padding: 10px; border-radius: 6px;">${escapeHTML(fp)}</div>
+      <div class="settings-tabs">
+        <button class="settings-tab ${tab === "identity"  ? "active" : ""}" data-stab="identity">Identity</button>
+        <button class="settings-tab ${tab === "workspace" ? "active" : ""}" data-stab="workspace">Workspace</button>
+        ${isAdminUser ? `<button class="settings-tab ${tab === "admin" ? "active" : ""}" data-stab="admin">Admin</button>` : ""}
       </div>
-      <div class="field">
-        <label>Backup status</label>
-        <div>${State.identity.backed_up
-          ? `<span style="color: var(--ok);">✓ Backed up</span>`
-          : `<span style="color: var(--warn);">⚠ Not backed up</span>`
-        }</div>
-      </div>
-      <div class="row">
-        <button id="settings-close">Close</button>
-        <div class="grow"></div>
-        <button class="primary" id="settings-backup">${State.identity.backed_up ? "Re-download backup" : "Back up identity"}</button>
+      <div class="settings-tab-body" id="stab-body">
+        ${renderSettingsTabBody(tab, current, me, isAdminUser, wsName)}
       </div>
     </div>
   `;
   document.body.appendChild(wrap);
   wrap.querySelector("#settings-close").onclick = () => { wrap.remove(); closeModal(); };
-  wrap.querySelector("#settings-backup").onclick = () => { wrap.remove(); openBackupModal(); };
-  wrap.querySelector("#settings-rename").onclick = async () => {
+
+  // Tab switching — rebuild body in place without closing the modal.
+  wrap.querySelectorAll(".settings-tab").forEach(btn => {
+    btn.onclick = () => {
+      const t = btn.dataset.stab;
+      State._settingsTab = t;
+      wrap.querySelectorAll(".settings-tab").forEach(b => b.classList.toggle("active", b.dataset.stab === t));
+      wrap.querySelector("#stab-body").innerHTML = renderSettingsTabBody(t, current, me, isAdminUser, wsName);
+      wireSettingsTab(t, wrap, current, me, wsName);
+    };
+  });
+  wireSettingsTab(tab, wrap, current, me, wsName);
+}
+
+function renderSettingsTabBody(tab, current, me, isAdminUser, wsName) {
+  if (tab === "identity") return renderSettingsIdentityTab(me);
+  if (tab === "workspace") return renderSettingsWorkspaceTab(wsName, current);
+  if (tab === "admin" && isAdminUser) return renderSettingsAdminTab(current, me);
+  return "";
+}
+
+function renderSettingsIdentityTab(me) {
+  return `
+    <div class="field">
+      <label>Your fingerprint</label>
+      <div class="mono" style="background: var(--bg-sunken); padding: 10px; border-radius: 6px; font-size: 12px;">${escapeHTML(me.fp)}</div>
+    </div>
+    <div class="field">
+      <label>Backup status</label>
+      <div>${State.identity.backed_up
+        ? `<span style="color: var(--ok);">✓ Backed up</span>`
+        : `<span style="color: var(--warn);">⚠ Not backed up — if you lose this device, your identity is gone</span>`
+      }</div>
+    </div>
+    <div class="row">
+      <div class="grow"></div>
+      <button class="primary" id="s-backup-btn">${State.identity.backed_up ? "Re-download backup" : "Back up identity"}</button>
+    </div>
+  `;
+}
+
+function renderSettingsWorkspaceTab(wsName, current) {
+  const relays = current.relays || [];
+  const relayRows = relays.length === 0
+    ? `<div style="color: var(--fg-dim); font-size: 12px; padding: 8px 0;">No relay configured. Using gossip (LAN / direct WebRTC) only.</div>`
+    : relays.map((r, i) => `
+        <div class="relay-row">
+          <div class="relay-row-info">
+            <div style="font-size: 12px; font-weight: 500;">${escapeHTML(r.type)}</div>
+            <div class="relay-row-url">${escapeHTML(r.url)}</div>
+          </div>
+          <button class="danger" data-remove-relay="${i}" style="font-size: 11px; padding: 4px 8px;">Remove</button>
+        </div>`).join("");
+
+  return `
+    <div class="field">
+      <label>Workspace name</label>
+      <div class="row" style="gap: 8px;">
+        <input type="text" id="ws-rename" value="${escapeHTML(wsName)}" maxlength="64" style="flex: 1;">
+        <button id="settings-rename">Rename</button>
+      </div>
+      <div class="err" id="rename-err"></div>
+    </div>
+    <div class="field">
+      <label>Relays</label>
+      <div id="relay-list">${relayRows}</div>
+      <button id="btn-add-relay" style="margin-top: 8px; font-size: 12px; padding: 6px 12px;">+ Add relay</button>
+      <div id="relay-form" style="display: none; margin-top: 10px; padding: 12px; background: var(--bg-sunken); border-radius: 8px;">
+        <div class="field" style="margin-bottom: 8px;">
+          <label>Type</label>
+          <select id="relay-type" style="font: inherit; background: var(--bg-elev); border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px; width: 100%; color: var(--fg);">
+            <option value="cloudflare-r2">Cloudflare R2</option>
+            <option value="s3">S3-compatible</option>
+          </select>
+        </div>
+        <div class="field" style="margin-bottom: 8px;">
+          <label>URL</label>
+          <input type="text" id="relay-url" placeholder="https://..." style="font-size: 13px;">
+        </div>
+        <div class="field" style="margin-bottom: 10px;">
+          <label>Bearer token</label>
+          <input type="password" id="relay-token" placeholder="sk-...">
+        </div>
+        <div class="err" id="relay-err"></div>
+        <div class="row">
+          <button id="relay-cancel">Cancel</button>
+          <div class="grow"></div>
+          <button id="relay-test" style="font-size: 12px;">Test connection</button>
+          <button class="primary" id="relay-save">Save relay</button>
+        </div>
+      </div>
+    </div>
+    <div class="field">
+      <label>Export workspace</label>
+      <div style="font-size: 12px; color: var(--fg-mute); margin-bottom: 8px;">Download an encrypted backup of all messages, channels, and keys.</div>
+      <button id="btn-export-ws">Export workspace…</button>
+    </div>
+    <div class="field">
+      <label>Import workspace</label>
+      <div style="font-size: 12px; color: var(--fg-mute); margin-bottom: 8px;">Restore a workspace from a <code>.workspace</code> backup file.</div>
+      <button id="btn-import-ws">Import workspace…</button>
+    </div>
+  `;
+}
+
+function renderSettingsAdminTab(current, me) {
+  const myUserId = me.id;
+  const pendingPromos = current.doc
+    ? WorkspaceDoc.getPendingPromotions(current.doc)
+    : [];
+
+  const memberRows = current.members.map(m => {
+    const badgeClass = m.role === "owner" ? "owner" : m.role === "admin" ? "admin" : "";
+    const canRemove = (me.role === "owner" || me.role === "admin") && m.id !== myUserId && m.role !== "owner";
+    const canPromote = (me.role === "owner" || me.role === "admin") && m.id !== myUserId && m.role === "member";
+    return `
+      <div class="member-row">
+        <div class="avatar" style="background: ${avatarColorFor(m.id)}; width: 28px; height: 28px; font-size: 11px;">${escapeHTML(initials(m.name))}</div>
+        <div class="member-row-info">
+          <div class="member-row-name">${escapeHTML(m.name)}${m.id === myUserId ? " <span style='color:var(--fg-dim);font-size:11px;'>(you)</span>" : ""}</div>
+          <div class="member-row-fp">${escapeHTML(m.fp || "")}</div>
+        </div>
+        <span class="role-badge ${badgeClass}">${escapeHTML(m.role)}</span>
+        ${canPromote ? `<button class="icon-btn" data-draft-promo="${escapeHTML(m.id)}" title="Propose promotion to admin" style="font-size: 12px; padding: 3px 8px;">Promote…</button>` : ""}
+        ${canRemove ? `<button class="danger icon-btn" data-remove-member="${escapeHTML(m.id)}" title="Remove from workspace" style="font-size: 12px; padding: 3px 8px;">Remove</button>` : ""}
+      </div>
+    `;
+  }).join("");
+
+  const promoCards = pendingPromos.map(pp => {
+    const target = current.members.find(m => m.id === pp.target_id);
+    const drafter = current.members.find(m => m.id === pp.drafter_id);
+    const supporters = pp.cosigs || [];
+    const alreadySupported = supporters.some(s => s.user_id === myUserId);
+    const threshold = 2;
+    const canCosign = !alreadySupported && pp.target_id !== myUserId;
+    const canFinalize = supporters.length >= threshold;
+    const expiresIn = Math.max(0, Math.round((pp.expires_at - Date.now()) / 86400000));
+    return `
+      <div class="promo-card">
+        <div class="promo-card-title">Promote ${escapeHTML(target?.name || pp.target_id)} to admin</div>
+        <div class="promo-card-sub">
+          Proposed by ${escapeHTML(drafter?.name || pp.drafter_id)} · ${supporters.length}/${threshold} supporters · expires in ${expiresIn}d
+        </div>
+        <div class="promo-card-actions">
+          ${canCosign ? `<button class="primary" data-cosign="${escapeHTML(pp.id)}" style="font-size: 12px; padding: 5px 12px;">Support this promotion</button>` : ""}
+          ${canFinalize ? `<button class="primary" data-finalize-promo="${escapeHTML(pp.id)}" style="font-size: 12px; padding: 5px 12px; background: var(--ok); border-color: var(--ok);">Activate promotion</button>` : ""}
+          ${alreadySupported ? `<span style="color: var(--ok); font-size: 12px;">✓ You supported this</span>` : ""}
+        </div>
+      </div>
+    `;
+  }).join("");
+
+  return `
+    <div class="field">
+      <label>Members</label>
+      <div id="admin-member-list">${memberRows}</div>
+    </div>
+    ${pendingPromos.length > 0 ? `
+      <div class="field">
+        <label>Pending promotions</label>
+        <div id="admin-promo-list">${promoCards}</div>
+      </div>
+    ` : ""}
+    <div class="err" id="admin-err"></div>
+  `;
+}
+
+function wireSettingsTab(tab, wrap, current, me, wsName) {
+  if (tab === "identity") {
+    const btn = wrap.querySelector("#s-backup-btn");
+    if (btn) btn.onclick = () => { wrap.remove(); openBackupModal(); };
+
+  } else if (tab === "workspace") {
     const $err = wrap.querySelector("#rename-err");
-    $err.textContent = "";
-    const newName = wrap.querySelector("#ws-rename").value.trim();
-    if (!newName) { $err.textContent = "Name is required."; return; }
-    if (newName === wsName) { $err.textContent = "Same as current name."; return; }
-    wrap.querySelector("#settings-rename").disabled = true;
-    try {
-      // Mutate the Yjs doc locally, capture the update, broadcast.
-      const update = WorkspaceDoc.setName(State.current.doc, newName);
-      await sendWorkspacePatch(State.current, update);
+    wrap.querySelector("#settings-rename").onclick = async () => {
+      $err.textContent = "";
+      const newName = wrap.querySelector("#ws-rename").value.trim();
+      if (!newName) { $err.textContent = "Name is required."; return; }
+      if (newName === wsName) { $err.textContent = "Same as current name."; return; }
+      wrap.querySelector("#settings-rename").disabled = true;
+      try {
+        const update = WorkspaceDoc.setName(current.doc, newName);
+        await sendWorkspacePatch(current, update);
+        wrap.remove();
+        setState({ modal: null });
+      } catch (e) {
+        $err.textContent = e.message;
+        wrap.querySelector("#settings-rename").disabled = false;
+      }
+    };
+
+    // Relay management
+    const $addBtn = wrap.querySelector("#btn-add-relay");
+    const $relayForm = wrap.querySelector("#relay-form");
+    $addBtn.onclick = () => {
+      $relayForm.style.display = "block";
+      $addBtn.style.display = "none";
+    };
+    wrap.querySelector("#relay-cancel").onclick = () => {
+      $relayForm.style.display = "none";
+      $addBtn.style.display = "";
+    };
+    wrap.querySelector("#relay-test").onclick = async () => {
+      const $re = wrap.querySelector("#relay-err");
+      $re.textContent = "";
+      const url = wrap.querySelector("#relay-url").value.trim();
+      const token = wrap.querySelector("#relay-token").value.trim();
+      if (!url) { $re.textContent = "URL required."; return; }
+      try {
+        const probe = new URL(`/ws/${encodeURIComponent(current.meta.id)}/cursor`, url);
+        const resp = await fetch(probe.href, {
+          headers: token ? { "Authorization": "Bearer " + token } : {}
+        });
+        if (resp.ok || resp.status === 404) {
+          $re.style.color = "var(--ok)";
+          $re.textContent = "✓ Relay reachable (status " + resp.status + ")";
+          $re.style.color = "var(--ok)";
+        } else {
+          $re.textContent = "Relay returned " + resp.status;
+        }
+      } catch (e) {
+        $re.textContent = "Connection failed: " + e.message;
+      }
+    };
+    wrap.querySelector("#relay-save").onclick = async () => {
+      const $re = wrap.querySelector("#relay-err");
+      $re.textContent = "";
+      const url = wrap.querySelector("#relay-url").value.trim();
+      const token = wrap.querySelector("#relay-token").value.trim();
+      const type = wrap.querySelector("#relay-type").value;
+      if (!url) { $re.textContent = "URL required."; return; }
+      try { new URL(url); } catch (_) { $re.textContent = "Invalid URL."; return; }
+      const relay = { type, url, token, added_at: Date.now() };
+      if (!current.relays) current.relays = [];
+      current.relays.push(relay);
+      // Persist relay config in workspace meta
+      current.meta.relays = current.relays;
+      await idbPut(current.wsDB, "keys", current.meta, "workspace_meta");
       wrap.remove();
       setState({ modal: null });
-    } catch (e) {
-      $err.textContent = e.message;
-      wrap.querySelector("#settings-rename").disabled = false;
-    }
-  };
+    };
+    wrap.querySelectorAll("[data-remove-relay]").forEach(btn => {
+      btn.onclick = async () => {
+        const idx = parseInt(btn.dataset.removeRelay, 10);
+        if (!isNaN(idx)) {
+          current.relays.splice(idx, 1);
+          current.meta.relays = current.relays;
+          await idbPut(current.wsDB, "keys", current.meta, "workspace_meta");
+          wrap.remove();
+          setState({ modal: null });
+        }
+      };
+    });
+
+    // Export / import
+    wrap.querySelector("#btn-export-ws").onclick = () => { wrap.remove(); openExportModal(); };
+    wrap.querySelector("#btn-import-ws").onclick = () => { wrap.remove(); openImportModal(); };
+
+  } else if (tab === "admin") {
+    const $err = wrap.querySelector("#admin-err");
+
+    // Remove member
+    wrap.querySelectorAll("[data-remove-member]").forEach(btn => {
+      btn.onclick = async () => {
+        const targetId = btn.dataset.removeMember;
+        const target = current.members.find(m => m.id === targetId);
+        if (!target) return;
+        const confirmed = confirm(
+          `Remove ${target.name} from this workspace?\n\n` +
+          `They'll keep any messages they've already received. ` +
+          `New keys will be distributed to remaining members so they can't read future messages.`
+        );
+        if (!confirmed) return;
+        btn.disabled = true;
+        try {
+          await sendMemberRemove(current, targetId);
+          wrap.remove();
+          setState({ modal: null });
+        } catch (e) {
+          $err.textContent = e.message;
+          btn.disabled = false;
+        }
+      };
+    });
+
+    // Draft promotion
+    wrap.querySelectorAll("[data-draft-promo]").forEach(btn => {
+      btn.onclick = async () => {
+        const targetId = btn.dataset.draftPromo;
+        const target = current.members.find(m => m.id === targetId);
+        if (!target) return;
+        btn.disabled = true;
+        try {
+          await draftPromotion(current, targetId);
+          wrap.remove();
+          openSettings("admin");
+        } catch (e) {
+          $err.textContent = e.message;
+          btn.disabled = false;
+        }
+      };
+    });
+
+    // Co-sign promotion
+    wrap.querySelectorAll("[data-cosign]").forEach(btn => {
+      btn.onclick = async () => {
+        const proposalId = btn.dataset.cosign;
+        btn.disabled = true;
+        try {
+          await addCoSignPromotion(current, proposalId);
+          wrap.remove();
+          openSettings("admin");
+        } catch (e) {
+          $err.textContent = e.message;
+          btn.disabled = false;
+        }
+      };
+    });
+
+    // Finalize promotion
+    wrap.querySelectorAll("[data-finalize-promo]").forEach(btn => {
+      btn.onclick = async () => {
+        const proposalId = btn.dataset.finalizePromo;
+        btn.disabled = true;
+        try {
+          await finalizePromotion(current, proposalId);
+          wrap.remove();
+          setState({ modal: null });
+        } catch (e) {
+          $err.textContent = e.message;
+          btn.disabled = false;
+        }
+      };
+    });
+  }
 }
 
 /* ------------------------------------------------------------
@@ -5411,6 +5851,38 @@ const WorkspaceDoc = {
     return out;
   },
 
+  // ========== Pending promotions (Slice 5 / §4.3) ==========
+  // Stored in the Yjs doc so they're shared with peers via workspace.patch.
+
+  setPendingPromotion(doc, proposal) {
+    return this.mutate(doc, () => {
+      if (!doc.getMap("pending_promotions")) {
+        // Older docs that were created before Slice 5 may not have this map.
+        // Yjs creates the map lazily on first access.
+      }
+      doc.getMap("pending_promotions").set(
+        proposal.id,
+        JSON.parse(JSON.stringify(proposal))
+      );
+    });
+  },
+
+  removePendingPromotion(doc, proposalId) {
+    return this.mutate(doc, () => {
+      const m = doc.getMap("pending_promotions");
+      if (m.has(proposalId)) m.delete(proposalId);
+    });
+  },
+
+  getPendingPromotions(doc) {
+    const m = doc.getMap("pending_promotions");
+    const out = [];
+    m.forEach((v) => {
+      if (v && !v.removed) out.push({ ...v });
+    });
+    return out;
+  },
+
   /**
    * Build an initial Yjs doc from the existing (pre-4b.2) projected
    * state. Used by the migration path in Workspace.open.
@@ -5749,6 +6221,9 @@ const EnvelopeDispatch = {
             lc: env.lc
           });
           current.messages.sort((a, b) => a.ts - b.ts);
+          // Add to on-disk search index (Slice 5 / WT-18). Non-blocking.
+          const newMsg = current.messages.find(m => m.id === env.id);
+          if (newMsg) SearchIndex.addMessage(current.wsDB, newMsg).catch(() => {});
         }
         break;
 
@@ -6047,6 +6522,138 @@ const EnvelopeDispatch = {
           if (gwsRec) {
             gwsRec.name = newName;
             await idbPut(State.globalDB, "workspaces", gwsRec);
+          }
+        }
+        break;
+      }
+
+      case "member.remove": {
+        // Admin op: remove a member from the workspace.
+        // Sender must be admin/owner. After this envelope, workspace.rekey
+        // and channel.rekey envelopes follow to revoke the removed member's
+        // access to future messages.
+        const myUserId = bytesToB64Url(State.identity.pubkey);
+        const sender = current.members.find(m => m.id === env.from);
+        if (!sender || (sender.role !== "owner" && sender.role !== "admin")) {
+          console.warn("member.remove from non-admin, ignoring");
+          break;
+        }
+        const removedId = inner.target;
+        if (removedId === myUserId) {
+          // We've been removed. Show a notice and close the workspace.
+          const idx = current.members.findIndex(m => m.id === removedId);
+          if (idx !== -1) current.members.splice(idx, 1);
+          alert("You've been removed from this workspace.");
+          setState({ view: "landing" });
+          break;
+        }
+        const idxToRemove = current.members.findIndex(m => m.id === removedId);
+        if (idxToRemove !== -1) {
+          current.members.splice(idxToRemove, 1);
+          // Remove from IDB projection.
+          const tx = current.wsDB.transaction("members", "readwrite");
+          tx.objectStore("members").delete(removedId);
+          await new Promise((res, rej) => { tx.oncomplete = res; tx.onerror = rej; });
+          current.meta.member_count = current.members.length;
+          await idbPut(current.wsDB, "keys", current.meta, "workspace_meta");
+        }
+        break;
+      }
+
+      case "workspace.rekey": {
+        // A new workspace root key has been distributed. `inner.wrapped_keys`
+        // is a map of user_id → {iv, ct} wrapped with X25519. Find our entry
+        // and unwrap the new root key.
+        const myUserId = bytesToB64Url(State.identity.pubkey);
+        const myEntry = inner.wrapped_keys && inner.wrapped_keys[myUserId];
+        if (!myEntry) {
+          // We have no entry — we were removed. Ignore.
+          break;
+        }
+        // Unwrap: ECDH(my_x25519_priv, sender_x25519_pub) → KEK → decrypt.
+        const sender = current.members.find(m => m.id === env.from);
+        if (!sender || !sender.x25519_pub) {
+          console.warn("workspace.rekey: sender has no x25519_pub");
+          break;
+        }
+        const myPriv = await Crypto.importX25519Priv(State.identity.x25519_priv_pkcs8);
+        const theirPub = await Crypto.importX25519Pub(sender.x25519_pub);
+        const kek = await Crypto.deriveX25519AesKey(myPriv, theirPub);
+        const newRawKey = await Crypto.aesDecrypt(kek, myEntry.iv, myEntry.ct);
+        await idbPut(current.wsDB, "keys", newRawKey, "root");
+        current.rootKey = await Crypto.importAesRaw(newRawKey);
+        break;
+      }
+
+      case "channel.rekey": {
+        // A channel key has been rotated. For public channels the new raw key
+        // is inside the envelope (encrypted under the workspace root key —
+        // which is how we got here). For private channels, the key is wrapped
+        // per-member in `inner.wrapped_keys`.
+        const myUserId = bytesToB64Url(State.identity.pubkey);
+        const chId = inner.channel_id;
+        if (!chId) break;
+        let newRawKey;
+        if (inner.key) {
+          // Public channel: raw key in the payload.
+          newRawKey = inner.key;
+        } else if (inner.wrapped_keys) {
+          // Private channel: wrapped for us.
+          const myEntry = inner.wrapped_keys[myUserId];
+          if (!myEntry) break; // Not a member of this channel.
+          const sender = current.members.find(m => m.id === env.from);
+          if (!sender || !sender.x25519_pub) break;
+          const myPriv = await Crypto.importX25519Priv(State.identity.x25519_priv_pkcs8);
+          const theirPub = await Crypto.importX25519Pub(sender.x25519_pub);
+          const kek = await Crypto.deriveX25519AesKey(myPriv, theirPub);
+          newRawKey = await Crypto.aesDecrypt(kek, myEntry.iv, myEntry.ct);
+        } else {
+          break;
+        }
+        await idbPut(current.wsDB, "keys", newRawKey, "ch:" + chId);
+        current.channelKeys[chId] = await Crypto.importAesRaw(newRawKey);
+        break;
+      }
+
+      case "member.promote": {
+        // Promote a member to admin via consensus (2+ distinct valid sigs).
+        // `inner.signers` carries [{user_id, sig}] from the proposal — each
+        // signed the canonical promote payload independently. Verify each sig
+        // against the canonical bytes and count distinct valid signers.
+        const targetId = inner.target;
+        if (!targetId || !inner.ts || !inner.nonce || !Array.isArray(inner.signers)) break;
+
+        const sigPayload = MP.encode({ type: "member.promote", target: targetId, ts: inner.ts, nonce: inner.nonce });
+
+        let validSigners = new Set();
+        for (const signer of inner.signers) {
+          if (!signer.user_id || !signer.sig) continue;
+          try {
+            const pub = b64UrlToBytes(signer.user_id);
+            const vk  = await Crypto.importVerifyKey(pub);
+            if (await Crypto.verify(vk, signer.sig, sigPayload)) {
+              validSigners.add(signer.user_id);
+            }
+          } catch (_) { /* bad sig — ignore */ }
+        }
+
+        if (validSigners.size < 2) {
+          console.warn("member.promote: insufficient valid signers (" + validSigners.size + "), dropping");
+          break;
+        }
+
+        const target = current.members.find(m => m.id === targetId);
+        if (target && target.role === "member") {
+          target.role = "admin";
+          await idbPut(current.wsDB, "members", target);
+        }
+        // Remove from pending promotions if present.
+        if (current.doc) {
+          const promos = WorkspaceDoc.getPendingPromotions(current.doc);
+          const pp = promos.find(p => p.target_id === targetId);
+          if (pp) {
+            WorkspaceDoc.removePendingPromotion(current.doc, pp.id);
+            await WorkspaceDoc.save(current.wsDB, current.doc);
           }
         }
         break;
@@ -6834,7 +7441,743 @@ const PresenceDriver = {
   }
 };
 
-/* ------------------------------------------------------------
+/* ============================================================
+ *  §31  Search — local + cross-workspace (Slice 5 / WT-18, WT-19)
+ *
+ *  MiniSearch is loaded lazily from esm.sh the first time the palette
+ *  opens. The current workspace's messages are indexed in-memory each
+ *  time the palette opens (fast — messages are already decrypted in
+ *  State.current.messages). Other workspaces are indexed from their
+ *  pre-built plaintext `search_index` IDB store (written as messages
+ *  arrive). Results from all sources are merged and ranked by score.
+ * ============================================================ */
+let MiniSearch = null;
+
+const SearchIndex = {
+  /**
+   * Add a single decrypted message record to a workspace's on-disk
+   * plaintext index. Called by dispatch after each message.create +
+   * attachment.ref projects. Non-blocking — failures are silently
+   * swallowed so a search-index write never disrupts the message flow.
+   */
+  async addMessage(wsDB, msg) {
+    if (!msg.body || msg.deleted) return;
+    try {
+      const rec = {
+        id:   msg.id,
+        body: msg.body,
+        from: msg.from,
+        ch:   msg.ch,
+        ts:   msg.ts
+      };
+      await idbPut(wsDB, "search_index", rec, msg.id);
+    } catch (_) { /* non-fatal */ }
+  },
+
+  /** Load all records from the on-disk index for one workspace. */
+  async loadIndex(wsDB) {
+    try { return await idbGetAll(wsDB, "search_index"); }
+    catch (_) { return []; }
+  }
+};
+
+/**
+ * Open the search command palette (Cmd/Ctrl+K).
+ * Builds an in-memory MiniSearch index from all available sources,
+ * then renders an interactive overlay.
+ */
+async function openSearchPalette() {
+  if (document.querySelector(".search-overlay")) return; // already open
+
+  // Lazy-load MiniSearch.
+  if (!MiniSearch) {
+    try {
+      const mod = await import("https://esm.sh/minisearch@7");
+      MiniSearch = mod.default || mod;
+    } catch (e) {
+      console.warn("MiniSearch load failed:", e);
+      alert("Search requires network access to load on first use. Try again when online.");
+      return;
+    }
+  }
+
+  // Build the combined index. Current workspace messages come from
+  // State.current.messages (already in memory). Other workspaces are
+  // loaded from their IDB search_index stores.
+  const allDocs = [];
+  const wsLabels = {};  // wsId → name
+
+  // Current workspace.
+  if (State.current) {
+    const wsId = State.current.meta.id;
+    wsLabels[wsId] = State.current.meta.name;
+    for (const m of State.current.messages) {
+      if (m.body && !m.deleted) {
+        allDocs.push({ id: m.id, body: m.body, from: m.from, ch: m.ch, ts: m.ts, ws: wsId });
+      }
+    }
+  }
+
+  // Other workspaces (from disk index — already plaintext, safe to read).
+  for (const ws of (State.workspaces || [])) {
+    if (State.current && ws.id === State.current.meta.id) continue;
+    wsLabels[ws.id] = ws.name;
+    try {
+      const wsDB = await openWorkspaceDB(ws.id);
+      const recs = await SearchIndex.loadIndex(wsDB);
+      wsDB.close();
+      for (const r of recs) {
+        allDocs.push({ id: ws.id + ":" + r.id, body: r.body, from: r.from, ch: r.ch, ts: r.ts, ws: ws.id, orig_id: r.id });
+      }
+    } catch (_) { /* skip unreadable workspace */ }
+  }
+
+  const ms = new MiniSearch({
+    fields: ["body"],
+    storeFields: ["body", "from", "ch", "ts", "ws", "orig_id"],
+    searchOptions: { prefix: true, fuzzy: 0.15, boost: { body: 1 } }
+  });
+  ms.addAll(allDocs);
+
+  // Render overlay.
+  const overlay = document.createElement("div");
+  overlay.className = "search-overlay";
+  overlay.innerHTML = `
+    <div class="search-palette">
+      <div class="search-input-row">
+        <span class="search-input-icon">⌕</span>
+        <input id="search-input" type="text" placeholder="Search messages…" autocomplete="off">
+        <span class="search-kbd">Esc</span>
+      </div>
+      <div class="search-results" id="search-results">
+        <div class="search-empty">Type to search across all messages</div>
+      </div>
+    </div>
+  `;
+  document.body.appendChild(overlay);
+
+  const $input = overlay.querySelector("#search-input");
+  const $results = overlay.querySelector("#search-results");
+  $input.focus();
+
+  // Close on background click or Escape (Escape handled globally, but also here).
+  overlay.addEventListener("click", (e) => {
+    if (e.target === overlay) overlay.remove();
+  });
+
+  // Live search.
+  let debounceTimer = null;
+  $input.addEventListener("input", () => {
+    clearTimeout(debounceTimer);
+    debounceTimer = setTimeout(() => {
+      const q = $input.value.trim();
+      if (!q) {
+        $results.innerHTML = `<div class="search-empty">Type to search across all messages</div>`;
+        return;
+      }
+      const hits = ms.search(q, { limit: 40 });
+      if (hits.length === 0) {
+        $results.innerHTML = `<div class="search-empty">No results for "${escapeHTML(q)}"</div>`;
+        return;
+      }
+      // Group by workspace.
+      const byWs = {};
+      for (const hit of hits) {
+        (byWs[hit.ws] = byWs[hit.ws] || []).push(hit);
+      }
+      let html = "";
+      // Current workspace first.
+      const orderedWs = State.current
+        ? [State.current.meta.id, ...Object.keys(byWs).filter(w => w !== State.current.meta.id)]
+        : Object.keys(byWs);
+      for (const wsId of orderedWs) {
+        const group = byWs[wsId];
+        if (!group) continue;
+        const wsName = wsLabels[wsId] || wsId;
+        // Show workspace header if there are multiple workspaces with results.
+        if (Object.keys(byWs).length > 1) {
+          html += `<div class="search-ws-header">${escapeHTML(wsName)}</div>`;
+        }
+        for (const hit of group) {
+          const current = State.current;
+          const isCurrentWs = current && wsId === current.meta.id;
+          const member = isCurrentWs
+            ? current.members.find(m => m.id === hit.from)
+            : null;
+          const authorName = member ? member.name : hit.from.slice(0, 8) + "…";
+          const ch = isCurrentWs
+            ? current.channels.find(c => c.id === hit.ch)
+            : null;
+          const chName = ch ? ch.name : (hit.ch ? hit.ch.slice(0, 6) + "…" : "DM");
+          const highlighted = highlightSearchResult(hit.body, hit.terms || [q]);
+          html += `
+            <div class="search-result" data-ws="${escapeHTML(wsId)}" data-msg="${escapeHTML(hit.orig_id || hit.id)}" data-ch="${escapeHTML(hit.ch || "")}">
+              <div class="search-result-meta">
+                <span>${escapeHTML(authorName)}</span>
+                <span>·</span>
+                <span>#${escapeHTML(chName)}</span>
+                <span>·</span>
+                <span>${formatDate(hit.ts)}</span>
+              </div>
+              <div class="search-result-body">${highlighted}</div>
+            </div>
+          `;
+        }
+      }
+      $results.innerHTML = html;
+
+      // Wire up result click: jump to the channel + message.
+      $results.querySelectorAll(".search-result").forEach(el => {
+        el.onclick = () => {
+          const wsId = el.dataset.ws;
+          const chId = el.dataset.ch;
+          const msgId = el.dataset.msg;
+          overlay.remove();
+          if (State.current && wsId === State.current.meta.id) {
+            if (chId && chId !== State.currentChannel) {
+              State.currentChannel = chId;
+            }
+            setState({});  // re-render to show the channel
+            // Scroll to message after render.
+            setTimeout(() => {
+              const el = document.querySelector(`[data-msg-text="${CSS.escape(msgId)}"]`);
+              if (el) el.scrollIntoView({ behavior: "smooth", block: "center" });
+            }, 80);
+          } else {
+            // Switch to a different workspace.
+            openWorkspaceById(wsId).catch(console.warn);
+          }
+        };
+      });
+    }, 120);
+  });
+
+  // Keyboard navigation.
+  $input.addEventListener("keydown", (e) => {
+    if (e.key === "Escape") { overlay.remove(); e.preventDefault(); }
+    if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+      const items = [...$results.querySelectorAll(".search-result")];
+      if (!items.length) return;
+      const focused = $results.querySelector(".search-result.focused");
+      const idx = focused ? items.indexOf(focused) : -1;
+      const next = e.key === "ArrowDown"
+        ? Math.min(idx + 1, items.length - 1)
+        : Math.max(idx - 1, 0);
+      items.forEach(i => i.classList.remove("focused"));
+      items[next].classList.add("focused");
+      items[next].scrollIntoView({ block: "nearest" });
+      e.preventDefault();
+    }
+    if (e.key === "Enter") {
+      const focused = $results.querySelector(".search-result.focused");
+      if (focused) focused.click();
+    }
+  });
+}
+
+/**
+ * Wrap matched terms in `<mark>` for display. Simple word-boundary
+ * highlighting — good enough without requiring DOMParser.
+ */
+function highlightSearchResult(body, terms) {
+  const escaped = escapeHTML(body.slice(0, 200) + (body.length > 200 ? "…" : ""));
+  if (!terms || terms.length === 0) return escaped;
+  let out = escaped;
+  for (const term of terms) {
+    const re = new RegExp("(" + term.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + ")", "gi");
+    out = out.replace(re, "<mark>$1</mark>");
+  }
+  return out;
+}
+
+/* ============================================================
+ *  §32  Admin operations — member removal + rekey (Slice 5 / WT-22)
+ * ============================================================ */
+
+/**
+ * Convenience helper: is the current user an admin or owner of `current`?
+ */
+function isAdmin(current) {
+  const myUserId = bytesToB64Url(State.identity.pubkey);
+  const me = current.members.find(m => m.id === myUserId);
+  return me && (me.role === "owner" || me.role === "admin");
+}
+
+/**
+ * Build and broadcast a `member.remove` envelope, then rotate the
+ * workspace root key and all public channel keys so the removed member
+ * can't read future messages.
+ *
+ * Flow:
+ *  1. Send `member.remove` (target: removedUserId)
+ *  2. Generate new workspace root key, wrap per remaining member
+ *  3. Send `workspace.rekey` with the wrapped keys
+ *  4. For each non-DM public channel: new key, send `channel.rekey`
+ *  5. For each non-DM private channel where removed member was listed:
+ *     new key, wrap per remaining channel members, send `channel.rekey`
+ *  6. Update local projections
+ */
+async function sendMemberRemove(current, removedUserId) {
+  if (!isAdmin(current)) throw new Error("Only admins can remove members.");
+  const myUserId = bytesToB64Url(State.identity.pubkey);
+  const signKey  = await Crypto.importSignKey(State.identity.privkey_pkcs8);
+  const meta     = current.meta;
+  const remaining = current.members.filter(m => m.id !== removedUserId);
+
+  // Helper to build, persist + broadcast a workspace-level envelope.
+  const wsEnvelope = async (type, inner) => {
+    meta.lc_counter = (meta.lc_counter || 0) + 1;
+    const env = await Envelope.build({
+      workspaceId: meta.id,
+      channelId: null,
+      channelKey: current.rootKey,
+      signKey,
+      signerPubkey: State.identity.pubkey,
+      deviceId: meta.device_id,
+      type,
+      inner,
+      vectorClock: [[myUserId, meta.lc_counter]]
+    });
+    await idbPut(current.wsDB, "envelopes", env);
+    PeerMgr.sendEnvelope(meta.id, env).catch(e => console.warn(e));
+    return env;
+  };
+
+  // 1. member.remove envelope.
+  await wsEnvelope("member.remove", { target: removedUserId, reason: "removed by admin" });
+
+  // Apply locally before sending rekey so remaining.map works correctly.
+  const removeIdx = current.members.findIndex(m => m.id === removedUserId);
+  if (removeIdx !== -1) current.members.splice(removeIdx, 1);
+  const removeTx = current.wsDB.transaction("members", "readwrite");
+  removeTx.objectStore("members").delete(removedUserId);
+  await new Promise((res, rej) => { removeTx.oncomplete = res; removeTx.onerror = rej; });
+
+  // 2. New workspace root key.
+  const newRootKey = await Crypto.genAesKey();
+  const newRootRaw = await Crypto.exportAesRaw(newRootKey);
+  const myPriv = await Crypto.importX25519Priv(State.identity.x25519_priv_pkcs8);
+
+  const wrapForMembers = async (members) => {
+    const wrapped_keys = {};
+    for (const m of members) {
+      if (!m.x25519_pub) continue;
+      const theirPub = await Crypto.importX25519Pub(m.x25519_pub);
+      const kek = await Crypto.deriveX25519AesKey(myPriv, theirPub);
+      const iv = Crypto.rand(12);
+      const ct = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv }, kek, newRootRaw));
+      wrapped_keys[m.id] = { iv, ct };
+    }
+    return wrapped_keys;
+  };
+
+  // Include ourselves in the wrap so our own dispatch handler can load
+  // the new key from the envelope on reload (not strictly needed since we
+  // update in-memory below, but good for consistency).
+  const membersForWrap = remaining;
+  const rootWrapped = await wrapForMembers(membersForWrap);
+  await wsEnvelope("workspace.rekey", { wrapped_keys: rootWrapped });
+
+  // Update local root key immediately.
+  await idbPut(current.wsDB, "keys", newRootRaw, "root");
+  current.rootKey = newRootKey;
+
+  // 3. Rekey channels.
+  for (const ch of current.channels) {
+    if (ch.dm) continue;  // DM keys are bilateral; can't rekey without the other party
+    const newChKey = await Crypto.genAesKey();
+    const newChRaw = await Crypto.exportAesRaw(newChKey);
+
+    if (!ch.private) {
+      // Public channel: raw key travels in the envelope encrypted under
+      // the NEW root key (which we just set above).
+      await wsEnvelope("channel.rekey", { channel_id: ch.id, key: newChRaw });
+    } else {
+      // Private channel: wrap per remaining member.
+      const channelMembers = remaining.filter(m => (ch.members || []).includes(m.id));
+      if (channelMembers.length === 0) continue;
+      const wrapped_keys = {};
+      for (const m of channelMembers) {
+        if (!m.x25519_pub) continue;
+        const theirPub = await Crypto.importX25519Pub(m.x25519_pub);
+        const kek = await Crypto.deriveX25519AesKey(myPriv, theirPub);
+        const iv = Crypto.rand(12);
+        const ct = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv }, kek, newChRaw));
+        wrapped_keys[m.id] = { iv, ct };
+      }
+      await wsEnvelope("channel.rekey", { channel_id: ch.id, wrapped_keys });
+    }
+
+    // Update locally.
+    await idbPut(current.wsDB, "keys", newChRaw, "ch:" + ch.id);
+    current.channelKeys[ch.id] = newChKey;
+  }
+
+  await idbPut(current.wsDB, "keys", meta, "workspace_meta");
+  current.meta.member_count = current.members.length;
+}
+
+/* ============================================================
+ *  §33  Promote-by-consensus (Slice 5 / WT-23)
+ *
+ *  Any member can draft a promotion proposal. Others co-sign via
+ *  the Admin settings tab. Once 2 distinct valid signatures are
+ *  collected, any member can finalize by broadcasting the
+ *  `member.promote` envelope with cosigs.
+ *
+ *  Signing payload (deterministic):
+ *    msgpack({ type: "member.promote", target: target_id, ts, nonce })
+ * ============================================================ */
+
+/**
+ * Create a new pending promotion proposal for `targetUserId`.
+ * Signs the canonical payload with the drafter's identity key and
+ * stores the proposal in the WorkspaceDoc (shared with peers via
+ * workspace.patch).
+ */
+async function draftPromotion(current, targetUserId) {
+  const myUserId = bytesToB64Url(State.identity.pubkey);
+  const signKey  = await Crypto.importSignKey(State.identity.privkey_pkcs8);
+  const ts       = Date.now();
+  const nonce    = Crypto.rand(12);
+  const nonce_b64 = bytesToB64(nonce);
+
+  const sigPayload = MP.encode({ type: "member.promote", target: targetUserId, ts, nonce });
+  const sig = await Crypto.sign(signKey, sigPayload);
+
+  const proposal = {
+    id:         bytesToB64Url(Crypto.rand(12)),
+    target_id:  targetUserId,
+    drafter_id: myUserId,
+    ts,
+    nonce_b64,
+    cosigs: [{ user_id: myUserId, sig_b64: bytesToB64(sig) }],
+    expires_at: ts + 7 * 24 * 3600 * 1000  // 7 days
+  };
+
+  if (!current.doc) throw new Error("Workspace doc not loaded — cannot draft promotion.");
+  const update = WorkspaceDoc.setPendingPromotion(current.doc, proposal);
+  await WorkspaceDoc.save(current.wsDB, current.doc);
+  await sendWorkspacePatch(current, update);
+}
+
+/**
+ * Add the current user's co-signature to an existing proposal.
+ * Signs the same payload (target_id + ts + nonce from proposal).
+ */
+async function addCoSignPromotion(current, proposalId) {
+  const myUserId = bytesToB64Url(State.identity.pubkey);
+  const signKey  = await Crypto.importSignKey(State.identity.privkey_pkcs8);
+  if (!current.doc) throw new Error("Workspace doc not loaded.");
+
+  const promos = WorkspaceDoc.getPendingPromotions(current.doc);
+  const proposal = promos.find(p => p.id === proposalId);
+  if (!proposal) throw new Error("Proposal not found.");
+  if (proposal.cosigs.some(s => s.user_id === myUserId)) {
+    throw new Error("You've already supported this proposal.");
+  }
+
+  const nonce    = b64ToBytes(proposal.nonce_b64);
+  const sigPayload = MP.encode({ type: "member.promote", target: proposal.target_id, ts: proposal.ts, nonce });
+  const sig = await Crypto.sign(signKey, sigPayload);
+
+  proposal.cosigs.push({ user_id: myUserId, sig_b64: bytesToB64(sig) });
+  const update = WorkspaceDoc.setPendingPromotion(current.doc, proposal);
+  await WorkspaceDoc.save(current.wsDB, current.doc);
+  await sendWorkspacePatch(current, update);
+}
+
+/**
+ * Finalize a proposal once enough co-signatures are collected.
+ * Builds the `member.promote` envelope with cosigs and broadcasts it.
+ * The dispatch handler verifies the sigs and applies the promotion.
+ */
+async function finalizePromotion(current, proposalId) {
+  const myUserId = bytesToB64Url(State.identity.pubkey);
+  const signKey  = await Crypto.importSignKey(State.identity.privkey_pkcs8);
+  if (!current.doc) throw new Error("Workspace doc not loaded.");
+
+  const promos   = WorkspaceDoc.getPendingPromotions(current.doc);
+  const proposal = promos.find(p => p.id === proposalId);
+  if (!proposal) throw new Error("Proposal not found.");
+  if (proposal.cosigs.length < 2) throw new Error("Need at least 2 supporters first.");
+
+  const nonce      = b64ToBytes(proposal.nonce_b64);
+  const sigPayload = MP.encode({ type: "member.promote", target: proposal.target_id, ts: proposal.ts, nonce });
+
+  // The finalizer adds their own sig if not already present.
+  let myEntry = proposal.cosigs.find(s => s.user_id === myUserId);
+  if (!myEntry) {
+    const sig = await Crypto.sign(signKey, sigPayload);
+    myEntry = { user_id: myUserId, sig_b64: bytesToB64(sig) };
+    proposal.cosigs.push(myEntry);
+  }
+
+  // Use the drafter's cosig as the primary signer on the envelope,
+  // and the rest as cosigs.
+  const drafterEntry = proposal.cosigs.find(s => s.user_id === proposal.drafter_id) || proposal.cosigs[0];
+  const cosigsForEnv = proposal.cosigs
+    .filter(s => s.user_id !== drafterEntry.user_id)
+    .map(s => ({ from: s.user_id, sig: b64ToBytes(s.sig_b64) }));
+
+  const meta = current.meta;
+  meta.lc_counter = (meta.lc_counter || 0) + 1;
+
+  // Build envelope.  The envelope `sig` field is the primary signer's sig
+  // (verified in dispatch against the canonical payload), so we need to use
+  // the drafter's sig. We build the envelope normally (which computes a NEW
+  // sig from our key), then swap the sig to the drafter's stored sig.
+  // This works because the canonical bytes for sig verification are the same
+  // regardless of who is sending the envelope wire message.
+  //
+  // NOTE: We still sign with our own key for the envelope wrapper; the
+  // `member.promote` inner payload carries the proposal's stored sigs for
+  // the dispatch handler to verify against the canonical promote payload.
+  const env = await Envelope.build({
+    workspaceId: meta.id,
+    channelId: null,
+    channelKey: current.rootKey,
+    signKey,
+    signerPubkey: State.identity.pubkey,
+    deviceId: meta.device_id,
+    type: "member.promote",
+    inner: {
+      target:  proposal.target_id,
+      ts:      proposal.ts,
+      nonce,
+      signers: proposal.cosigs.map(s => ({ user_id: s.user_id, sig: b64ToBytes(s.sig_b64) }))
+    },
+    vectorClock: [[myUserId, meta.lc_counter]]
+  });
+  // Attach cosigs to the envelope for the spec §4.3 transport layer.
+  env.cosigs = cosigsForEnv;
+
+  await idbPut(current.wsDB, "envelopes", env);
+  await idbPut(current.wsDB, "keys", meta, "workspace_meta");
+  PeerMgr.sendEnvelope(meta.id, env).catch(e => console.warn(e));
+
+  // Remove from WorkspaceDoc.
+  const update = WorkspaceDoc.removePendingPromotion(current.doc, proposalId);
+  await WorkspaceDoc.save(current.wsDB, current.doc);
+  await sendWorkspacePatch(current, update);
+}
+
+/* ============================================================
+ *  §34  Workspace export / import (Slice 5 / WT-34)
+ *
+ *  Export format: a JSON file (`.workspace`) wrapping a PBKDF2-
+ *  encrypted msgpack blob that contains:
+ *    - meta: workspace metadata
+ *    - envelopes: all stored envelopes (as raw msgpack bytes)
+ *    - channels: projected channel records
+ *    - members: projected member records
+ *    - keys: all keys from the `keys` IDB store
+ *
+ *  Import replays the envelopes into a fresh local DB, re-projecting
+ *  the workspace from first principles.
+ *
+ *  Identity is NOT included — identities live only in .mehfil-key.
+ * ============================================================ */
+function openExportModal() {
+  const wrap = document.createElement("div");
+  wrap.className = "modal-bg";
+  wrap.innerHTML = `
+    <div class="card" style="max-width: 440px;">
+      <h1>Export workspace</h1>
+      <p class="sub">
+        Download an encrypted backup of this workspace — all messages, channels,
+        members, and keys. Your identity is NOT included (use "Back up identity" for that).
+      </p>
+      <div class="field">
+        <label>Passphrase (encrypts the file)</label>
+        <input type="password" id="exp-pass1" autofocus>
+      </div>
+      <div class="field">
+        <label>Confirm passphrase</label>
+        <input type="password" id="exp-pass2">
+        <div class="err" id="exp-err"></div>
+      </div>
+      <div class="row">
+        <button id="exp-cancel">Cancel</button>
+        <div class="grow"></div>
+        <button class="primary" id="exp-go">Download backup</button>
+      </div>
+    </div>
+  `;
+  document.body.appendChild(wrap);
+
+  const close = () => { wrap.remove(); closeModal(); };
+  wrap.querySelector("#exp-cancel").onclick = close;
+  wrap.querySelector("#exp-go").onclick = async () => {
+    const $err = wrap.querySelector("#exp-err");
+    $err.textContent = "";
+    const p1 = wrap.querySelector("#exp-pass1").value;
+    const p2 = wrap.querySelector("#exp-pass2").value;
+    if (!p1 || p1.length < 6) { $err.textContent = "Pick at least 6 characters."; return; }
+    if (p1 !== p2) { $err.textContent = "Passphrases don't match."; return; }
+    wrap.querySelector("#exp-go").disabled = true;
+    try {
+      await exportWorkspace(State.current, p1);
+      close();
+    } catch (e) {
+      $err.textContent = e.message;
+      wrap.querySelector("#exp-go").disabled = false;
+    }
+  };
+}
+
+async function exportWorkspace(current, passphrase) {
+  const wsDB = current.wsDB;
+  // Gather all stores.
+  const [envelopes, channels, members] = await Promise.all([
+    idbGetAll(wsDB, "envelopes"),
+    idbGetAll(wsDB, "channels"),
+    idbGetAll(wsDB, "members")
+  ]);
+  // The `keys` store uses out-of-line keys — we need {key, value} pairs.
+  const keysStore = await idbGetAllEntries(wsDB, "keys");
+
+  const payload = {
+    meta: current.meta,
+    envelopes,
+    channels,
+    members,
+    keys: keysStore   // already raw byte arrays / plain objects from IDB
+  };
+
+  const plaintext = MP.encode(payload);
+  const wrapped = await Crypto.pbkdf2Wrap(passphrase, plaintext);
+  const file = {
+    magic: "mehfil-workspace",
+    v: 1,
+    ws_id: current.meta.id,
+    ws_name: current.meta.name,
+    created_at: Date.now(),
+    kdf: wrapped.kdf,
+    wrap: wrapped.wrap
+  };
+
+  const blob = new Blob([JSON.stringify(file, null, 2)], { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = `${current.meta.name.replace(/[^a-z0-9]/gi, "_")}.workspace`;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
+function openImportModal() {
+  const wrap = document.createElement("div");
+  wrap.className = "modal-bg";
+  wrap.innerHTML = `
+    <div class="card" style="max-width: 440px;">
+      <h1>Import workspace</h1>
+      <p class="sub">
+        Restore a workspace from a <code>.workspace</code> backup file.
+        A new local workspace will be created with all the messages and channels from the backup.
+      </p>
+      <div class="field">
+        <label>Backup file</label>
+        <input type="file" id="imp-file" accept=".workspace,.json">
+      </div>
+      <div class="field">
+        <label>Passphrase</label>
+        <input type="password" id="imp-pass">
+        <div class="err" id="imp-err"></div>
+      </div>
+      <div id="imp-status" style="color: var(--fg-mute); font-size: 12px; min-height: 16px;"></div>
+      <div class="row" style="margin-top: 14px;">
+        <button id="imp-cancel">Cancel</button>
+        <div class="grow"></div>
+        <button class="primary" id="imp-go">Import</button>
+      </div>
+    </div>
+  `;
+  document.body.appendChild(wrap);
+
+  const close = () => { wrap.remove(); closeModal(); };
+  wrap.querySelector("#imp-cancel").onclick = close;
+  wrap.querySelector("#imp-go").onclick = async () => {
+    const $err = wrap.querySelector("#imp-err");
+    const $status = wrap.querySelector("#imp-status");
+    $err.textContent = "";
+    const fileInput = wrap.querySelector("#imp-file");
+    const pass = wrap.querySelector("#imp-pass").value;
+    if (!fileInput.files || !fileInput.files[0]) { $err.textContent = "Choose a file."; return; }
+    if (!pass) { $err.textContent = "Passphrase required."; return; }
+    wrap.querySelector("#imp-go").disabled = true;
+    try {
+      $status.textContent = "Decrypting…";
+      await importWorkspace(fileInput.files[0], pass, (msg) => { $status.textContent = msg; });
+      close();
+      // Refresh landing page workspace list.
+      const workspaces = await idbGetAll(State.globalDB, "workspaces");
+      State.workspaces = workspaces;
+      setState({ view: "landing" });
+    } catch (e) {
+      $err.textContent = e.message;
+      wrap.querySelector("#imp-go").disabled = false;
+      $status.textContent = "";
+    }
+  };
+}
+
+async function importWorkspace(file, passphrase, onProgress) {
+  const text = await file.text();
+  let fileObj;
+  try { fileObj = JSON.parse(text); }
+  catch (_) { throw new Error("Not a valid .workspace file."); }
+  if (fileObj.magic !== "mehfil-workspace") throw new Error("Not a Mehfil workspace backup.");
+  if (fileObj.v !== 1) throw new Error("Unsupported backup version: " + fileObj.v);
+
+  onProgress && onProgress("Unwrapping keys…");
+  let plaintext;
+  try {
+    plaintext = await Crypto.pbkdf2Unwrap(passphrase, fileObj);
+  } catch (_) {
+    throw new Error("Wrong passphrase or corrupted file.");
+  }
+
+  const payload = MP.decode(plaintext);
+  const { meta, envelopes, channels, members, keys } = payload;
+  if (!meta || !meta.id) throw new Error("Backup missing workspace metadata.");
+
+  // Check for collision with existing workspace.
+  const existing = State.workspaces.find(w => w.id === meta.id);
+  if (existing) throw new Error(`Workspace "${existing.name}" is already on this device.`);
+
+  onProgress && onProgress("Creating workspace DB…");
+  const wsDB = await openWorkspaceDB(meta.id);
+
+  // Restore keys store. Keys are [{key, value}] pairs from idbGetAllEntries.
+  onProgress && onProgress("Restoring keys…");
+  for (const entry of (keys || [])) {
+    if (entry && entry.key !== undefined) {
+      await idbPut(wsDB, "keys", entry.value, entry.key);
+    }
+  }
+
+  // Restore channels, members.
+  onProgress && onProgress("Restoring channels + members…");
+  for (const ch of (channels || [])) await idbPut(wsDB, "channels", ch);
+  for (const m of (members || [])) await idbPut(wsDB, "members", m);
+
+  // Restore envelopes.
+  onProgress && onProgress("Restoring messages…");
+  for (const env of (envelopes || [])) await idbPut(wsDB, "envelopes", env);
+
+  // Register in global workspaces list.
+  await idbPut(State.globalDB, "workspaces", {
+    id: meta.id,
+    name: meta.name,
+    created_at: meta.created_at || Date.now(),
+    last_opened_at: Date.now()
+  });
+
+  onProgress && onProgress("Done.");
+}
+
+/* ============================================================
  *  §12  Helpers
  * ------------------------------------------------------------ */
 function bytesToHex(b) {
@@ -6870,6 +8213,17 @@ function escapeHTML(s) {
   return String(s).replace(/[&<>"']/g, c => ({
     "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
   })[c]);
+}
+/**
+ * Sanitize a URL before inserting into an href or src attribute.
+ * Rejects javascript:, data:, and vbscript: URIs (WT-33 XSS hardening).
+ */
+function sanitizeUrl(url) {
+  try {
+    const parsed = new URL(url, location.href);
+    if (["javascript:", "data:", "vbscript:"].includes(parsed.protocol)) return "#";
+  } catch (_) { return "#"; }
+  return url;
 }
 function initials(name) {
   return (name || "?").trim().split(/\s+/).slice(0,2).map(w => w[0] || "").join("").toUpperCase() || "?";
@@ -6946,7 +8300,12 @@ if (/[?&]debug=1/.test(location.search)) {
     sendPeerAnnounce, SeenSet, CausalBuffer,
     WorkspaceDoc, sendWorkspacePatch,
     GapTracker, ResyncResponder,
+    // Slice 5
+    sendMemberRemove, draftPromotion, addCoSignPromotion, finalizePromotion,
+    exportWorkspace, importWorkspace, openSearchPalette, SearchIndex,
+    sanitizeUrl, isAdmin,
     get Y() { return Y; },
+    get MiniSearch() { return MiniSearch; },
     bytesToB64Url, b64UrlToBytes, bytesToHex, bytesToB64,
     render, setState
   };
@@ -7006,13 +8365,21 @@ window.addEventListener("unhandledrejection", (e) => {
   console.error("Unhandled rejection:", e.reason);
 });
 
-// Global Escape handler: closes the topmost modal/overlay if one is open.
-// Priority order: reaction picker → modals → thread panel. Each layer
-// dismisses one level on Escape so repeated presses walk back through
-// nested UI.
+// Global keyboard handler: Cmd/Ctrl+K opens search; Escape closes overlays.
+// Priority order (Escape): search overlay → reaction picker → modals → thread panel.
 window.addEventListener("keydown", (e) => {
+  // Cmd/Ctrl+K — open search palette (Slice 5 / WT-18, WT-19).
+  if ((e.metaKey || e.ctrlKey) && e.key === "k" && State.view === "workspace") {
+    e.preventDefault();
+    openSearchPalette().catch(console.warn);
+    return;
+  }
+
   if (e.key !== "Escape") return;
-  // Reaction picker first — it's a floating, non-modal element.
+  // Search palette first — fixed overlay above everything else.
+  const searchOverlay = document.querySelector(".search-overlay");
+  if (searchOverlay) { searchOverlay.remove(); e.preventDefault(); return; }
+  // Reaction picker — floating, non-modal element.
   const picker = document.querySelector(".reaction-picker");
   if (picker) { picker.remove(); e.preventDefault(); return; }
   // Then the topmost modal (DOM order; last-added wins since modals
