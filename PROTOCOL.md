@@ -884,6 +884,87 @@ Result: both Bose and Charlie's `bundle.messages` contain "hello mesh"; both see
 
 ---
 
-**Version:** living document, updated per slice. Slice 2 added §8–§11. Slice 3a extended §3 (closed-form padding). Slice 3b bumped §6 to v2 and added §12–§14. Slice 3c added §3b (BlobStore), §15 (group DMs simplification), §16 (attachments). Slice 3c.1 added §17 (peer-to-peer blob transfer) and extended §9 with tags 0x03 + 0x04. Slice 3d.1 added §18 (reactions), §19 (@mentions), §20 (polish). Slice 3d.2 added §21 (threads). Slice 3d.3 added §22 (presence) and established the ephemeral-type fast-path. Slice 4a added §23 (multi-peer mesh + gossip rebroadcast + SeenSet + `gossip.peer_announce`).
+**Version:** living document, updated per slice. Slice 2 added §8–§11. Slice 3a extended §3 (closed-form padding). Slice 3b bumped §6 to v2 and added §12–§14. Slice 3c added §3b (BlobStore), §15 (group DMs simplification), §16 (attachments). Slice 3c.1 added §17 (peer-to-peer blob transfer) and extended §9 with tags 0x03 + 0x04. Slice 3d.1 added §18 (reactions), §19 (@mentions), §20 (polish). Slice 3d.2 added §21 (threads). Slice 3d.3 added §22 (presence) and established the ephemeral-type fast-path. Slice 4a added §23 (multi-peer mesh + gossip rebroadcast + SeenSet + `gossip.peer_announce`). Slice 4b.1 added §24 (vector clock causal delivery buffer).
+
+## 24. Vector clock causal delivery (Slice 4b.1)
+
+Slice 4a's gossip rebroadcast enables messages to traverse a mesh, but it assumes envelopes arrive at each peer in causal order. In practice, gossip topologies guarantee no such thing: envelope M2 can reach you via a short path while M1 (its causal predecessor) is still traveling a longer one. Without a causal buffer, the dispatch pipeline would project M2 into the UI before M1 — a user would see a reply appear before the message it's replying to.
+
+### The rule
+
+Every envelope carries an `lc` field: a list of `[user_id, counter]` pairs. For Slice 4b.1 we enforce the **per-sender causal chain**: an envelope from sender X with counter N requires that we've already seen counter N-1 from X's device first. If we haven't, the envelope is buffered.
+
+Other entries in `lc` (counters from senders OTHER than `env.from`) are informational in v1 — they tell us what the sender had seen at send time, useful for gap detection (Slice 4c) but not a blocker for delivery. Full Lamport-clock dominance comparison is spec §6.1 and can be added later without a wire-format change.
+
+### `bundle.hwm` — high-water-mark map
+
+Per-bundle state, populated during `Workspace.open`'s envelope replay:
+
+```
+bundle.hwm: Map<user_id, Map<device_id, highest_counter_seen>>
+```
+
+Keyed by sender user_id AND device_id (per spec §8.2 — vector clocks are per-(user, device) pair from Slice 0 onwards). Device id is the `env.dev` field on the outer envelope, NOT anything from `lc`.
+
+Computed on workspace open by walking the envelopes store and taking the max counter seen for each (sender, device) pair. Not persisted separately — always derivable from the envelopes store.
+
+### `bundle.causalBuffer` — pending envelopes
+
+In-memory array of envelopes whose dependencies aren't yet satisfied. NOT persisted separately — but the envelopes themselves ARE persisted to the envelopes store before the causal check runs (see "persist-first" rule below), so a shutdown mid-buffer is recoverable.
+
+### The persist-first rule
+
+`EnvelopeDispatch.receive` is restructured so that for non-ephemeral envelopes, the order is:
+
+1. Signature verification
+2. **Persist to envelopes store** (via `idbPut`)
+3. **Causal check** via `CausalBuffer.canDeliver`
+4. If not deliverable → `CausalBuffer.buffer`, return
+5. Otherwise decrypt + dispatch + advance hwm + drain buffer
+
+This is the critical change. Pre-4b.1, persistence happened after the dispatch check. Pre-4b.1 had no causal check, so that was fine. But with a causal buffer, if we buffered BEFORE persisting, a shutdown mid-buffer would lose the buffered envelopes. Persist-first ensures that envelopes reach disk before they're eligible for buffering — if the power dies with a buffer of 5 envelopes, the next `Workspace.open` sees all 5 in the envelopes store, rebuilds hwm from scratch, and the replay loop processes them in ts-order (which happens to usually be causal order, catching the common case).
+
+The cost: a tiny window where an envelope is persisted but unusable (failed signature verify → it's still in the store). Slice 5 adds a quarantine store + periodic cleanup. For now the window is narrow enough to accept.
+
+### `CausalBuffer.canDeliver(bundle, env)`
+
+Returns true iff the envelope can be delivered now. The rule:
+
+```
+senderCounter = env.lc.find([sender, counter] where sender === env.from)[1]
+hwm = bundle.hwm.get(env.from)?.get(env.dev) || 0
+return senderCounter <= hwm + 1
+```
+
+- `senderCounter === hwm + 1` — the normal case, new envelope advances the chain
+- `senderCounter === hwm` — idempotent retry, safe to deliver again (the in-memory dedupe in `handle()` catches double-projection)
+- `senderCounter < hwm` — an old envelope arriving late, safe to deliver (though usually the seen-set has already caught it)
+- `senderCounter > hwm + 1` — gap, buffer until hwm catches up
+
+### `CausalBuffer.advance(bundle, env)`
+
+Called after successful dispatch of a non-ephemeral envelope. Bumps `bundle.hwm.get(env.from).get(env.dev)` to `max(current, senderCounter)`.
+
+### `CausalBuffer.drain(bundle, dispatchFn)`
+
+Called after every successful dispatch. Walks the buffer and releases any envelope whose `canDeliver` now returns true. Repeats in a loop until a full pass makes no progress — handles transitive dependency chains (m3 releases m4 which releases m5...).
+
+Uses a callback `dispatchFn` rather than re-entering `receive()` so the causal check doesn't fire a second time on the just-released envelope. The caller (dispatch pipeline) inlines a trimmed dispatch path that skips the persist + causal steps.
+
+### Verified end-to-end
+
+Test: inject three message.create envelopes from the same sender with counters 2, 3, 4 (following a member.join at counter 1) in the order [m4, m2, m3]:
+
+1. **m4 arrives** → hwm=1, counter=4, `4 > 1+1` → BUFFERED. buffer size = 1, messages = 0
+2. **m2 arrives** → hwm=1, counter=2, `2 <= 1+1` → delivered, hwm advances to 2. Drain walks buffer: m4 needs hwm≥3, still buffered. buffer size = 1, messages = 1
+3. **m3 arrives** → hwm=2, counter=3, `3 <= 2+1` → delivered, hwm advances to 3. Drain walks buffer: m4 needs hwm≥3, now deliverable → released → dispatched → hwm advances to 4. buffer size = 0, messages = 3
+4. **Final order in the projection:** `["msg 2", "msg 3", "msg 4"]` — causal order preserved despite out-of-order arrival
+5. **Reload test:** close the workspace and reopen. `hwm[bose][bd]` rehydrates to 4 from the envelope log. All 3 messages reappear in correct order.
+
+### Replay path quirk
+
+`Workspace.open`'s replay loop does NOT go through `EnvelopeDispatch.receive` — it processes envelopes directly via verify → decrypt → switch on type. This means the causal check is NOT enforced during replay. That's intentional: the replay loop ts-sorts envelopes first, which happens to be causal order for single-device-per-user traffic in small clusters. For edge cases (clock skew producing ts-out-of-order for causally-ordered messages), the projection order is slightly wrong but self-healing because hwm is rebuilt from scratch on every open — any new envelope arriving live will hit the live dispatch path where causal order IS enforced.
+
+Slice 4b.2 (Yjs workspace doc) doesn't touch this. Full strict causal replay is a Slice 5+ concern if anyone reports an issue in practice.
 
 Deferred items, open decisions, known bugs and upcoming slices are tracked in `PENDING.md`. When a decision in this file changes, update both this file and the corresponding entry there.

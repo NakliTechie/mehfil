@@ -1906,7 +1906,35 @@ const Workspace = {
     // history once it received it. Slice 4a §20a.
     await SeenSet.hydrate(wsDB);
 
-    return { wsDB, meta, channels, members, channelKeys, rootKey, messages, presence };
+    // Slice 4b.1: vector clock causal delivery state. `hwm` is the
+    // per-sender-per-device high-water-mark — the highest `counter`
+    // we've seen in any envelope's `lc` entry for that (user, device)
+    // pair. `causalBuffer` holds envelopes waiting for their lc
+    // dependencies to arrive. Both are derived from replay and not
+    // persisted separately.
+    const hwm = new Map();         // Map<user_id, Map<device_id, counter>>
+    for (const env of envelopes) {
+      // Only advance hwm for envelopes that passed signature +
+      // decryption during replay. We track per (sender, device) pair
+      // and the counter is the highest seen from that pair.
+      if (!env.lc) continue;
+      for (const entry of env.lc) {
+        if (!Array.isArray(entry) || entry.length !== 2) continue;
+        const [senderId, counter] = entry;
+        if (typeof counter !== "number") continue;
+        // Use env.dev as the device id since lc entries in v1 carry
+        // only [user_id, counter] — per-device counters are projected
+        // from `env.dev` on the outer envelope.
+        const deviceId = env.from === senderId ? env.dev : "unknown";
+        let inner = hwm.get(senderId);
+        if (!inner) { inner = new Map(); hwm.set(senderId, inner); }
+        const cur = inner.get(deviceId) || 0;
+        if (counter > cur) inner.set(deviceId, counter);
+      }
+    }
+    const causalBuffer = [];
+
+    return { wsDB, meta, channels, members, channelKeys, rootKey, messages, presence, hwm, causalBuffer };
   },
 
   async sendMessage({ wsDB, meta, identity, channelId, channelKey, body, vectorClock, mentions, threadId }) {
@@ -4752,6 +4780,142 @@ const SeenSet = {
 };
 
 /* ------------------------------------------------------------
+ *  §20c  Causal delivery buffer (Slice 4b.1)
+ *
+ *  Vector clock dependency checking. Every envelope carries an
+ *  `lc` field: a list of [user_id, counter] pairs representing
+ *  the sender's knowledge of each other writer's counter at the
+ *  time of send. For Slice 4b.1 we interpret this minimally:
+ *
+ *    - An envelope from sender X with counter N depends on having
+ *      seen counter N-1 from X first. This is the per-sender
+ *      causal chain. An envelope arriving with counter N > hwm+1
+ *      is buffered until the gap is filled.
+ *
+ *    - Other entries in `lc` (not the sender's own counter) are
+ *      informational — they tell us the sender HAD seen those
+ *      counters at send time, so if we haven't, we're behind. We
+ *      use them to detect gaps but NOT to block delivery of this
+ *      envelope (v1 accepts messages that reference counters from
+ *      other senders we haven't seen; the order within a single
+ *      sender is the main causal guarantee).
+ *
+ *  The "wait for N-1 before delivering N" rule ships here. Richer
+ *  vector-clock comparison (Lamport clock dominance) is spec §6.1
+ *  and can be added later without a wire-format change.
+ *
+ *  Persistence: `hwm` is rebuilt from the envelopes store on
+ *  every `Workspace.open`, so the causal buffer state is derived
+ *  not stored. `causalBuffer` lives only in memory — envelopes
+ *  that are still buffered at shutdown are in the envelopes
+ *  store already (they were persisted via the normal dispatch
+ *  path during hydration), so replay restores the same state.
+ *
+ *  Actually — wait. Envelopes in the causalBuffer are NOT
+ *  persisted before being buffered, because the dispatch pipeline
+ *  persists AFTER the causal check. So buffered envelopes would
+ *  be lost on shutdown.
+ *
+ *  The fix is to persist the envelope in the dispatch pipeline
+ *  BEFORE the causal check — the envelopes store is append-only,
+ *  and holding an out-of-order envelope there is harmless (replay
+ *  will re-order via ts-sort in Workspace.open). That's what the
+ *  Slice 4b.1 dispatch changes do: persist first, then causal
+ *  check, then project.
+ * ------------------------------------------------------------ */
+const CausalBuffer = {
+  /**
+   * Given an envelope and the current bundle's high-water-mark map,
+   * decide whether the envelope's causal dependencies are satisfied.
+   *
+   * Returns true if the envelope can be delivered now. The rule: the
+   * envelope's own sender-counter must be exactly one greater than
+   * our current hwm for (sender, device), OR it's the first envelope
+   * we've ever seen from that sender (counter 1 with hwm 0).
+   *
+   * Re-delivery of the same counter (a hash collision or a bug) is
+   * treated as "ok" — the dispatch pipeline dedupes by id earlier.
+   */
+  canDeliver(bundle, env) {
+    if (!env.lc || !Array.isArray(env.lc)) return true;
+    // Find the sender's own counter in lc.
+    const senderEntry = env.lc.find(e => Array.isArray(e) && e[0] === env.from);
+    if (!senderEntry) return true;  // no self-counter, can't block
+    const expectedCounter = senderEntry[1];
+    if (typeof expectedCounter !== "number") return true;
+    const deviceHwm = bundle.hwm.get(env.from);
+    const currentHwm = (deviceHwm && deviceHwm.get(env.dev)) || 0;
+    // Allow delivery if:
+    //   - the envelope advances the chain by exactly 1 (normal case)
+    //   - the envelope is already delivered (same counter — idempotent)
+    //   - the envelope is older than hwm (out-of-order stale arrival,
+    //     usually a replay; the seen-set would normally catch it but
+    //     we allow it through as a safety net)
+    return expectedCounter <= currentHwm + 1;
+  },
+
+  /**
+   * Update the hwm for (sender, device) after a successful delivery.
+   * Called from the dispatch pipeline after EnvelopeDispatch.handle
+   * succeeds for a non-ephemeral envelope.
+   */
+  advance(bundle, env) {
+    if (!env.lc || !Array.isArray(env.lc)) return;
+    const senderEntry = env.lc.find(e => Array.isArray(e) && e[0] === env.from);
+    if (!senderEntry) return;
+    const counter = senderEntry[1];
+    if (typeof counter !== "number") return;
+    let inner = bundle.hwm.get(env.from);
+    if (!inner) { inner = new Map(); bundle.hwm.set(env.from, inner); }
+    const cur = inner.get(env.dev) || 0;
+    if (counter > cur) inner.set(env.dev, counter);
+  },
+
+  /**
+   * Push an envelope onto the buffer. Called when canDeliver returns
+   * false. The envelope is already persisted to IDB by the caller, so
+   * shutdown mid-buffer is recoverable on next workspace open.
+   */
+  buffer(bundle, env) {
+    // Dedupe — don't buffer the same envelope twice.
+    if (bundle.causalBuffer.find(e => e.id === env.id)) return;
+    bundle.causalBuffer.push(env);
+  },
+
+  /**
+   * Walk the buffer and release any envelope whose dependencies are
+   * now satisfied. Called after every successful delivery. Releases
+   * in a loop until a full pass makes no progress — handles chains
+   * of transitively dependent envelopes.
+   *
+   * Returns the list of envelopes that were released (for testing).
+   */
+  async drain(bundle, dispatchFn) {
+    const released = [];
+    let progress = true;
+    while (progress) {
+      progress = false;
+      for (let i = 0; i < bundle.causalBuffer.length; i++) {
+        const env = bundle.causalBuffer[i];
+        if (!this.canDeliver(bundle, env)) continue;
+        // Remove from buffer + deliver.
+        bundle.causalBuffer.splice(i, 1);
+        i--;
+        await dispatchFn(env);
+        released.push(env);
+        progress = true;
+      }
+    }
+    return released;
+  },
+
+  /** Current buffer size — used by gap detection in Slice 4c. */
+  size(bundle) {
+    return bundle.causalBuffer.length;
+  }
+};
+
+/* ------------------------------------------------------------
  *  §20b  BlobTransfer — peer-to-peer attachment delivery
  *         (Slice 3c.1)
  *
@@ -4938,10 +5102,31 @@ const EnvelopeDispatch = {
     // 2. Dedupe + persist — EXCEPT ephemeral types, which skip both
     //    (each heartbeat is intentionally a new envelope and we don't
     //    want to clutter the envelopes store or survive reload).
+    //
+    //    IMPORTANT (Slice 4b.1): persistence happens BEFORE the causal
+    //    delivery check below. This means envelopes that are buffered
+    //    due to missing dependencies are already on disk, so a shutdown
+    //    mid-buffer is recoverable — Workspace.open's replay loop will
+    //    process them in ts-sorted order after hydration, and the ones
+    //    whose dependencies eventually arrive will flow through the
+    //    CausalBuffer.drain path normally.
     if (!EPHEMERAL_TYPES.has(env.type)) {
       const existing = await idbGet(current.wsDB, "envelopes", env.id);
       if (existing) return;
       await idbPut(current.wsDB, "envelopes", env);
+    }
+
+    // 2b. Causal delivery check (Slice 4b.1). Ephemeral envelopes
+    //     skip this — presence heartbeats have no causal dependencies.
+    //     Non-ephemeral envelopes go through CausalBuffer: if
+    //     dependencies are satisfied, they proceed to dispatch
+    //     immediately; otherwise they're buffered and the drain
+    //     path will pick them up when prerequisites arrive.
+    if (!EPHEMERAL_TYPES.has(env.type)) {
+      if (!CausalBuffer.canDeliver(current, env)) {
+        CausalBuffer.buffer(current, env);
+        return;
+      }
     }
 
     // 3. Figure out the decryption key. For envelopes addressed to a
@@ -4981,6 +5166,40 @@ const EnvelopeDispatch = {
 
     // 4. Type-specific handling.
     await this.handle(current, env, inner);
+
+    // 4b. Advance the per-sender high-water-mark and drain the
+    //     causal buffer. Any envelopes whose dependencies are now
+    //     satisfied get delivered in a transitive pass.
+    if (!EPHEMERAL_TYPES.has(env.type)) {
+      CausalBuffer.advance(current, env);
+      if (CausalBuffer.size(current) > 0) {
+        // Re-dispatch released envelopes via a trampoline that
+        // skips the causal check (they just passed it). Use a local
+        // helper to avoid recursion through the full receive path.
+        await CausalBuffer.drain(current, async (releasedEnv) => {
+          // Run the same post-persist, post-causal flow for the
+          // released envelope. We inline the key lookup + decrypt
+          // + handle steps instead of re-entering receive() so the
+          // causal check doesn't fire a second time.
+          let relKey;
+          if (releasedEnv.ch && current.channelKeys[releasedEnv.ch]) {
+            relKey = current.channelKeys[releasedEnv.ch];
+          } else if (releasedEnv.ch) {
+            const res = await tryResolveIncomingDm(current, releasedEnv.ch);
+            if (res) relKey = current.channelKeys[releasedEnv.ch];
+            else return;
+          } else {
+            relKey = current.rootKey;
+          }
+          if (!relKey) return;
+          let relInner;
+          try { relInner = await Envelope.decrypt(releasedEnv, relKey); }
+          catch { return; }
+          await this.handle(current, releasedEnv, relInner);
+          CausalBuffer.advance(current, releasedEnv);
+        });
+      }
+    }
 
     // 5. Re-render.
     if (State.view === "workspace") render();
@@ -6100,7 +6319,7 @@ if (/[?&]debug=1/.test(location.search)) {
     sendAttachment, createGroupDm, BlobStore, BlobTransfer,
     sendReactionAdd, sendReactionRemove, toggleReaction, parseMentions,
     sendPresence, PresenceDriver, EPHEMERAL_TYPES,
-    sendPeerAnnounce, SeenSet,
+    sendPeerAnnounce, SeenSet, CausalBuffer,
     bytesToB64Url, b64UrlToBytes, bytesToHex, bytesToB64,
     render, setState
   };

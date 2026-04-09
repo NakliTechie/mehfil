@@ -2,7 +2,7 @@
 
 Browser-native, local-first team chat. Single HTML file. No accounts. No central server. Messages are end-to-end encrypted, signed by the sender, and stored on the devices of workspace members — never on a central server.
 
-> **Status: Slice 0+1+2+3+3d.3+4a.** Solo workspace, two-person Mode A, full Slice 3 (channels, DMs, group DMs, attachments, peer blob transfer, reactions, mentions, threads, presence), **plus multi-peer gossip mesh** — partial-mesh WebRTC routing, 10K-entry seen-set LRU dedupe, `gossip.peer_announce` for peer discovery 2+ hops away. See `MEHFIL-SPEC.md`, `MEHFIL-WALKTHROUGHS.md`, and `PENDING.md` for the full v1 plan.
+> **Status: Slice 0+1+2+3+3d.3+4a+4b.1.** Solo workspace, two-person Mode A, full Slice 3 (channels, DMs, group DMs, attachments, peer blob transfer, reactions, mentions, threads, presence), multi-peer gossip mesh with seen-set dedupe, **plus vector clock causal delivery buffer** — out-of-order envelopes are held until their dependencies arrive, then released in causal order. See `MEHFIL-SPEC.md`, `MEHFIL-WALKTHROUGHS.md`, and `PENDING.md` for the full v1 plan.
 
 ## What works today
 
@@ -37,6 +37,7 @@ Browser-native, local-first team chat. Single HTML file. No accounts. No central
 - **Threaded messages (Slice 3d.2)** — click 💬 on any message to open a thread side panel. Replies carry a `thread: <parent_id>` field that points to the ROOT parent (flat threading, no nested trees). The main channel view filters out replies and shows a "💬 N replies" pill on parents that have at least one reply. Reply counts are derived on render (no CRDT counter needed). Deleted parents still show the reply chain with a "(parent message not available)" stub
 - **Presence (Slice 3d.3)** — ephemeral `presence.update` envelopes (signed + encrypted but never persisted to the envelopes store) broadcast every 30 seconds while focused, transition to "away" on `window.blur`, best-effort "offline" on `beforeunload`. Status dots overlay the avatar in the sidebar People section — green/yellow/grey for online/away/offline. A 30-second stale sweep flips any peer silent for >90 seconds to "offline". Hover the row for a relative "last seen N m ago" tooltip
 - **Multi-peer gossip mesh (Slice 4a)** — `PeerMgr` now supports many peers per workspace via `Map<wsId, Map<peer_id, transport>>`. Every non-ephemeral envelope is rebroadcast to all attached peers except the source on receive, so messages propagate across a partial mesh (e.g. A↔B and B↔C will deliver an A-originated message to C without a direct A↔C link). A 10K-entry `SeenSet` LRU (backed by the IndexedDB `seen_set` store from Slice 0) drops duplicate envelopes at the framing layer before they reach the dispatch pipeline — loop-killing in one hop. New `gossip.peer_announce` envelope fired by `PeerMgr.attach` so peers 2+ hops away learn about new arrivals through gossip
+- **Vector clock causal delivery (Slice 4b.1)** — envelopes carrying `lc: [[user_id, counter], ...]` are checked against a per-(sender, device) high-water-mark on arrival. If counter is more than hwm+1, the envelope is held in a per-bundle `causalBuffer` until the gap closes. Transitive drain releases chains (m3 releases m4 releases m5). Persist-first rule: envelopes hit IDB BEFORE the causal check, so buffered envelopes survive a shutdown mid-buffer and rehydrate from `Workspace.open`'s replay on next boot
 
 ## Trying the two-person flow
 
@@ -72,7 +73,8 @@ Two real browser tabs work but are slow to set up. For faster iteration, append 
 | 3d.2 — Threads (side panel, flat threading) | — | ✅ done |
 | 3d.3 — Presence | — | ✅ done |
 | 4a — Multi-peer mesh + seen-set + rebroadcast | — (foundation for WT-09) | ✅ done |
-| 4b — Vector clock causal delivery + Yjs workspace doc | — | ⏳ next |
+| 4b.1 — Vector clock causal delivery buffer | — | ✅ done |
+| 4b.2 — Yjs workspace doc + WorkspaceDoc wrapper | — | ⏳ next |
 | 4c — Gap detection UI + resync | WT-31 | — |
 | 4 — Gossip Mode B | WT-09, 31 | — |
 | 5 — Search + admin | WT-18–22, 33 | — |
