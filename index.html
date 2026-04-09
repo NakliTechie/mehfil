@@ -1906,6 +1906,19 @@ const Workspace = {
     // history once it received it. Slice 4a §20a.
     await SeenSet.hydrate(wsDB);
 
+    // Slice 4b.2: load or migrate the Yjs workspace doc. If a
+    // persisted doc exists (written by a previous open or by a
+    // previous save), use it. Otherwise run the one-time migration
+    // from the legacy kv-projected state: builds an initial doc
+    // from the current channels/members projections and the kv
+    // `workspace_meta` record. After migration, `workspace_yjs`
+    // becomes the authoritative source for metadata, though the
+    // kv records stay in place for backward compat during 4b.2.
+    let doc = await WorkspaceDoc.load(wsDB);
+    if (!doc) {
+      doc = await WorkspaceDoc.migrateFromLegacy(wsDB, meta, channels, members);
+    }
+
     // Slice 4b.1: vector clock causal delivery state. `hwm` is the
     // per-sender-per-device high-water-mark — the highest `counter`
     // we've seen in any envelope's `lc` entry for that (user, device)
@@ -1934,7 +1947,7 @@ const Workspace = {
     }
     const causalBuffer = [];
 
-    return { wsDB, meta, channels, members, channelKeys, rootKey, messages, presence, hwm, causalBuffer };
+    return { wsDB, meta, channels, members, channelKeys, rootKey, messages, presence, hwm, causalBuffer, doc };
   },
 
   async sendMessage({ wsDB, meta, identity, channelId, channelKey, body, vectorClock, mentions, threadId }) {
@@ -3270,13 +3283,22 @@ function renderSettingsModal() {
   const myUserId = bytesToB64Url(State.identity.pubkey);
   const me = State.current.members.find(m => m.id === myUserId) || State.current.members[0];
   const fp = me.fp;   // pre-computed during Workspace.open
+  const wsName = State.current.meta.name;
   const wrap = document.createElement("div");
   wrap.className = "modal-bg";
   wrap.innerHTML = `
     <div class="card" style="max-width: 480px;">
-      <h1>Identity</h1>
+      <h1>Settings</h1>
       <div class="field">
-        <label>Fingerprint</label>
+        <label>Workspace name</label>
+        <div class="row" style="gap: 8px;">
+          <input type="text" id="ws-rename" value="${escapeHTML(wsName)}" maxlength="64" style="flex: 1;">
+          <button id="settings-rename">Rename</button>
+        </div>
+        <div class="err" id="rename-err"></div>
+      </div>
+      <div class="field">
+        <label>Your fingerprint</label>
         <div class="mono" style="background: var(--bg-sunken); padding: 10px; border-radius: 6px;">${escapeHTML(fp)}</div>
       </div>
       <div class="field">
@@ -3296,6 +3318,24 @@ function renderSettingsModal() {
   document.body.appendChild(wrap);
   wrap.querySelector("#settings-close").onclick = () => { wrap.remove(); closeModal(); };
   wrap.querySelector("#settings-backup").onclick = () => { wrap.remove(); openBackupModal(); };
+  wrap.querySelector("#settings-rename").onclick = async () => {
+    const $err = wrap.querySelector("#rename-err");
+    $err.textContent = "";
+    const newName = wrap.querySelector("#ws-rename").value.trim();
+    if (!newName) { $err.textContent = "Name is required."; return; }
+    if (newName === wsName) { $err.textContent = "Same as current name."; return; }
+    wrap.querySelector("#settings-rename").disabled = true;
+    try {
+      // Mutate the Yjs doc locally, capture the update, broadcast.
+      const update = WorkspaceDoc.setName(State.current.doc, newName);
+      await sendWorkspacePatch(State.current, update);
+      wrap.remove();
+      setState({ modal: null });
+    } catch (e) {
+      $err.textContent = e.message;
+      wrap.querySelector("#settings-rename").disabled = false;
+    }
+  };
 }
 
 /* ------------------------------------------------------------
@@ -4916,6 +4956,202 @@ const CausalBuffer = {
 };
 
 /* ------------------------------------------------------------
+ *  §20d  WorkspaceDoc — Yjs CRDT wrapper (Slice 4b.2)
+ *
+ *  Workspace metadata (name, channels, members, settings) lives
+ *  in a Yjs document. Each mutation captures an incremental
+ *  update via Y.encodeStateAsUpdate, which travels inside a
+ *  `workspace.patch` envelope to other peers. Recipients apply
+ *  the update via Y.applyUpdate — automatic CRDT merge.
+ *
+ *  Why a wrapper: application code should not touch Y.Doc, Y.Map
+ *  or Y.Array directly. The wrapper gives us named methods with
+ *  clean type signatures, centralizes the "capture the update
+ *  and broadcast" pattern, and provides a single chokepoint for
+ *  migrations and observability. If we ever need to swap Yjs for
+ *  something else, only this module changes.
+ *
+ *  The Yjs doc has three top-level shared types:
+ *    - meta     (Y.Map)  — workspace name, icon, settings
+ *    - channels (Y.Map)  — channel_id → channel record
+ *    - members  (Y.Map)  — user_id → member record
+ *
+ *  For Slice 4b.2 we wire up `meta.name` as the first fully-
+ *  migrated field. Channels and members still flow through the
+ *  existing channel.create / member.join envelope paths and are
+ *  mirrored into the Yjs doc on ingest — the old kv/projection
+ *  stores stay authoritative for those until Slice 5 migrates
+ *  them one-by-one.
+ * ------------------------------------------------------------ */
+const WorkspaceDoc = {
+  /**
+   * Create a fresh Y.Doc with the expected top-level shared types.
+   * Used by both the migration path (Workspace.create → seed doc
+   * from the initial metadata) and by the loader when no persisted
+   * doc exists yet.
+   */
+  create() {
+    if (!Y) throw new Error("Yjs not loaded");
+    const doc = new Y.Doc();
+    // Touch the shared types so they exist in the doc. Y.Map is
+    // created lazily on first access.
+    doc.getMap("meta");
+    doc.getMap("channels");
+    doc.getMap("members");
+    return doc;
+  },
+
+  /**
+   * Load the Yjs doc from a workspace's IDB. If no persisted doc
+   * exists, returns null so the caller can run migration.
+   */
+  async load(wsDB) {
+    const bytes = await idbGet(wsDB, "keys", "workspace_yjs");
+    if (!bytes) return null;
+    const doc = this.create();
+    Y.applyUpdate(doc, bytes);
+    return doc;
+  },
+
+  /**
+   * Persist the current full state of the doc as a single binary
+   * blob. This is the simplest possible persistence — every save
+   * replaces the blob with a fresh snapshot. Slice 5+ may switch
+   * to incremental persistence if the snapshot size becomes a
+   * measurable concern (it won't for small workspaces).
+   */
+  async save(wsDB, doc) {
+    const bytes = Y.encodeStateAsUpdate(doc);
+    await idbPut(wsDB, "keys", bytes, "workspace_yjs");
+  },
+
+  /**
+   * Apply a remote update to the local doc. Used by the
+   * `workspace.patch` dispatch handler.
+   */
+  applyUpdate(doc, updateBytes) {
+    Y.applyUpdate(doc, updateBytes, "remote");
+  },
+
+  /**
+   * Run a mutation inside a transaction, return the update bytes
+   * to broadcast. Callers pass the result to `sendWorkspacePatch`.
+   *
+   * IMPORTANT (Slice 4b.2): we return the FULL state, not just the
+   * delta-since-the-last-send. Yjs's delta encoding
+   * (`encodeStateAsUpdate(doc, stateVector)`) returns operations
+   * that reference prior ops as causal parents. When those are
+   * applied to a peer that doesn't already have the parents,
+   * Yjs marks them as "pending" and does NOT apply them. For a
+   * workspace where peers might independently seed their local
+   * doc (migration, join handshake, etc.), delta updates don't
+   * graft cleanly. Full-state updates always merge via the CRDT.
+   *
+   * The cost: every mutation broadcasts the full metadata blob.
+   * For workspace metadata (a few hundred bytes in practice)
+   * this is negligible. Slice 5+ may optimize via "bootstrap on
+   * join then delta" once member.welcome carries a snapshot.
+   */
+  mutate(doc, fn) {
+    Y.transact(doc, fn, "local");
+    return Y.encodeStateAsUpdate(doc);
+  },
+
+  // ========== Named mutation methods ==========
+  // Each returns the update bytes from the transaction so the
+  // caller can broadcast them via sendWorkspacePatch. Only callers
+  // that actually want to broadcast need to care about the return
+  // value — the in-memory doc is mutated either way.
+
+  setName(doc, name) {
+    return this.mutate(doc, () => {
+      doc.getMap("meta").set("name", name);
+    });
+  },
+
+  addChannel(doc, channelRec) {
+    return this.mutate(doc, () => {
+      const channels = doc.getMap("channels");
+      // Store a plain JSON-compatible record. Yjs handles the merge
+      // at the map-entry granularity: concurrent adds of different
+      // ids both land, concurrent adds of the SAME id go through
+      // Y.Map LWW semantics (last writer in the merge wins).
+      channels.set(channelRec.id, JSON.parse(JSON.stringify(channelRec)));
+    });
+  },
+
+  addMember(doc, memberRec) {
+    return this.mutate(doc, () => {
+      const members = doc.getMap("members");
+      // x25519_pub is a Uint8Array — serialize as array for Yjs
+      // (which wants plain JSON-compatible values in Y.Map).
+      const clean = { ...memberRec };
+      if (clean.x25519_pub instanceof Uint8Array) {
+        clean.x25519_pub_b64 = bytesToB64(clean.x25519_pub);
+        delete clean.x25519_pub;
+      }
+      if (clean.fpBytes) delete clean.fpBytes;  // derived, re-computed on load
+      members.set(memberRec.id, JSON.parse(JSON.stringify(clean)));
+    });
+  },
+
+  // ========== Read projections ==========
+
+  getName(doc) {
+    return doc.getMap("meta").get("name");
+  },
+
+  getChannels(doc) {
+    const channels = doc.getMap("channels");
+    const out = [];
+    channels.forEach((v) => out.push({ ...v }));
+    return out;
+  },
+
+  getMembers(doc) {
+    const members = doc.getMap("members");
+    const out = [];
+    members.forEach((v) => {
+      const rec = { ...v };
+      if (rec.x25519_pub_b64) {
+        rec.x25519_pub = b64ToBytes(rec.x25519_pub_b64);
+        delete rec.x25519_pub_b64;
+      }
+      out.push(rec);
+    });
+    return out;
+  },
+
+  /**
+   * Build an initial Yjs doc from the existing (pre-4b.2) projected
+   * state. Used by the migration path in Workspace.open.
+   */
+  async migrateFromLegacy(wsDB, meta, channels, members) {
+    const doc = this.create();
+    Y.transact(doc, () => {
+      doc.getMap("meta").set("name", meta.name);
+      doc.getMap("meta").set("created_at", meta.created_at || Date.now());
+      const chMap = doc.getMap("channels");
+      for (const ch of channels) {
+        chMap.set(ch.id, JSON.parse(JSON.stringify(ch)));
+      }
+      const memMap = doc.getMap("members");
+      for (const m of members) {
+        const clean = { ...m };
+        if (clean.x25519_pub instanceof Uint8Array) {
+          clean.x25519_pub_b64 = bytesToB64(clean.x25519_pub);
+          delete clean.x25519_pub;
+        }
+        if (clean.fpBytes) delete clean.fpBytes;
+        memMap.set(m.id, JSON.parse(JSON.stringify(clean)));
+      }
+    }, "migration");
+    await this.save(wsDB, doc);
+    return doc;
+  }
+};
+
+/* ------------------------------------------------------------
  *  §20b  BlobTransfer — peer-to-peer attachment delivery
  *         (Slice 3c.1)
  *
@@ -5486,6 +5722,41 @@ const EnvelopeDispatch = {
         // observed peers.
         if (!current.knownPeers) current.knownPeers = new Set();
         current.knownPeers.add(env.from);
+        break;
+      }
+
+      case "workspace.patch": {
+        // Slice 4b.2: apply an incremental Yjs update to the local
+        // workspace doc. `inner.update` is a Uint8Array produced by
+        // Y.encodeStateAsUpdate on the sender side. Y.applyUpdate
+        // is commutative + idempotent — out-of-order arrival is
+        // handled by Yjs itself, so we don't need the causal buffer
+        // to block this type. (The receive path already did the
+        // causal check before calling us, but Yjs would tolerate
+        // arbitrary order anyway.)
+        if (!current.doc || !inner.update) break;
+        WorkspaceDoc.applyUpdate(current.doc, inner.update);
+        // Persist the updated state as the new snapshot. This is
+        // the simplest possible persistence strategy — every apply
+        // writes the full state. For tiny workspaces this is fine;
+        // Slice 5+ may switch to incremental persistence.
+        await WorkspaceDoc.save(current.wsDB, current.doc);
+        // Mirror to the kv `workspace_meta` record for paths that
+        // still read from the legacy store (ws name in sidebar, etc.)
+        // — this shim goes away when Slice 5 migrates those paths
+        // to read from current.doc directly.
+        const newName = WorkspaceDoc.getName(current.doc);
+        if (newName && newName !== current.meta.name) {
+          current.meta.name = newName;
+          await idbPut(current.wsDB, "keys", current.meta, "workspace_meta");
+          // Also update the global workspaces list so the launcher
+          // reflects the rename.
+          const gwsRec = await idbGet(State.globalDB, "workspaces", current.meta.id);
+          if (gwsRec) {
+            gwsRec.name = newName;
+            await idbPut(State.globalDB, "workspaces", gwsRec);
+          }
+        }
         break;
       }
 
@@ -6102,6 +6373,67 @@ async function sendPeerAnnounce(current) {
   }
 }
 
+/**
+ * Slice 4b.2: broadcast an incremental Yjs update as a `workspace.patch`
+ * envelope. Called after any local `WorkspaceDoc.setName` / `addChannel`
+ * / `addMember` / etc. mutation that produced an update blob.
+ *
+ * Also persists the updated doc to IDB and, for name changes, mirrors
+ * into the legacy kv `workspace_meta` record + the global workspaces
+ * list so pre-migration code paths continue to see the new name.
+ */
+async function sendWorkspacePatch(current, updateBytes) {
+  if (!current || !State.identity) return;
+  if (!updateBytes || updateBytes.length === 0) return;
+
+  // Persist the updated local doc snapshot.
+  await WorkspaceDoc.save(current.wsDB, current.doc);
+
+  // Mirror name into legacy kv + global workspaces list.
+  const newName = WorkspaceDoc.getName(current.doc);
+  if (newName && newName !== current.meta.name) {
+    current.meta.name = newName;
+    await idbPut(current.wsDB, "keys", current.meta, "workspace_meta");
+    const gwsRec = await idbGet(State.globalDB, "workspaces", current.meta.id);
+    if (gwsRec) {
+      gwsRec.name = newName;
+      await idbPut(State.globalDB, "workspaces", gwsRec);
+    }
+    // Refresh the in-memory workspaces list so the launcher sees it.
+    State.workspaces = await idbGetAll(State.globalDB, "workspaces");
+  }
+
+  // Build the envelope. workspace.patch is workspace-level
+  // (ch: null), encrypted under the workspace root key like
+  // every other admin-tier envelope.
+  const signKey = await Crypto.importSignKey(State.identity.privkey_pkcs8);
+  const meta = current.meta;
+  meta.lc_counter = (meta.lc_counter || 0) + 1;
+  await idbPut(current.wsDB, "keys", meta, "workspace_meta");
+  const myUserId = bytesToB64Url(State.identity.pubkey);
+
+  const env = await Envelope.build({
+    workspaceId: meta.id,
+    channelId: null,
+    channelKey: current.rootKey,
+    signKey,
+    signerPubkey: State.identity.pubkey,
+    deviceId: meta.device_id,
+    type: "workspace.patch",
+    inner: { update: updateBytes },
+    vectorClock: [[myUserId, meta.lc_counter]]
+  });
+
+  // Persist to the envelopes store (these are NOT ephemeral — they
+  // should survive reload and replay so new peers catch up on any
+  // workspace metadata changes they missed).
+  await idbPut(current.wsDB, "envelopes", env);
+
+  // Broadcast to all attached peers. sendEnvelope auto-marks in
+  // SeenSet so rebroadcast-back-to-us gets dropped.
+  PeerMgr.sendEnvelope(meta.id, env).catch(e => console.warn("workspace.patch send failed:", e));
+}
+
 async function sendPresence(current, status) {
   if (!current || !State.identity) return;
   const myUserId = bytesToB64Url(State.identity.pubkey);
@@ -6320,10 +6652,19 @@ if (/[?&]debug=1/.test(location.search)) {
     sendReactionAdd, sendReactionRemove, toggleReaction, parseMentions,
     sendPresence, PresenceDriver, EPHEMERAL_TYPES,
     sendPeerAnnounce, SeenSet, CausalBuffer,
+    WorkspaceDoc, sendWorkspacePatch,
+    get Y() { return Y; },
     bytesToB64Url, b64UrlToBytes, bytesToHex, bytesToB64,
     render, setState
   };
 }
+
+// Yjs — lazy-loaded from esm.sh during boot(). Yjs provides the CRDT
+// for workspace metadata (channel list, member list, workspace name,
+// settings). Slice 4b.2 introduces the Yjs doc alongside the existing
+// kv meta store; the kv path continues to work during migration.
+// Pinned in PROTOCOL.md §23 (Yjs decision) and §25 (this slice).
+let Y = null;
 
 async function boot() {
   try {
@@ -6334,6 +6675,17 @@ async function boot() {
       throw new Error("Mehfil needs CompressionStream (Chrome 80+, Firefox 113+, Safari 16.4+).");
     }
     selfTest();
+
+    // Load Yjs. This is the second external runtime dep after the QR
+    // encoder (Slice 2) — also lazy-loaded from esm.sh, also cached by
+    // the browser after first load. If the user is offline on first
+    // boot we show a clean error.
+    try {
+      Y = await import("https://esm.sh/yjs@13");
+    } catch (e) {
+      throw new Error("Couldn't load Yjs from esm.sh (offline?). Mehfil needs it to merge workspace metadata changes.");
+    }
+
     const globalDB = await openGlobalDB();
     const identity = await Identity.ensure(globalDB);
     const workspaces = await idbGetAll(globalDB, "workspaces");

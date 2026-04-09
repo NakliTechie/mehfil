@@ -884,7 +884,116 @@ Result: both Bose and Charlie's `bundle.messages` contain "hello mesh"; both see
 
 ---
 
-**Version:** living document, updated per slice. Slice 2 added §8–§11. Slice 3a extended §3 (closed-form padding). Slice 3b bumped §6 to v2 and added §12–§14. Slice 3c added §3b (BlobStore), §15 (group DMs simplification), §16 (attachments). Slice 3c.1 added §17 (peer-to-peer blob transfer) and extended §9 with tags 0x03 + 0x04. Slice 3d.1 added §18 (reactions), §19 (@mentions), §20 (polish). Slice 3d.2 added §21 (threads). Slice 3d.3 added §22 (presence) and established the ephemeral-type fast-path. Slice 4a added §23 (multi-peer mesh + gossip rebroadcast + SeenSet + `gossip.peer_announce`). Slice 4b.1 added §24 (vector clock causal delivery buffer).
+**Version:** living document, updated per slice. Slice 2 added §8–§11. Slice 3a extended §3 (closed-form padding). Slice 3b bumped §6 to v2 and added §12–§14. Slice 3c added §3b (BlobStore), §15 (group DMs simplification), §16 (attachments). Slice 3c.1 added §17 (peer-to-peer blob transfer) and extended §9 with tags 0x03 + 0x04. Slice 3d.1 added §18 (reactions), §19 (@mentions), §20 (polish). Slice 3d.2 added §21 (threads). Slice 3d.3 added §22 (presence) and established the ephemeral-type fast-path. Slice 4a added §23 (multi-peer mesh + gossip rebroadcast + SeenSet + `gossip.peer_announce`). Slice 4b.1 added §24 (vector clock causal delivery buffer). Slice 4b.2 added §25 (Yjs workspace doc + `WorkspaceDoc` wrapper + `workspace.patch` envelope).
+
+## 25. Yjs workspace doc (Slice 4b.2)
+
+Spec §5.4 + §6.3 specify Yjs as the CRDT for workspace metadata (name, channel list, member list, settings). Slice 4b.2 introduces the Yjs document alongside the existing kv `workspace_meta` record. Both stores coexist during the migration period; future slices migrate channel/member mutations to the Yjs path one at a time.
+
+### Lazy load
+
+Yjs is lazy-loaded from `https://esm.sh/yjs@13` during `boot()`. Module-level `let Y = null` is populated on first boot and cached by the browser thereafter. If the user is offline on first launch, boot() throws a clean error: "Couldn't load Yjs from esm.sh (offline?). Mehfil needs it to merge workspace metadata changes."
+
+This is the second external runtime dep after the QR encoder (Slice 2). Both follow the same pattern: lazy import from esm.sh, cached by the browser.
+
+### Document structure
+
+Three top-level shared types:
+
+```
+doc.getMap("meta")     — workspace name, icon, settings
+doc.getMap("channels") — channel_id → channel record (JSON)
+doc.getMap("members")  — user_id → member record (JSON)
+```
+
+Channel and member records are stored as plain JSON-compatible values (Y.Map's nested record support). Binary fields (`x25519_pub`) are base64url-encoded as `x25519_pub_b64` so they survive Yjs's structural cloning. Derived fields (`fpBytes`) are stripped before storage and recomputed on read.
+
+### `WorkspaceDoc` wrapper
+
+Application code never touches `Y.Doc`, `Y.Map`, or `Y.Array` directly. The `WorkspaceDoc` module exposes named methods:
+
+- `WorkspaceDoc.create()` — fresh doc with all top-level types initialized
+- `WorkspaceDoc.load(wsDB)` — load persisted doc from `keys → workspace_yjs`, returns null if absent
+- `WorkspaceDoc.save(wsDB, doc)` — write the full state as a binary snapshot to `keys → workspace_yjs`
+- `WorkspaceDoc.applyUpdate(doc, bytes)` — apply a remote update via `Y.applyUpdate(doc, bytes, "remote")`
+- `WorkspaceDoc.mutate(doc, fn)` — run `fn` inside a `Y.transact` and return the **full state** as update bytes (see "delta vs full state" gotcha below)
+- `WorkspaceDoc.setName(doc, name)` — workspace rename
+- `WorkspaceDoc.addChannel(doc, channelRec)` — add a channel to the channels map
+- `WorkspaceDoc.addMember(doc, memberRec)` — add a member to the members map
+- `WorkspaceDoc.getName(doc)`, `getChannels(doc)`, `getMembers(doc)` — read projections
+- `WorkspaceDoc.migrateFromLegacy(wsDB, meta, channels, members)` — one-time migration: build a fresh doc from the existing kv-projected state, persist, return the new doc
+
+### Delta vs full state — the gotcha
+
+Yjs's `Y.encodeStateAsUpdate(doc, stateVector)` returns delta updates that reference prior operations as **causal parents**. When you apply a delta to a peer that doesn't already have the parents, Yjs marks the new ops as "pending" and does NOT integrate them into the visible state.
+
+In a real Yjs-over-WebSocket setup, both peers exchange state vectors at handshake time and then trade incremental deltas. Mehfil's transport doesn't have a handshake-then-stream model — peers may join late, may have independently created their local doc via migration, and may receive a `workspace.patch` envelope at any time without prior synchronization.
+
+The fix in `WorkspaceDoc.mutate`: return `Y.encodeStateAsUpdate(doc)` (full state, no state vector argument) instead of the delta. Every mutation broadcasts the full metadata blob. The cost is bytes-on-the-wire — for small workspaces (a few hundred bytes of metadata), this is negligible. Slice 5+ may add a "bootstrap on join then delta" optimization once `member.welcome` carries an authoritative snapshot.
+
+The pre-fix bug: a 42-byte delta from Asha's rename couldn't graft onto Bose's independently-created doc. Bose's local state stayed at the original name. After the fix, the same mutation produces a 542-byte full-state update that Bose can apply and converge correctly.
+
+### `workspace.patch` envelope
+
+```
+type: "workspace.patch"
+inner: { update: <Yjs update bytes> }
+```
+
+Workspace-level (`ch: null`), encrypted under the workspace root key like every other admin-tier envelope. **Persisted to the envelopes store** — workspace patches are NOT ephemeral. They go through the normal dispatch pipeline including the causal delivery buffer (§24), though Yjs's CRDT semantics mean out-of-order arrival would be tolerated regardless.
+
+### Dispatch handler
+
+```
+case "workspace.patch":
+  WorkspaceDoc.applyUpdate(current.doc, inner.update);
+  await WorkspaceDoc.save(current.wsDB, current.doc);
+  // Mirror name into legacy kv + global workspaces list
+  const newName = WorkspaceDoc.getName(current.doc);
+  if (newName && newName !== current.meta.name) {
+    current.meta.name = newName;
+    await idbPut(current.wsDB, "keys", current.meta, "workspace_meta");
+    // ... also update the global workspaces row
+  }
+  break;
+```
+
+The "mirror to legacy kv" step is a transitional shim. It exists because the sidebar render path (and other UI code) still reads `current.meta.name` directly, not via `WorkspaceDoc.getName(current.doc)`. As Slice 5 migrates UI paths to read from the Yjs doc, the shim can be removed.
+
+### `sendWorkspacePatch` helper
+
+The local-mutation-then-broadcast pattern:
+
+```
+const update = WorkspaceDoc.setName(current.doc, "New Name");
+await sendWorkspacePatch(current, update);
+```
+
+`sendWorkspacePatch` handles all the wiring: persists the doc, mirrors the name into legacy kv + global workspaces, builds the envelope (signed + encrypted under workspace root key), persists the envelope, broadcasts via `PeerMgr.sendEnvelope` (which also marks in SeenSet to prevent reflection back to us).
+
+### Migration path
+
+`Workspace.open` checks for a persisted Yjs doc first. If absent (a workspace created before 4b.2), it runs `WorkspaceDoc.migrateFromLegacy` which builds a fresh doc from the current kv `workspace_meta` + projected `channels` and `members` stores. The new doc is persisted immediately so subsequent opens take the load path. Migration is idempotent — running it twice is safe but the second invocation never fires because the persisted doc now exists.
+
+### What's in 4b.2 vs 4b.3+
+
+Slice 4b.2 wires up the rename-workspace path end-to-end as the proof-of-concept mutation. Channel and member mutations still flow through their existing envelope types (`channel.create`, `member.join`). Those are migrated to the Yjs path in Slice 5 admin work, where they pair naturally with the rekey + member-removal flows.
+
+### Verified end-to-end
+
+Single bundle:
+- Workspace.create → Workspace.open → migration runs → 518-byte initial Yjs doc persisted
+- WorkspaceDoc.setName → 542-byte full-state update bytes
+- sendWorkspacePatch → envelope persisted, legacy meta + global workspaces row mirrored
+- Sidebar reflects the new name immediately
+
+Cross-peer (two independent bundles, two independent IDB instances):
+- Asha mutates her doc, sends `workspace.patch` envelope
+- Bose's independently-created doc (initial name "YjsTest") receives the envelope via `EnvelopeDispatch`
+- `WorkspaceDoc.applyUpdate` merges the full-state update via Yjs's CRDT
+- Bose's doc name converges to "YjsTest Renamed"
+- Bose's legacy `meta.name` mirrored
+- Bose's persisted doc round-trips through `WorkspaceDoc.load` → still renamed
 
 ## 24. Vector clock causal delivery (Slice 4b.1)
 

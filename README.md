@@ -2,7 +2,7 @@
 
 Browser-native, local-first team chat. Single HTML file. No accounts. No central server. Messages are end-to-end encrypted, signed by the sender, and stored on the devices of workspace members — never on a central server.
 
-> **Status: Slice 0+1+2+3+3d.3+4a+4b.1.** Solo workspace, two-person Mode A, full Slice 3 (channels, DMs, group DMs, attachments, peer blob transfer, reactions, mentions, threads, presence), multi-peer gossip mesh with seen-set dedupe, **plus vector clock causal delivery buffer** — out-of-order envelopes are held until their dependencies arrive, then released in causal order. See `MEHFIL-SPEC.md`, `MEHFIL-WALKTHROUGHS.md`, and `PENDING.md` for the full v1 plan.
+> **Status: Slice 0+1+2+3+3d.3+4a+4b.1+4b.2.** Solo workspace, two-person Mode A, full Slice 3 (channels, DMs, group DMs, attachments, peer blob transfer, reactions, mentions, threads, presence), multi-peer gossip mesh with seen-set dedupe, vector clock causal delivery buffer, **plus a Yjs CRDT for workspace metadata** — workspace renames merge across peers via `workspace.patch` envelopes carrying full-state Yjs updates. See `MEHFIL-SPEC.md`, `MEHFIL-WALKTHROUGHS.md`, and `PENDING.md` for the full v1 plan.
 
 ## What works today
 
@@ -38,6 +38,7 @@ Browser-native, local-first team chat. Single HTML file. No accounts. No central
 - **Presence (Slice 3d.3)** — ephemeral `presence.update` envelopes (signed + encrypted but never persisted to the envelopes store) broadcast every 30 seconds while focused, transition to "away" on `window.blur`, best-effort "offline" on `beforeunload`. Status dots overlay the avatar in the sidebar People section — green/yellow/grey for online/away/offline. A 30-second stale sweep flips any peer silent for >90 seconds to "offline". Hover the row for a relative "last seen N m ago" tooltip
 - **Multi-peer gossip mesh (Slice 4a)** — `PeerMgr` now supports many peers per workspace via `Map<wsId, Map<peer_id, transport>>`. Every non-ephemeral envelope is rebroadcast to all attached peers except the source on receive, so messages propagate across a partial mesh (e.g. A↔B and B↔C will deliver an A-originated message to C without a direct A↔C link). A 10K-entry `SeenSet` LRU (backed by the IndexedDB `seen_set` store from Slice 0) drops duplicate envelopes at the framing layer before they reach the dispatch pipeline — loop-killing in one hop. New `gossip.peer_announce` envelope fired by `PeerMgr.attach` so peers 2+ hops away learn about new arrivals through gossip
 - **Vector clock causal delivery (Slice 4b.1)** — envelopes carrying `lc: [[user_id, counter], ...]` are checked against a per-(sender, device) high-water-mark on arrival. If counter is more than hwm+1, the envelope is held in a per-bundle `causalBuffer` until the gap closes. Transitive drain releases chains (m3 releases m4 releases m5). Persist-first rule: envelopes hit IDB BEFORE the causal check, so buffered envelopes survive a shutdown mid-buffer and rehydrate from `Workspace.open`'s replay on next boot
+- **Yjs workspace doc (Slice 4b.2)** — workspace metadata (name, channels, members, settings) lives in a Yjs CRDT lazy-loaded from esm.sh. New `workspace.patch` envelope type carries full-state Yjs update bytes between peers. The `WorkspaceDoc` wrapper module exposes named methods (`setName`, `addChannel`, `addMember`, etc.) so application code never touches `Y.Doc` directly. Settings → Rename workspace fully wired as the proof-of-concept mutation; channel and member mutations migrate to the Yjs path in Slice 5
 
 ## Trying the two-person flow
 
@@ -74,8 +75,8 @@ Two real browser tabs work but are slow to set up. For faster iteration, append 
 | 3d.3 — Presence | — | ✅ done |
 | 4a — Multi-peer mesh + seen-set + rebroadcast | — (foundation for WT-09) | ✅ done |
 | 4b.1 — Vector clock causal delivery buffer | — | ✅ done |
-| 4b.2 — Yjs workspace doc + WorkspaceDoc wrapper | — | ⏳ next |
-| 4c — Gap detection UI + resync | WT-31 | — |
+| 4b.2 — Yjs workspace doc + WorkspaceDoc wrapper | — | ✅ done |
+| 4c — Gap detection UI + resync | WT-31 | ⏳ next |
 | 4 — Gossip Mode B | WT-09, 31 | — |
 | 5 — Search + admin | WT-18–22, 33 | — |
 | 6 — Tier UX | WT-10, 35 | — |
