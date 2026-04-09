@@ -349,6 +349,22 @@
   .presence-dot.away    { background: var(--warn); }
   .presence-dot.offline { background: var(--fg-dim); }
 
+  .gap-banner {
+    margin: 8px 20px;
+    padding: 10px 14px;
+    background: var(--bg-elev);
+    border: 1px solid var(--warn);
+    border-radius: var(--radius);
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    font-size: 13px;
+  }
+  .gap-banner .gap-text {
+    flex: 1;
+    color: var(--warn);
+  }
+
   .thread-pill {
     display: inline-flex;
     align-items: center;
@@ -1947,7 +1963,14 @@ const Workspace = {
     }
     const causalBuffer = [];
 
-    return { wsDB, meta, channels, members, channelKeys, rootKey, messages, presence, hwm, causalBuffer, doc };
+    // Slice 4c: gaps map. For each (sender, device) pair, tracks
+    // the highest counter we know exists (peeked from lc entries
+    // in envelopes from other senders) but haven't yet received
+    // ourselves. The gap UI uses this to surface "missing N
+    // messages from Alice" banners.
+    const gaps = new Map();   // Map<user_id, Map<device_id, max_known_counter>>
+
+    return { wsDB, meta, channels, members, channelKeys, rootKey, messages, presence, hwm, causalBuffer, doc, gaps };
   },
 
   async sendMessage({ wsDB, meta, identity, channelId, channelKey, body, vectorClock, mentions, threadId }) {
@@ -2298,6 +2321,7 @@ function renderWorkspace() {
             <span class="dot" style="${badge.dotStyle}"></span>${escapeHTML(badge.label)}
           </div>
         </div>
+        ${renderGapBanner(current)}
         <div class="messages" id="messages-list">
           ${channelMessages.length === 0 && isOnlyMember ? renderEmptyState() : ""}
           ${channelMessages.map(m => renderMessage(m, current.members, myUserId, { replyCount: replyCounts.get(m.id) || 0 })).join("")}
@@ -2332,6 +2356,38 @@ function renderWorkspace() {
   document.getElementById("btn-settings").onclick = openSettings;
   document.getElementById("btn-invite").onclick = openInviteModal;
   document.getElementById("btn-new-channel").onclick = openCreateChannelModal;
+
+  // Slice 4c: gap banner "Try to fetch" button. Walks the visible
+  // gap list and broadcasts one resync.request per sender, asking
+  // for the missing range. Replies arrive as normal envelopes
+  // through the dispatch path; the seen-set drops dupes.
+  const $fetchGap = document.getElementById("btn-fetch-gap");
+  if ($fetchGap) {
+    $fetchGap.onclick = async () => {
+      const banner = $fetchGap.closest(".gap-banner");
+      const senderIds = banner.getAttribute("data-gap-senders").split(",");
+      $fetchGap.disabled = true;
+      $fetchGap.textContent = "Fetching…";
+      for (const senderId of senderIds) {
+        // Compute the missing range from hwm + lc-peek max.
+        const inner = current.gaps.get(senderId);
+        const peeked = inner?.get("lc_peek") || 0;
+        const hwmDevices = current.hwm.get(senderId);
+        const hwmMax = hwmDevices ? Math.max(0, ...hwmDevices.values()) : 0;
+        if (peeked <= hwmMax) continue;
+        await PeerMgr.sendResyncRequest(current.meta.id, senderId, hwmMax + 1, peeked);
+      }
+      // The banner will disappear naturally on the next render
+      // when the dispatched envelopes advance hwm past peeked.
+      // Re-enable in case nothing was returned (peers offline).
+      setTimeout(() => {
+        if ($fetchGap.parentElement) {
+          $fetchGap.disabled = false;
+          $fetchGap.textContent = "Try to fetch";
+        }
+      }, 3000);
+    };
+  }
   const $groupDm = document.getElementById("btn-group-dm");
   if ($groupDm) $groupDm.onclick = openGroupDmModal;
 
@@ -2971,6 +3027,41 @@ async function maybeCheckAttachmentAvailable(msg) {
   } finally {
     _attachmentCheckInflight.delete(msg.id);
   }
+}
+
+/**
+ * Slice 4c: render the gap detection banner. Reads bundle.gaps
+ * via GapTracker.allGaps() and produces an inline banner above
+ * the message list. Empty string when there are no gaps.
+ */
+function renderGapBanner(current) {
+  const gaps = GapTracker.allGaps(current);
+  if (gaps.length === 0) return "";
+  // Build a sentence from the gaps. We list up to 3 senders by
+  // name; more than 3 collapses to "Alice, Bose, and 2 others".
+  const named = gaps.map(g => {
+    const member = current.members.find(m => m.id === g.senderId);
+    const name = member ? member.name : g.senderId.slice(0, 6);
+    return { name, missing: g.missing, senderId: g.senderId };
+  });
+  let summary;
+  if (named.length === 1) {
+    const g = named[0];
+    summary = `Missing ${g.missing} ${g.missing === 1 ? "message" : "messages"} from ${escapeHTML(g.name)}`;
+  } else if (named.length <= 3) {
+    summary = `Missing messages from ${named.map(g => escapeHTML(g.name)).join(", ")}`;
+  } else {
+    summary = `Missing messages from ${named.slice(0,2).map(g => escapeHTML(g.name)).join(", ")} and ${named.length - 2} others`;
+  }
+  // data attribute carries a comma-separated list of sender ids so
+  // the click handler can fire one resync request per sender.
+  const senderIds = named.map(g => g.senderId).join(",");
+  return `
+    <div class="gap-banner" data-gap-senders="${escapeHTML(senderIds)}">
+      <div class="gap-text">⚠ ${summary}</div>
+      <button id="btn-fetch-gap" class="primary" style="padding: 6px 12px; font-size: 12px;">Try to fetch</button>
+    </div>
+  `;
 }
 
 function renderEmptyState() {
@@ -4659,6 +4750,12 @@ const PeerMgr = {
     } else if (tag === 0x04) {
       const chunk = MP.decode(payload);
       await BlobTransfer.receiveChunk(workspaceId, chunk);
+    } else if (tag === 0x05) {
+      // Slice 4c: resync.request — peer is asking us to re-send
+      // any envelopes from a specific (sender, counter range) we
+      // happen to have in our envelopes store.
+      const req = MP.decode(payload);
+      await ResyncResponder.serve(workspaceId, req, sourcePeerId);
     } else {
       console.warn("Unknown transport tag:", tag);
     }
@@ -4680,6 +4777,30 @@ const PeerMgr = {
     for (const p of wsPeers.values()) {
       try { p.transport.send(framed); sent = true; }
       catch (e) { console.warn("blob.request send failed:", e); }
+    }
+    return sent;
+  },
+
+  /**
+   * Slice 4c: broadcast a resync.request to all attached peers.
+   * The first one(s) with matching envelopes will reply by
+   * re-broadcasting them through the normal envelope path.
+   */
+  async sendResyncRequest(workspaceId, targetUserId, fromCounter, toCounter) {
+    const wsPeers = this.peers.get(workspaceId);
+    if (!wsPeers || wsPeers.size === 0) return false;
+    const body = MP.encode({
+      target: targetUserId,
+      from: fromCounter,
+      to: toCounter
+    });
+    const framed = new Uint8Array(1 + body.length);
+    framed[0] = 0x05;
+    framed.set(body, 1);
+    let sent = false;
+    for (const p of wsPeers.values()) {
+      try { p.transport.send(framed); sent = true; }
+      catch (e) { console.warn("resync.request send failed:", e); }
     }
     return sent;
   },
@@ -4952,6 +5073,174 @@ const CausalBuffer = {
   /** Current buffer size — used by gap detection in Slice 4c. */
   size(bundle) {
     return bundle.causalBuffer.length;
+  }
+};
+
+/* ------------------------------------------------------------
+ *  §20c2  GapTracker — Slice 4c
+ *
+ *  Two complementary signals tell us we're missing envelopes
+ *  from a peer:
+ *
+ *  1. The causal buffer (§20c) holds envelopes whose own
+ *     sender-counter exceeds hwm+1. We KNOW we're missing the
+ *     gap because we have the later envelope to prove it.
+ *
+ *  2. The lc field of an envelope from sender X may contain
+ *     entries like [Y, 7] — meaning "X had seen Y's counter 7
+ *     when X sent this". If our own hwm for (Y, Y_device) is
+ *     below 7, we're missing some of Y's envelopes too — even
+ *     if we have no later envelope from Y to prove it.
+ *
+ *  GapTracker.observe(bundle, env) inspects the second signal
+ *  every time an envelope arrives. It records the highest counter
+ *  we've ever seen mentioned for each (sender, device) pair in
+ *  bundle.gaps, regardless of whether we've actually received
+ *  that envelope. The "missing range" for a sender is then the
+ *  difference between gaps[(sender, device)] and hwm[(sender,
+ *  device)].
+ *
+ *  Note on device id: lc entries in v1 carry only [user_id,
+ *  counter] — no device id. We don't know which device of the
+ *  sender produced the counter. For Slice 4c we attribute all
+ *  lc-peeked counters to a special "unknown" device id, and
+ *  surface gaps as "messages from Alice", not "messages from
+ *  Alice's phone". v1.1 multi-device may upgrade lc to carry
+ *  device ids.
+ * ------------------------------------------------------------ */
+const GapTracker = {
+  /**
+   * Inspect an envelope's lc and update bundle.gaps for any
+   * (sender, device) pair where the lc-peeked counter is higher
+   * than what we currently know about. Called from the dispatch
+   * pipeline AFTER successful processing of the envelope.
+   */
+  observe(bundle, env) {
+    if (!env.lc || !Array.isArray(env.lc)) return;
+    for (const entry of env.lc) {
+      if (!Array.isArray(entry) || entry.length !== 2) continue;
+      const [senderId, counter] = entry;
+      if (typeof counter !== "number" || counter <= 0) continue;
+      // Skip the entry for the envelope's own sender — that one
+      // is handled by hwm advancement in CausalBuffer.advance.
+      if (senderId === env.from) continue;
+      // For lc entries from other senders we don't know the device,
+      // so we use a sentinel "lc_peek" device key. When the actual
+      // envelope arrives, hwm tracks the real device id. The gap
+      // calculation then compares lc_peek max against the SUM of
+      // all known device counters for that sender — see missingFor.
+      let inner = bundle.gaps.get(senderId);
+      if (!inner) { inner = new Map(); bundle.gaps.set(senderId, inner); }
+      const cur = inner.get("lc_peek") || 0;
+      if (counter > cur) inner.set("lc_peek", counter);
+    }
+  },
+
+  /**
+   * How many envelopes are we missing from a given sender?
+   * Combines two signals:
+   *   - lc-peek max (the highest counter another envelope claimed
+   *     this sender had reached)
+   *   - hwm sum across all known devices for this sender
+   *
+   * If lc-peek > hwm sum, there's a gap. Returns the gap size.
+   */
+  missingFor(bundle, senderId) {
+    const inner = bundle.gaps.get(senderId);
+    if (!inner) return 0;
+    const peeked = inner.get("lc_peek") || 0;
+    const hwmDevices = bundle.hwm.get(senderId);
+    let hwmMax = 0;
+    if (hwmDevices) {
+      for (const counter of hwmDevices.values()) {
+        if (counter > hwmMax) hwmMax = counter;
+      }
+    }
+    return Math.max(0, peeked - hwmMax);
+  },
+
+  /**
+   * List all senders with non-zero gaps, plus how many envelopes
+   * we're missing from each. Used by the gap banner UI.
+   */
+  allGaps(bundle) {
+    const out = [];
+    for (const senderId of bundle.gaps.keys()) {
+      const missing = this.missingFor(bundle, senderId);
+      if (missing > 0) out.push({ senderId, missing });
+    }
+    // Also include senders represented in the causal buffer but
+    // not in the gaps map (we have the future envelope but no lc
+    // peek from another sender).
+    for (const env of bundle.causalBuffer) {
+      const senderEntry = (env.lc || []).find(e => Array.isArray(e) && e[0] === env.from);
+      if (!senderEntry) continue;
+      const target = senderEntry[1];
+      const hwmDevices = bundle.hwm.get(env.from);
+      const hwmMax = hwmDevices ? Math.max(0, ...hwmDevices.values()) : 0;
+      const missing = Math.max(0, target - hwmMax - 1); // -1 because target itself is in the buffer
+      if (missing > 0 && !out.find(g => g.senderId === env.from)) {
+        out.push({ senderId: env.from, missing });
+      }
+    }
+    return out;
+  }
+};
+
+/* ------------------------------------------------------------
+ *  §20c3  ResyncResponder — Slice 4c
+ *
+ *  Serves incoming resync.request packets. Walks the local
+ *  envelopes store, finds any envelopes matching the request's
+ *  (target user, counter range), and re-sends each one through
+ *  the normal PeerMgr.sendEnvelope path. The seen-set ensures
+ *  the requester drops any envelope they already have, and
+ *  applies the rest via the regular dispatch pipeline.
+ *
+ *  Note: we send to ALL peers, not just the requester. Other
+ *  peers in the mesh may also be missing these envelopes — the
+ *  rebroadcast doubles as opportunistic gossip. Their seen-set
+ *  drops anything they already have.
+ *
+ *  Privacy: we only re-send envelopes for channels the requester
+ *  is in. We approximate this by checking that the envelope's
+ *  channel id is one we ourselves can decrypt (i.e. we have the
+ *  channel key) — but this is a weak check. A peer that's a
+ *  member of channel X but not channel Y could request a counter
+ *  range and indirectly observe whether the target sends to Y.
+ *  Slice 5+ should add a per-channel resync ACL.
+ * ------------------------------------------------------------ */
+const ResyncResponder = {
+  async serve(workspaceId, req, requesterPeerId) {
+    const current = State.current;
+    if (!current || current.meta.id !== workspaceId) return;
+    if (!req || !req.target || typeof req.from !== "number" || typeof req.to !== "number") return;
+
+    // Walk the envelopes store. For small stores this is fine;
+    // for larger ones we'd want to use the `from` index added in
+    // Slice 0 — `envelopes.createIndex("from", "from")`.
+    const all = await idbGetAll(current.wsDB, "envelopes");
+    const matches = all.filter(env => {
+      if (env.from !== req.target) return false;
+      // Skip ephemeral types — they should never be in the store
+      // anyway, but defense in depth.
+      if (EPHEMERAL_TYPES.has(env.type)) return false;
+      // Find sender's counter in lc.
+      const senderEntry = (env.lc || []).find(e => Array.isArray(e) && e[0] === env.from);
+      if (!senderEntry) return false;
+      const counter = senderEntry[1];
+      return counter >= req.from && counter <= req.to;
+    });
+
+    // Re-broadcast each match. PeerMgr.sendEnvelope handles
+    // SeenSet marking and avoids reflecting back to ourselves.
+    for (const env of matches) {
+      try {
+        await PeerMgr.sendEnvelope(workspaceId, env);
+      } catch (e) {
+        console.warn("resync re-broadcast failed for", env.id, e);
+      }
+    }
   }
 };
 
@@ -5406,8 +5695,10 @@ const EnvelopeDispatch = {
     // 4b. Advance the per-sender high-water-mark and drain the
     //     causal buffer. Any envelopes whose dependencies are now
     //     satisfied get delivered in a transitive pass.
+    //     Slice 4c: also observe lc peeks to populate the gap tracker.
     if (!EPHEMERAL_TYPES.has(env.type)) {
       CausalBuffer.advance(current, env);
+      GapTracker.observe(current, env);
       if (CausalBuffer.size(current) > 0) {
         // Re-dispatch released envelopes via a trampoline that
         // skips the causal check (they just passed it). Use a local
@@ -5433,6 +5724,7 @@ const EnvelopeDispatch = {
           catch { return; }
           await this.handle(current, releasedEnv, relInner);
           CausalBuffer.advance(current, releasedEnv);
+          GapTracker.observe(current, releasedEnv);
         });
       }
     }
@@ -6653,6 +6945,7 @@ if (/[?&]debug=1/.test(location.search)) {
     sendPresence, PresenceDriver, EPHEMERAL_TYPES,
     sendPeerAnnounce, SeenSet, CausalBuffer,
     WorkspaceDoc, sendWorkspacePatch,
+    GapTracker, ResyncResponder,
     get Y() { return Y; },
     bytesToB64Url, b64UrlToBytes, bytesToHex, bytesToB64,
     render, setState

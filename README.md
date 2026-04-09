@@ -2,7 +2,7 @@
 
 Browser-native, local-first team chat. Single HTML file. No accounts. No central server. Messages are end-to-end encrypted, signed by the sender, and stored on the devices of workspace members — never on a central server.
 
-> **Status: Slice 0+1+2+3+3d.3+4a+4b.1+4b.2.** Solo workspace, two-person Mode A, full Slice 3 (channels, DMs, group DMs, attachments, peer blob transfer, reactions, mentions, threads, presence), multi-peer gossip mesh with seen-set dedupe, vector clock causal delivery buffer, **plus a Yjs CRDT for workspace metadata** — workspace renames merge across peers via `workspace.patch` envelopes carrying full-state Yjs updates. See `MEHFIL-SPEC.md`, `MEHFIL-WALKTHROUGHS.md`, and `PENDING.md` for the full v1 plan.
+> **Status: Slice 0+1+2+3+3d.3+4a+4b.1+4b.2+4c.** Solo workspace, two-person Mode A, full Slice 3, multi-peer gossip mesh with seen-set dedupe, vector clock causal delivery buffer, Yjs workspace doc, **plus gap detection + resync** — missing-message banner triggers a `gossip.resync_request` to attached peers who walk their envelopes store and re-broadcast matches. **Slice 4 is now feature-complete.** See `MEHFIL-SPEC.md`, `MEHFIL-WALKTHROUGHS.md`, and `PENDING.md` for the full v1 plan.
 
 ## What works today
 
@@ -39,6 +39,7 @@ Browser-native, local-first team chat. Single HTML file. No accounts. No central
 - **Multi-peer gossip mesh (Slice 4a)** — `PeerMgr` now supports many peers per workspace via `Map<wsId, Map<peer_id, transport>>`. Every non-ephemeral envelope is rebroadcast to all attached peers except the source on receive, so messages propagate across a partial mesh (e.g. A↔B and B↔C will deliver an A-originated message to C without a direct A↔C link). A 10K-entry `SeenSet` LRU (backed by the IndexedDB `seen_set` store from Slice 0) drops duplicate envelopes at the framing layer before they reach the dispatch pipeline — loop-killing in one hop. New `gossip.peer_announce` envelope fired by `PeerMgr.attach` so peers 2+ hops away learn about new arrivals through gossip
 - **Vector clock causal delivery (Slice 4b.1)** — envelopes carrying `lc: [[user_id, counter], ...]` are checked against a per-(sender, device) high-water-mark on arrival. If counter is more than hwm+1, the envelope is held in a per-bundle `causalBuffer` until the gap closes. Transitive drain releases chains (m3 releases m4 releases m5). Persist-first rule: envelopes hit IDB BEFORE the causal check, so buffered envelopes survive a shutdown mid-buffer and rehydrate from `Workspace.open`'s replay on next boot
 - **Yjs workspace doc (Slice 4b.2)** — workspace metadata (name, channels, members, settings) lives in a Yjs CRDT lazy-loaded from esm.sh. New `workspace.patch` envelope type carries full-state Yjs update bytes between peers. The `WorkspaceDoc` wrapper module exposes named methods (`setName`, `addChannel`, `addMember`, etc.) so application code never touches `Y.Doc` directly. Settings → Rename workspace fully wired as the proof-of-concept mutation; channel and member mutations migrate to the Yjs path in Slice 5
+- **Gap detection + resync (Slice 4c, WT-31)** — `GapTracker` watches `lc` peeks: when an envelope from sender X mentions sender Y's counter N in its lc but our hwm for Y is below N, we know we're missing some of Y's envelopes. An inline "⚠ Missing N messages from Alice [Try to fetch]" banner appears above the message list. Clicking it broadcasts a `gossip.resync_request` (transport tag 0x05) to attached peers; `ResyncResponder` walks their envelopes store, finds matches in the requested counter range, and re-broadcasts each one through the normal envelope path. The seen-set dedupes; the dispatch pipeline applies the rest. Banner disappears on the next render once hwm catches up
 
 ## Trying the two-person flow
 
@@ -76,7 +77,8 @@ Two real browser tabs work but are slow to set up. For faster iteration, append 
 | 4a — Multi-peer mesh + seen-set + rebroadcast | — (foundation for WT-09) | ✅ done |
 | 4b.1 — Vector clock causal delivery buffer | — | ✅ done |
 | 4b.2 — Yjs workspace doc + WorkspaceDoc wrapper | — | ✅ done |
-| 4c — Gap detection UI + resync | WT-31 | ⏳ next |
+| 4c — Gap detection UI + resync | WT-31 | ✅ done |
+| 5 — Admin (member removal + rekey, promote, search, XSS, export, quota) | WT-18, 19, 21, 22, 23, 33, 34 | ⏳ next |
 | 4 — Gossip Mode B | WT-09, 31 | — |
 | 5 — Search + admin | WT-18–22, 33 | — |
 | 6 — Tier UX | WT-10, 35 | — |

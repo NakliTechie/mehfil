@@ -884,7 +884,62 @@ Result: both Bose and Charlie's `bundle.messages` contain "hello mesh"; both see
 
 ---
 
-**Version:** living document, updated per slice. Slice 2 added §8–§11. Slice 3a extended §3 (closed-form padding). Slice 3b bumped §6 to v2 and added §12–§14. Slice 3c added §3b (BlobStore), §15 (group DMs simplification), §16 (attachments). Slice 3c.1 added §17 (peer-to-peer blob transfer) and extended §9 with tags 0x03 + 0x04. Slice 3d.1 added §18 (reactions), §19 (@mentions), §20 (polish). Slice 3d.2 added §21 (threads). Slice 3d.3 added §22 (presence) and established the ephemeral-type fast-path. Slice 4a added §23 (multi-peer mesh + gossip rebroadcast + SeenSet + `gossip.peer_announce`). Slice 4b.1 added §24 (vector clock causal delivery buffer). Slice 4b.2 added §25 (Yjs workspace doc + `WorkspaceDoc` wrapper + `workspace.patch` envelope).
+**Version:** living document, updated per slice. Slice 2 added §8–§11. Slice 3a extended §3 (closed-form padding). Slice 3b bumped §6 to v2 and added §12–§14. Slice 3c added §3b (BlobStore), §15 (group DMs simplification), §16 (attachments). Slice 3c.1 added §17 (peer-to-peer blob transfer) and extended §9 with tags 0x03 + 0x04. Slice 3d.1 added §18 (reactions), §19 (@mentions), §20 (polish). Slice 3d.2 added §21 (threads). Slice 3d.3 added §22 (presence) and established the ephemeral-type fast-path. Slice 4a added §23 (multi-peer mesh + gossip rebroadcast + SeenSet + `gossip.peer_announce`). Slice 4b.1 added §24 (vector clock causal delivery buffer). Slice 4b.2 added §25 (Yjs workspace doc + `WorkspaceDoc` wrapper + `workspace.patch` envelope). Slice 4c added §26 (gap detection + resync).
+
+## 26. Gap detection + resync (Slice 4c)
+
+Spec §6.2 / WT-31. Slice 4b.1's causal buffer holds envelopes whose own sender-counter exceeds hwm+1, so we KNOW we're missing the gap because we have a later envelope to prove it. But there's a second signal: an envelope from sender X may carry an `lc` entry like `[Y, 7]` meaning "X had seen Y's counter 7 at send time". If our own hwm for Y is below 7, we're missing some of Y's envelopes too — even with no later envelope from Y.
+
+### `GapTracker` module (§20c2)
+
+- `bundle.gaps: Map<user_id, Map<device_id, max_known_counter>>` — sentinel device id `lc_peek` for "I saw this in someone's lc but I don't know which device of theirs sent it"
+- `GapTracker.observe(bundle, env)` — called from the dispatch pipeline after successful processing. Walks `env.lc` and for each entry from a sender OTHER than `env.from`, records the counter as a peek
+- `GapTracker.missingFor(bundle, senderId)` — returns `max(0, lc_peek - max(hwm devices))`
+- `GapTracker.allGaps(bundle)` — list all senders with non-zero gaps; also includes senders represented in the causal buffer (we have a future envelope but no peek)
+
+### `gossip.resync_request` transport packet (tag 0x05)
+
+```
+{ target: <user_id>, from: <counter>, to: <counter> }
+```
+
+Transport-level packet, not a signed envelope. Same shape as the existing 0x03 / 0x04 blob transfer packets — fast and simple, no sig overhead. Receivers can implicitly trust the requester is in the workspace because they're an attached peer.
+
+### `ResyncResponder` module (§20c3)
+
+- `serve(workspaceId, req, requesterPeerId)` — walks the local envelopes store, filters by `env.from === req.target` and `senderCounter ∈ [req.from, req.to]`, re-broadcasts each match via `PeerMgr.sendEnvelope`
+- The re-broadcast goes to ALL peers, not just the requester. Other peers in the mesh may also be missing these envelopes — opportunistic gossip. Their seen-set drops anything they already have.
+- Privacy caveat: a peer in channel X but not channel Y could request a counter range and indirectly observe whether the target sends to Y. Slice 5+ should add a per-channel resync ACL.
+
+### Gap banner UI
+
+`renderGapBanner(current)` produces an inline banner above the message list whenever `GapTracker.allGaps(current)` returns at least one entry. Format:
+
+- 1 sender: "Missing N messages from Alice"
+- 2-3 senders: "Missing messages from Alice, Bose, Charlie"
+- 4+ senders: "Missing messages from Alice, Bose and N others"
+
+Plus a "Try to fetch" button that broadcasts one `gossip.resync_request` per sender via `PeerMgr.sendResyncRequest`. The banner disappears naturally on the next render once `hwm` advances past the lc-peek max.
+
+### Verified end-to-end
+
+Single bundle, three synthesized members:
+
+- Bose joins → hwm[bose]=1, Carol joins → hwm[carol]=1
+- Bose sends `message.create` with `lc: [[bose, 2], [charlie, 5]]`
+- Asha's dispatch processes Bose's message → bose hwm advances to 2
+- `GapTracker.observe` peeks the `[charlie, 5]` entry → records `gaps[charlie][lc_peek] = 5`
+- `GapTracker.missingFor(charlie)` returns `5 - 1 = 4`
+- Banner renders: **"⚠ Missing 4 messages from Charlie"** with "Try to fetch" button
+
+Resync round trip:
+
+- Carol joins (different identity), Asha forces gap state for Carol
+- Bose's peer IDB is seeded with Carol's counter-2 / 3 / 4 envelopes
+- `ResyncResponder.serve(wsId, {target: carol, from: 2, to: 4}, ...)` walks the peer store, finds 3 matches, broadcasts each
+- 3 envelopes feed back into Asha's dispatch via `EnvelopeDispatch.receive`
+- Asha's projection: 1 → 4 messages; hwm[carol] advances 1 → 4; `missingFor(carol)` returns 0
+- The Carol banner disappears; the unrelated Charlie banner stays
 
 ## 25. Yjs workspace doc (Slice 4b.2)
 
