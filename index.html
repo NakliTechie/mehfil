@@ -2477,7 +2477,7 @@ function renderWorkspace() {
     };
   });
 
-  document.getElementById("btn-settings").onclick = openSettings;
+  document.getElementById("btn-settings").onclick = () => openSettings();
   document.getElementById("btn-invite").onclick = openInviteModal;
   document.getElementById("btn-new-channel").onclick = openCreateChannelModal;
 
