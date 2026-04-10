@@ -260,6 +260,7 @@
   .badge.live .dot { background: var(--ok); }
   .badge.connecting .dot { background: var(--warn); animation: pulse 1.4s infinite; }
   .badge.offline .dot { background: var(--danger); }
+  .badge.relay   .dot { background: color-mix(in srgb, var(--accent) 80%, white); }
   @keyframes pulse {
     0%, 100% { opacity: 1; }
     50% { opacity: 0.35; }
@@ -2230,6 +2231,7 @@ function renderLanding() {
         <div class="stack">
           <button class="primary" id="btn-start">Start a workspace</button>
           <button id="btn-join" disabled title="Open a join link instead">Join a workspace</button>
+          <button id="btn-join-code">Join by code</button>
           <button id="btn-restore">I have a backup file</button>
         </div>
         ${State.workspaces.length ? renderWorkspaceList() : ""}
@@ -2240,6 +2242,7 @@ function renderLanding() {
     </div>
   `;
   document.getElementById("btn-start").onclick = () => setState({ view: "name-input" });
+  document.getElementById("btn-join-code").onclick = openPairingCodeJoinModal;
   document.getElementById("btn-restore").onclick = openRestoreModal;
   document.getElementById("link-lost").onclick = () => alert(
     "Mehfil has no central recovery. If you lose all your devices and don't have " +
@@ -2325,6 +2328,8 @@ async function openWorkspaceById(wsId) {
   // (e.g. from a previous workspace in the same session) and starts a
   // fresh one bound to this bundle.
   PresenceDriver.start(bundle);
+  // §35: start relay transport if the workspace has a relay configured.
+  RelayMgr.startForWorkspace(bundle);
 }
 
 function renderWorkspace() {
@@ -2367,8 +2372,9 @@ function renderWorkspace() {
   const isOnlyMember = current.members.length === 1;
 
   // Corner badge state derives from PeerMgr.
-  const peerStatus = PeerMgr.status(current.meta.id);
-  const badge = computeBadge(peerStatus, current.members.length);
+  const peerStatus  = PeerMgr.status(current.meta.id);
+  const relayStatus = RelayMgr.status(current.meta.id);
+  const badge = computeBadge(peerStatus, current.members.length, relayStatus);
 
   $app.innerHTML = `
     <div id="banner-slot"></div>
@@ -2862,7 +2868,7 @@ function renderWorkspace() {
   if ($threadScroll) $threadScroll.scrollTop = $threadScroll.scrollHeight;
 }
 
-function computeBadge(peerStatus, memberCount) {
+function computeBadge(peerStatus, memberCount, relayStatus) {
   if (memberCount === 1) {
     return { cls: "local", label: "Local only", title: "You're the only member — invite someone to connect", dotStyle: "" };
   }
@@ -2871,6 +2877,13 @@ function computeBadge(peerStatus, memberCount) {
   }
   if (peerStatus === "connecting") {
     return { cls: "connecting", label: "Connecting…", title: "Establishing WebRTC connection", dotStyle: "background: var(--warn)" };
+  }
+  // §7: relay fallback — WebRTC is down but relay is reachable.
+  if (relayStatus === "connected") {
+    return { cls: "relay", label: "Via relay", title: "WebRTC unavailable — delivering via relay", dotStyle: "" };
+  }
+  if (relayStatus === "connecting") {
+    return { cls: "connecting", label: "Relay connecting…", title: "Connecting to relay server", dotStyle: "background: var(--warn)" };
   }
   return { cls: "offline", label: "Offline", title: "No peers reachable — messages will queue", dotStyle: "background: var(--danger)" };
 }
@@ -3728,6 +3741,12 @@ function renderSettingsWorkspaceTab(wsName, current) {
         </div>
       </div>
     </div>
+    ${relays.length > 0 ? `
+    <div class="field">
+      <label>Invite by code</label>
+      <div style="font-size: 12px; color: var(--fg-mute); margin-bottom: 8px;">Generate a 6-word code to share verbally or by message. Valid for 5 minutes. No link needed.</div>
+      <button id="btn-invite-by-code">Generate code…</button>
+    </div>` : ""}
     <div class="field">
       <label>Export workspace</label>
       <div style="font-size: 12px; color: var(--fg-mute); margin-bottom: 8px;">Download an encrypted backup of all messages, channels, and keys.</div>
@@ -3875,6 +3894,8 @@ function wireSettingsTab(tab, wrap, current, me, wsName) {
       // Persist relay config in workspace meta
       current.meta.relays = current.relays;
       await idbPut(current.wsDB, "keys", current.meta, "workspace_meta");
+      // §35: start relay transport immediately.
+      RelayMgr.startForWorkspace(current);
       wrap.remove();
       setState({ modal: null });
     };
@@ -3885,6 +3906,8 @@ function wireSettingsTab(tab, wrap, current, me, wsName) {
           current.relays.splice(idx, 1);
           current.meta.relays = current.relays;
           await idbPut(current.wsDB, "keys", current.meta, "workspace_meta");
+          // §35: restart (or stop) relay transport after removal.
+          RelayMgr.startForWorkspace(current);
           wrap.remove();
           setState({ modal: null });
         }
@@ -3892,6 +3915,9 @@ function wireSettingsTab(tab, wrap, current, me, wsName) {
     });
 
     // Export / import
+    // §36: Invite by code (only wired when relay configured → button exists)
+    const $invByCode = wrap.querySelector("#btn-invite-by-code");
+    if ($invByCode) $invByCode.onclick = () => { wrap.remove(); openPairingCodeSendModal(current); };
     wrap.querySelector("#btn-export-ws").onclick = () => { wrap.remove(); openExportModal(); };
     wrap.querySelector("#btn-import-ws").onclick = () => { wrap.remove(); openImportModal(); };
 
@@ -5241,6 +5267,12 @@ const PeerMgr = {
       } catch (e) {
         console.warn("send failed for peer", peerId, e);
       }
+    }
+    // §35: also push to relay if one is configured (store-and-forward).
+    // Non-ephemeral only — presence and typing heartbeats are per-device
+    // and make no sense forwarded via relay.
+    if (!EPHEMERAL_TYPES.has(env.type)) {
+      RelayMgr.send(workspaceId, body).catch(e => console.warn("relay push:", e));
     }
     return sentAny;
   },
@@ -8427,6 +8459,529 @@ function formatRelative(ts) {
 }
 
 /* ------------------------------------------------------------
+ *  §35  Relay transport — Cloudflare Worker adapter (Slice 7)
+ *
+ *  RelayTransport polls GET /ws/:id/envelopes for new envelopes and
+ *  pushes outbound envelopes via PUT. Operates independently of PeerMgr
+ *  (different transport model — polling vs WebRTC data channel).
+ *
+ *  RelayMgr is the workspace-level manager: one RelayTransport per
+ *  workspace, started on Workspace.open and stopped on workspace close.
+ *
+ *  Received envelopes flow: RelayTransport → SeenSet dedup →
+ *    EnvelopeDispatch.receive → PeerMgr.sendEnvelope (WebRTC rebroadcast).
+ *
+ *  Sent envelopes flow: PeerMgr.sendEnvelope (existing WebRTC path) +
+ *    RelayMgr.send (relay push, fire-and-forget).
+ * ------------------------------------------------------------ */
+
+/**
+ * RelayTransport — manages polling and pushing for one workspace + relay.
+ *
+ * Config: { url, token, workspaceId }
+ * url   — base URL of the relay Worker (no trailing slash)
+ * token — Bearer token for Authorization header (may be empty for open relay)
+ */
+class RelayTransport {
+  constructor({ url, token, workspaceId }) {
+    this.url         = url.replace(/\/$/, "");
+    this.token       = token || "";
+    this.workspaceId = workspaceId;
+    this.cursor      = "";
+    this.pollTimer   = null;
+    this.status      = "connecting";
+    this._closed     = false;
+  }
+
+  _headers(contentType) {
+    const h = {};
+    if (this.token) h["Authorization"] = "Bearer " + this.token;
+    if (contentType) h["Content-Type"] = contentType;
+    return h;
+  }
+
+  _wsUrl(path) {
+    return `${this.url}/ws/${encodeURIComponent(this.workspaceId)}${path}`;
+  }
+
+  /** Fetch current cursor from relay (fast-forward on first connect). */
+  async fetchCursor() {
+    const resp = await fetch(this._wsUrl("/cursor"), {
+      headers: this._headers(),
+      signal: AbortSignal.timeout(8_000)
+    });
+    if (resp.ok) {
+      const { cursor } = await resp.json();
+      this.cursor = cursor || "";
+      this.status = "connected";
+    } else if (resp.status === 401) {
+      this.status = "error";
+      console.warn("Relay: auth failed — check token");
+    }
+  }
+
+  /** Start polling. Call once after construction. */
+  async start() {
+    try { await this.fetchCursor(); } catch (e) {
+      console.warn("Relay cursor fetch failed:", e.message);
+      this.status = "offline";
+    }
+    this._schedulePoll(0);
+  }
+
+  _schedulePoll(delay = 5_000) {
+    if (this._closed) return;
+    this.pollTimer = setTimeout(() => this._poll(), delay);
+  }
+
+  async _poll() {
+    if (this._closed) return;
+    try {
+      const url = new URL(this._wsUrl("/envelopes"));
+      if (this.cursor) url.searchParams.set("since", this.cursor);
+      url.searchParams.set("limit", "100");
+
+      const resp = await fetch(url.href, {
+        headers: this._headers(),
+        signal: AbortSignal.timeout(10_000)
+      });
+
+      if (resp.ok) {
+        const items = await resp.json(); // [{seq, data: base64}]
+        this.status = "connected";
+        for (const item of items) {
+          if (this._closed) return;
+          try {
+            await this._ingest(item);
+            this.cursor = item.seq; // advance cursor even on dispatch error
+          } catch (e) {
+            console.warn("Relay ingest error:", e);
+          }
+        }
+      } else if (resp.status === 401) {
+        this.status = "error";
+        return; // stop polling — credentials are wrong
+      } else {
+        this.status = "offline";
+      }
+    } catch (e) {
+      this.status = "offline";
+      console.warn("Relay poll error:", e.message);
+    }
+    this._schedulePoll(5_000);
+  }
+
+  /** Decode and dispatch one relay item. */
+  async _ingest({ data }) {
+    // data is base64 of the raw msgpack envelope bytes.
+    const bytes = b64ToBytes(data);
+    const env   = MP.decode(bytes);
+    if (!env || !env.id) return;
+
+    // Seen-set deduplication (same logic as PeerMgr.handlePacket).
+    const wsId = this.workspaceId;
+    const known = await SeenSet.has(wsId, env.id);
+    if (known) return;
+    await SeenSet.add(wsId, env.id);
+
+    // Dispatch locally — updates state, persists to IDB, re-renders.
+    await EnvelopeDispatch.receive(wsId, env);
+
+    // Rebroadcast to any connected WebRTC peers. Ephemeral envelopes
+    // (presence, typing) are not rebroadcast — relay versions are stale.
+    if (!EPHEMERAL_TYPES.has(env.type)) {
+      await PeerMgr.sendEnvelope(wsId, env);
+    }
+  }
+
+  /**
+   * Push a raw msgpack envelope to the relay.
+   * Called from PeerMgr.sendEnvelope (fire-and-forget).
+   */
+  async send(envBytes) {
+    if (this.status === "error" || this._closed) return;
+    const resp = await fetch(this._wsUrl("/envelopes"), {
+      method:  "PUT",
+      headers: this._headers("application/octet-stream"),
+      body:    envBytes,
+      signal:  AbortSignal.timeout(8_000)
+    });
+    if (!resp.ok && resp.status !== 204) {
+      throw new Error(`Relay PUT ${resp.status}`);
+    }
+    this.status = "connected"; // at least one successful write
+  }
+
+  close() {
+    this._closed = true;
+    clearTimeout(this.pollTimer);
+    this.status = "closed";
+  }
+}
+
+/**
+ * RelayMgr — workspace-level relay manager.
+ * At most one RelayTransport per workspace (uses the first configured relay).
+ */
+const RelayMgr = {
+  /** workspaceId → RelayTransport */
+  _transports: new Map(),
+
+  /**
+   * Start the relay for a workspace if it has a relay configured.
+   * Stops any existing transport first (idempotent on re-open).
+   */
+  startForWorkspace(current) {
+    const wsId   = current.meta.id;
+    const relays = current.relays || [];
+    this.stop(wsId); // tear down any prior transport
+    if (relays.length === 0) return;
+
+    const cfg = relays[0]; // use first relay (multi-relay is a future feature)
+    const t   = new RelayTransport({ url: cfg.url, token: cfg.token, workspaceId: wsId });
+    this._transports.set(wsId, t);
+    t.start().catch(e => console.warn("Relay start error:", e));
+  },
+
+  stop(wsId) {
+    const t = this._transports.get(wsId);
+    if (t) { t.close(); this._transports.delete(wsId); }
+  },
+
+  /**
+   * Send raw msgpack envelope bytes to the relay for a workspace.
+   * Fire-and-forget — caller should not await (returns void).
+   */
+  async send(wsId, envBytes) {
+    const t = this._transports.get(wsId);
+    if (!t || t.status === "error" || t.status === "closed") return;
+    try { await t.send(envBytes); } catch (e) {
+      console.warn("Relay send failed:", e.message);
+    }
+  },
+
+  /** "connected" | "connecting" | "offline" | "error" | "none" */
+  status(wsId) {
+    const t = this._transports.get(wsId);
+    return t ? t.status : "none";
+  },
+};
+
+/* ------------------------------------------------------------
+ *  §36  Pairing-by-code (WT-06)
+ *
+ *  6 random words → PBKDF2(300K, SHA-256) → AES-256-GCM key.
+ *  The key encrypts a self-contained workspace invite bundle that is
+ *  stored on the relay for 5 minutes under SHA-256(code) as the key.
+ *  Single-use — the relay deletes the entry on first fetch.
+ *
+ *  Flow:
+ *   Sender  — openPairingCodeSendModal → generate code → encrypt bundle
+ *             → POST /pairing on relay → show 6 words
+ *   Receiver — openPairingCodeJoinModal → enter words → derive key+hash
+ *             → GET /pairing/:hash → decrypt bundle → join workspace
+ *
+ *  Requires a relay (tier 3+). Shown in Settings → Workspace when relay
+ *  is configured.
+ * ------------------------------------------------------------ */
+
+/**
+ * 256-word list: short, common English words chosen for phonetic clarity.
+ * 8 bits per word × 6 words = 48 bits of entropy. With PBKDF2 at 300K
+ * iterations this is effectively unguessable in any realistic timeframe.
+ */
+const PAIRING_WORDS = [
+  "acid","aged","also","alto","arch","area","army","atom","aunt","axis",
+  "back","band","base","bath","beam","bean","bear","beat","beef","bell",
+  "belt","bend","best","bile","bird","bite","blue","boat","bold","bolt",
+  "bond","bone","book","born","both","bowl","burn","buzz","byte","cage",
+  "cake","calm","camp","cape","card","care","cart","case","cast","cave",
+  "cell","cent","chain","chef","chin","chip","chop","cite","city","clam",
+  "clan","clap","clay","clip","club","clue","coal","coat","code","coil",
+  "coin","coke","cold","colt","come","cone","cook","cool","cope","core",
+  "corn","cost","coup","crab","crew","crop","crow","cube","cure","curl",
+  "damp","dare","dark","dart","dash","data","date","dawn","deal","dear",
+  "deck","deed","deep","deer","dell","dent","desk","dial","dice","diet",
+  "dine","dip","dire","dirt","disc","dish","disk","dome","door","dose",
+  "dove","down","draw","dune","dusk","dust","duty","each","earl","earn",
+  "ease","edge","emit","epic","even","ever","evil","exam","face","fact",
+  "fade","fall","fame","farm","fast","fate","fear","feat","feed","feel",
+  "felt","fern","file","fill","film","find","fine","fire","firm","fish",
+  "fist","five","flag","flat","flaw","flea","flew","flex","flip","flow",
+  "foam","fold","folk","fond","font","food","fool","ford","fork","form",
+  "fray","free","frog","from","fuel","full","fume","fund","fuse","gale",
+  "game","gear","gaze","gill","give","glad","glow","glue","goal","gold",
+  "golf","gone","good","gown","grab","gram","gray","grew","grid","grin",
+  "grip","grow","gulf","gull","gust","hail","half","hall","halt","hand",
+  "hang","hard","harm","harp","hash","hate","hawk","heal","heat","heel",
+  "helm","hemp","here","hero","hide","high","hill","hint","hire","hold",
+  "hole","holy","home","hood","hook","hope","horn","host","hour","hull",
+  "hunt","husk","icon","idea","inch","into","iris","isle","itch","item"
+];
+
+const PairingCode = {
+  /**
+   * Generate a fresh 6-word code.
+   * Returns { words, codeStr, key (CryptoKey), codeHash (hex) }.
+   */
+  async generate() {
+    const bytes = crypto.getRandomValues(new Uint8Array(6));
+    const words = [...bytes].map(b => PAIRING_WORDS[b]); // 256-word list → 8 bits each
+    const codeStr = words.join(" ");
+    const { key, codeHash } = await this._deriveKey(codeStr);
+    return { words, codeStr, key, codeHash };
+  },
+
+  /** Derive key + hash from a code string entered by the user. */
+  async fromString(codeStr) {
+    return this._deriveKey(codeStr.trim().toLowerCase().replace(/\s+/g, " "));
+  },
+
+  async _deriveKey(codeStr) {
+    const enc  = new TextEncoder();
+    const base = await crypto.subtle.importKey("raw", enc.encode(codeStr), "PBKDF2", false, ["deriveKey"]);
+    const key  = await crypto.subtle.deriveKey(
+      { name: "PBKDF2", hash: "SHA-256", salt: enc.encode("mehfil-pairing-v1"), iterations: 300_000 },
+      base, { name: "AES-GCM", length: 256 }, false, ["encrypt", "decrypt"]
+    );
+    const hashBuf  = await crypto.subtle.digest("SHA-256", enc.encode(codeStr));
+    const codeHash = [...new Uint8Array(hashBuf)].map(b => b.toString(16).padStart(2, "0")).join("");
+    return { key, codeHash };
+  },
+
+  async encrypt(key, obj) {
+    const iv  = crypto.getRandomValues(new Uint8Array(12));
+    const pt  = new TextEncoder().encode(JSON.stringify(obj));
+    const ct  = await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, pt);
+    const out = new Uint8Array(12 + ct.byteLength);
+    out.set(iv);
+    out.set(new Uint8Array(ct), 12);
+    return btoa(String.fromCharCode(...out));
+  },
+
+  async decrypt(key, b64) {
+    const raw = Uint8Array.from(atob(b64), c => c.charCodeAt(0));
+    const pt  = await crypto.subtle.decrypt({ name: "AES-GCM", iv: raw.slice(0, 12) }, key, raw.slice(12));
+    return JSON.parse(new TextDecoder().decode(pt));
+  }
+};
+
+/**
+ * Open the "Invite by code" modal (sender side).
+ * Called from Settings → Workspace (only when relay is configured).
+ */
+async function openPairingCodeSendModal(current) {
+  const relay = (current.relays || [])[0];
+  if (!relay) { alert("Add a relay first — Settings → Workspace → Relays."); return; }
+
+  // Build a self-contained relay-join bundle (no SDP — relay delivers the join).
+  const rootRaw  = await idbGet(current.wsDB, "keys", "root");
+  const gchKey   = await idbGet(current.wsDB, "keys", "ch:" + current.meta.general_channel_id);
+  const me       = current.members.find(m => m.id === bytesToB64Url(State.identity.pubkey));
+  const fpHash   = await Crypto.sha256(State.identity.pubkey);
+  const bundle   = {
+    ws:                  current.meta.id,
+    name:                current.meta.name,
+    root_key:            bytesToB64(rootRaw),
+    general_channel_id:  current.meta.general_channel_id,
+    general_channel_key: bytesToB64(gchKey),
+    inviter_id:          bytesToB64Url(State.identity.pubkey),
+    inviter_name:        me?.name || "?",
+    inviter_fp:          bytesToHex(fpHash.slice(0, 16)),
+    relays:              current.relays,
+    expires:             Date.now() + 5 * 60 * 1000
+  };
+
+  let words, codeStr, key, codeHash;
+  const wrap = document.createElement("div");
+  wrap.className = "modal-bg";
+  wrap.innerHTML = `
+    <div class="card" style="max-width: 420px; text-align: center;">
+      <h1 style="font-size: 18px; margin-bottom: 8px;">Invite by code</h1>
+      <p class="sub" style="margin-bottom: 16px;">Generating secure code…</p>
+    </div>
+  `;
+  document.body.appendChild(wrap);
+
+  try {
+    ({ words, codeStr, key, codeHash } = await PairingCode.generate());
+    const encrypted = await PairingCode.encrypt(key, bundle);
+
+    const resp = await fetch(`${relay.url}/pairing`, {
+      method:  "POST",
+      headers: { "Content-Type": "application/json", ...(relay.token ? { "Authorization": "Bearer " + relay.token } : {}) },
+      body:    JSON.stringify({ code_hash: codeHash, payload: encrypted, ttl_ms: 300_000 })
+    });
+    if (!resp.ok) throw new Error(`Relay returned ${resp.status}`);
+  } catch (e) {
+    wrap.remove();
+    alert("Failed to generate pairing code: " + e.message);
+    return;
+  }
+
+  wrap.querySelector(".card").innerHTML = `
+    <h1 style="font-size: 18px; margin-bottom: 4px;">Invite by code</h1>
+    <p class="sub" style="margin-bottom: 16px;">Read these 6 words to the person joining. Valid for 5 minutes.</p>
+    <div style="display: flex; gap: 8px; flex-wrap: wrap; justify-content: center; margin-bottom: 20px;">
+      ${words.map((w, i) => `
+        <div style="background: var(--bg-sunken); border-radius: 6px; padding: 8px 12px; min-width: 72px; text-align: center;">
+          <div style="font-size: 10px; color: var(--fg-dim); margin-bottom: 2px;">${i + 1}</div>
+          <div style="font-size: 15px; font-weight: 600;">${escapeHTML(w)}</div>
+        </div>`).join("")}
+    </div>
+    <p class="sub" style="font-size: 11px; margin-bottom: 16px;">
+      They'll click <strong>Join by code</strong> on the Mehfil landing page and type these words.
+    </p>
+    <button class="primary" id="pairing-done">Done</button>
+  `;
+  wrap.querySelector("#pairing-done").onclick = () => wrap.remove();
+  wrap.addEventListener("click", e => { if (e.target === wrap) wrap.remove(); });
+}
+
+/**
+ * Open the "Join by code" modal (receiver side).
+ * Called from the landing page "Join by code" button.
+ */
+function openPairingCodeJoinModal() {
+  const wrap = document.createElement("div");
+  wrap.className = "modal-bg";
+  wrap.innerHTML = `
+    <div class="card" style="max-width: 420px;">
+      <h1 style="font-size: 18px; margin-bottom: 8px;">Join by code</h1>
+      <p class="sub" style="margin-bottom: 12px;">Enter the 6 words shared by your workspace admin.</p>
+      <div class="field">
+        <label>Code (6 words, space-separated)</label>
+        <input id="pairing-code-input" type="text" placeholder="apple table river…"
+               autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false"
+               style="font-size: 14px; letter-spacing: 0.03em;">
+      </div>
+      <div class="err" id="pairing-err"></div>
+      <div class="row" style="margin-top: 16px; gap: 8px; justify-content: flex-end;">
+        <button id="pairing-cancel">Cancel</button>
+        <button class="primary" id="pairing-join">Join workspace</button>
+      </div>
+    </div>
+  `;
+  document.body.appendChild(wrap);
+
+  const $input = wrap.querySelector("#pairing-code-input");
+  const $err   = wrap.querySelector("#pairing-err");
+  const $btn   = wrap.querySelector("#pairing-join");
+  $input.focus();
+  wrap.querySelector("#pairing-cancel").onclick = () => wrap.remove();
+  wrap.addEventListener("click", e => { if (e.target === wrap) wrap.remove(); });
+
+  const join = async () => {
+    const raw = $input.value.trim();
+    const words = raw.toLowerCase().split(/\s+/).filter(Boolean);
+    if (words.length !== 6) { $err.textContent = "Enter exactly 6 words."; return; }
+
+    $btn.disabled = true;
+    $btn.textContent = "Looking up…";
+    $err.textContent = "";
+
+    try {
+      const { key, codeHash } = await PairingCode.fromString(words.join(" "));
+
+      // Find any configured relay in existing workspaces to use for the lookup.
+      // Fall back to prompting for the relay URL.
+      let relayUrl = "", relayToken = "";
+      for (const ws of (State.workspaces || [])) {
+        try {
+          const wsDB = await openWorkspaceDB(ws.id);
+          const meta = await idbGet(wsDB, "keys", "workspace_meta");
+          wsDB.close();
+          if (meta?.relays?.length) { relayUrl = meta.relays[0].url; relayToken = meta.relays[0].token || ""; break; }
+        } catch {}
+      }
+      if (!relayUrl) {
+        relayUrl = prompt("Enter the relay URL (e.g. https://mehfil-relay.example.workers.dev):");
+        if (!relayUrl) { $btn.disabled = false; $btn.textContent = "Join workspace"; return; }
+        relayToken = prompt("Bearer token (leave blank if none):") || "";
+      }
+
+      const headers = relayToken ? { "Authorization": "Bearer " + relayToken } : {};
+      const resp = await fetch(`${relayUrl.replace(/\/$/, "")}/pairing/${codeHash}`, { headers });
+      if (resp.status === 404) throw new Error("Code not found or expired. Ask for a new code.");
+      if (!resp.ok) throw new Error(`Relay error ${resp.status}`);
+      const { payload } = await resp.json();
+
+      const bundle = await PairingCode.decrypt(key, payload);
+      if (Date.now() > bundle.expires) throw new Error("This code has expired. Ask for a fresh one.");
+
+      wrap.remove();
+      await joinWorkspaceFromBundle(bundle, relayUrl, relayToken);
+    } catch (e) {
+      $err.textContent = e.message;
+      $btn.disabled = false;
+      $btn.textContent = "Join workspace";
+    }
+  };
+
+  $btn.onclick = join;
+  $input.onkeydown = e => { if (e.key === "Enter") join(); };
+}
+
+/**
+ * Join a workspace using a relay-delivered bundle (no WebRTC handshake).
+ * The bundle carries all keys directly — no offer/answer needed.
+ */
+async function joinWorkspaceFromBundle(bundle, relayUrl, relayToken) {
+  // Ensure identity exists.
+  if (!State.identity) {
+    await Identity.load(State.globalDB);
+    State.identity = await idbGet(State.globalDB, "identity", "self");
+    if (!State.identity) State.identity = await Identity.create(State.globalDB);
+  }
+
+  // Prompt for display name if not set.
+  let myName = State.identity.name || "";
+  if (!myName) {
+    myName = prompt(`Joining "${bundle.name}". Enter your display name:`)?.trim();
+    if (!myName) { alert("Display name required."); return; }
+    State.identity.name = myName;
+    await idbPut(State.globalDB, "identity", State.identity, "self");
+  }
+
+  // Check if already joined.
+  const existing = await idbGet(State.globalDB, "workspaces", bundle.ws);
+  if (existing) {
+    await openWorkspaceById(bundle.ws);
+    return;
+  }
+
+  // Decode keys from bundle.
+  const rootKeyBytes = b64ToBytes(bundle.root_key);
+  const gchKeyBytes  = b64ToBytes(bundle.general_channel_key);
+  const relayConfig  = bundle.relays || [{ url: relayUrl, token: relayToken }];
+
+  // Create workspace DB and populate keys.
+  const wsDB = await openWorkspaceDB(bundle.ws);
+  await idbPut(wsDB, "keys", {
+    id: bundle.ws, name: bundle.name,
+    general_channel_id: bundle.general_channel_id,
+    relays: relayConfig,
+    created_at: Date.now()
+  }, "workspace_meta");
+  await idbPut(wsDB, "keys", rootKeyBytes, "root");
+  await idbPut(wsDB, "keys", gchKeyBytes, `ch:${bundle.general_channel_id}`);
+
+  // Register identity key.
+  await idbPut(wsDB, "keys", State.identity.privkey, "sign_priv");
+  await idbPut(wsDB, "keys", State.identity.pubkey,  "sign_pub");
+
+  // Register in global workspace list.
+  await idbPut(State.globalDB, "workspaces", {
+    id: bundle.ws, name: bundle.name, created_at: Date.now(), last_opened_at: Date.now()
+  });
+  wsDB.close();
+
+  // Send member.join envelope via relay so workspace members see us.
+  await openWorkspaceById(bundle.ws);
+  await sendMemberJoin(State.current);
+}
+
+/* ------------------------------------------------------------
  *  §13  Boot
  * ------------------------------------------------------------ */
 // Debug hook: when the URL carries ?debug=1, expose every module on
@@ -8462,6 +9017,10 @@ if (/[?&]debug=1/.test(location.search)) {
     // Slice 6
     memberTier, composePlaceholder, renderTierEscalationBanner,
     flushStoredMessages,
+    // Slice 7
+    RelayTransport, RelayMgr,
+    PairingCode, openPairingCodeSendModal, openPairingCodeJoinModal,
+    joinWorkspaceFromBundle,
     get Y() { return Y; },
     get MiniSearch() { return MiniSearch; },
     bytesToB64Url, b64UrlToBytes, bytesToHex, bytesToB64,
