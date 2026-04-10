@@ -1125,11 +1125,20 @@ const MP = (() => {
     return a;
   }
   function decMap(st, n) {
-    const o = {};
+    // Use Object.create(null) so there is no prototype to pollute.
+    // A msgpack map with key "__proto__" would otherwise change the
+    // decoded object's prototype chain via o["__proto__"] = value,
+    // allowing a peer to control property lookups on missing own keys.
+    const o = Object.create(null);
     for (let i = 0; i < n; i++) {
       const k = decVal(st);
       if (typeof k !== "string") throw new Error("MP decode: non-string map key");
-      if (o.hasOwnProperty(k)) throw new Error("MP decode: duplicate map key " + k);
+      // Explicitly block dangerous prototype keys even with null prototype,
+      // as a defense-in-depth measure for any downstream JSON.parse paths.
+      if (k === "__proto__" || k === "constructor" || k === "prototype") {
+        throw new Error("MP decode: forbidden map key: " + k);
+      }
+      if (Object.prototype.hasOwnProperty.call(o, k)) throw new Error("MP decode: duplicate map key " + k);
       o[k] = decVal(st);
     }
     return o;
@@ -2978,7 +2987,9 @@ function renderWorkspace() {
     const url = URL.createObjectURL(blob);
     if (el.tagName === "IMG") {
       el.src = url;
-      el.onclick = () => window.open(url, "_blank");
+      // noopener,noreferrer severs window.opener so an SVG (or any image)
+      // opened in a new tab can't reach back into this page.
+      el.onclick = () => window.open(url, "_blank", "noopener,noreferrer");
     } else {
       el.onclick = () => {
         const link = document.createElement("a");
@@ -3418,7 +3429,10 @@ function renderMessageBody(body, mentions, members) {
 
 function renderAttachment(m) {
   const a = m.attachment;
-  const isImage = (a.mime || "").startsWith("image/");
+  // SVG is excluded from inline rendering — it's treated as a file download.
+  // Opening SVG as a same-origin blob: URL lets embedded <script> access
+  // window.opener; even with noopener it can run JS in the page context.
+  const isImage = (a.mime || "").startsWith("image/") && a.mime !== "image/svg+xml";
   const size = formatBytes(a.size);
   // If `available === null` we haven't checked OPFS yet — render a
   // placeholder and kick off a lazy check that re-renders when done.
@@ -8352,7 +8366,7 @@ async function openSearchPalette() {
   // Lazy-load MiniSearch.
   if (!MiniSearch) {
     try {
-      const mod = await import("https://esm.sh/minisearch@7");
+      const mod = await import("https://esm.sh/minisearch@7.2.0");
       MiniSearch = mod.default || mod;
     } catch (e) {
       console.warn("MiniSearch load failed:", e);
@@ -10857,7 +10871,7 @@ async function boot() {
     // the browser after first load. If the user is offline on first
     // boot we show a clean error.
     try {
-      Y = await import("https://esm.sh/yjs@13");
+      Y = await import("https://esm.sh/yjs@13.6.30");
     } catch (e) {
       throw new Error("Couldn't load Yjs from esm.sh (offline?). Mehfil needs it to merge workspace metadata changes.");
     }
