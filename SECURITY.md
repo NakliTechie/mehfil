@@ -90,4 +90,4 @@ The LAN bridge announces itself via mDNS. Any device on the same LAN can reach i
 
 ## Reporting a vulnerability
 
-Open an issue at [github.com/NakliTechie/mehfil](https://github.com/NakliTechie/mehfil) or email chirag@naklitechie.com. Please include a description of the vulnerability, steps to reproduce, and your assessment of severity. I aim to respond within 72 hours.
+Please **do not** open a public GitHub issue for security vulnerabilities. Reach out on Twitter at [@chirag](https://twitter.com/chirag). Include a description of the vulnerability, steps to reproduce, and your assessment of severity. I aim to respond within 72 hours.
