@@ -82,8 +82,8 @@ Or open `index.html` directly. Requires Web Crypto Ed25519: Chrome 113+, Firefox
 The **Mehfil Relay** is an optional Cloudflare Workers service. Deploy your own in five minutes:
 
 ```bash
-git clone https://github.com/NakliTechie/relay-cloudflare
-cd relay-cloudflare
+git clone https://github.com/NakliTechie/mehfil-relay
+cd mehfil-relay
 wrangler kv namespace create MEHFIL_KV   # paste the id into wrangler.toml
 wrangler secret put MEHFIL_TOKEN         # choose a long random bearer token
 wrangler deploy
@@ -149,7 +149,7 @@ Two companion services live in separate repos:
 
 | Repo | Language | Purpose |
 |---|---|---|
-| [`relay-cloudflare`](https://github.com/NakliTechie/relay-cloudflare) | JS / Cloudflare Workers | Store-and-forward relay + pairing endpoint |
+| [`mehfil-relay`](https://github.com/NakliTechie/mehfil-relay) | JS / Cloudflare Workers | Store-and-forward relay + pairing endpoint |
 | [`mehfil-bridge`](https://github.com/NakliTechie/mehfil-bridge) | Go | LAN buffer + mDNS discovery + WebRTC signaling |
 
 ## Documents
