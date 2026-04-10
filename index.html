@@ -369,6 +369,20 @@
     flex: 1;
     color: var(--warn);
   }
+  /* §6 Tier escalation banner */
+  .tier-banner {
+    margin: 8px 20px;
+    padding: 10px 14px;
+    background: color-mix(in srgb, var(--accent) 12%, var(--bg-elev));
+    border: 1px solid color-mix(in srgb, var(--accent) 40%, transparent);
+    border-radius: var(--radius);
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    font-size: 13px;
+  }
+  .tier-banner .tier-banner-text { flex: 1; }
+  .tier-banner .tier-banner-actions { display: flex; gap: 6px; flex-shrink: 0; }
 
   .thread-pill {
     display: inline-flex;
@@ -2407,7 +2421,9 @@ function renderWorkspace() {
             // Status dot classes match the CSS colors defined for
             // .presence-dot.{online,away,offline}.
             const p = (current.presence || {})[m.id];
-            const status = p?.status || "offline";
+            // §6: presence entries older than 90s are treated as stale → offline.
+            const stale = p && (Date.now() - p.updated_at) > 90_000;
+            const status = (p && !stale) ? p.status : "offline";
             const title = p?.updated_at
               ? (status === "online" ? "Online" : status === "away" ? "Away" : `Offline (last seen ${formatRelative(p.updated_at)})`)
               : "Offline";
@@ -2425,8 +2441,9 @@ function renderWorkspace() {
               + Start group DM
             </div>
           ` : ""}
-          <div class="ch-item" id="btn-invite" style="color: var(--accent); margin-top: 4px;">
-            + Invite someone
+          <div class="ch-item" id="btn-invite" style="color: var(--accent); margin-top: 4px;"
+               title="${memberTier(current) === 1 ? 'Share a link to bring others into this workspace' : ''}">
+            + Invite someone${current.members.length === 1 ? ` <span style="color: var(--fg-dim); font-size: 11px;">— get started</span>` : ""}
           </div>
         </div>
         <div class="sidebar-foot">
@@ -2446,13 +2463,14 @@ function renderWorkspace() {
           </div>
         </div>
         ${renderGapBanner(current)}
+        ${renderTierEscalationBanner(current)}
         <div class="messages" id="messages-list">
           ${channelMessages.length === 0 && isOnlyMember ? renderEmptyState() : ""}
           ${channelMessages.map(m => renderMessage(m, current.members, myUserId, { replyCount: replyCounts.get(m.id) || 0 })).join("")}
         </div>
         <div class="composer">
           <div class="composer-box" id="composer-box">
-            <textarea id="composer" rows="2" placeholder="Message ${channel.dm ? channel.name : '#' + channel.name}" autofocus></textarea>
+            <textarea id="composer" rows="2" placeholder="${composePlaceholder(channel, current)}" autofocus></textarea>
             <div class="composer-actions">
               <input type="file" id="attach-input" style="display:none">
               <button class="icon-btn" id="btn-attach" title="Attach a file">📎</button>
@@ -2512,6 +2530,16 @@ function renderWorkspace() {
       }, 3000);
     };
   }
+  // §6 Tier escalation banner wiring.
+  const $setupRelay = document.getElementById("btn-setup-relay");
+  if ($setupRelay) $setupRelay.onclick = () => openSettings("workspace");
+  const $dismissTier = document.getElementById("btn-dismiss-tier-banner");
+  if ($dismissTier) $dismissTier.onclick = async () => {
+    current.meta.tier_banner_dismissed = Date.now();
+    await idbPut(current.wsDB, "keys", current.meta, "workspace_meta");
+    setState({});
+  };
+
   const $groupDm = document.getElementById("btn-group-dm");
   if ($groupDm) $groupDm.onclick = openGroupDmModal;
 
@@ -2845,6 +2873,83 @@ function computeBadge(peerStatus, memberCount) {
     return { cls: "connecting", label: "Connecting…", title: "Establishing WebRTC connection", dotStyle: "background: var(--warn)" };
   }
   return { cls: "offline", label: "Offline", title: "No peers reachable — messages will queue", dotStyle: "background: var(--danger)" };
+}
+
+/**
+ * §6 Tier: member-count density.
+ *   Tier 1 (≤5):  verbose — full hints, explanatory tooltips, invite nudges.
+ *   Tier 3 (6-10): medium — brief copy, tooltips on hover.
+ *   Tier 4 (11+):  minimal — spare copy, suppress passive hints.
+ */
+function memberTier(current) {
+  const n = (current?.members || []).length;
+  if (n <= 5)  return 1;
+  if (n <= 10) return 3;
+  return 4;
+}
+
+/**
+ * §6 Compose placeholder — tier-1 solo nudge.
+ */
+function composePlaceholder(channel, current) {
+  const name = channel.dm ? channel.name : '#' + channel.name;
+  if (current.members.length === 1) return `Message ${name} — or invite someone first`;
+  return `Message ${name}`;
+}
+
+/**
+ * §6 Tier escalation banner (WT-10).
+ * Shown once a workspace reaches tier 3 (6+ members) and has no relay
+ * configured. Dismissible for 7 days. Clicking "Set up" opens the relay
+ * tab of Settings.
+ */
+function renderTierEscalationBanner(current) {
+  const n = current.members.length;
+  if (n < 6) return "";
+  if ((current.relays || []).length > 0) return "";
+  const dismissed = current.meta.tier_banner_dismissed || 0;
+  if (dismissed && (Date.now() - dismissed) < 7 * 24 * 3600 * 1000) return "";
+  return `
+    <div class="tier-banner" id="tier-escalation-banner">
+      <div class="tier-banner-text">
+        <strong>Your workspace is growing</strong> — with ${escapeHTML(String(n))} members,
+        a relay ensures nobody misses messages when devices are offline.
+      </div>
+      <div class="tier-banner-actions">
+        <button class="primary" id="btn-setup-relay" style="font-size: 12px; padding: 5px 12px;">Set up relay</button>
+        <button id="btn-dismiss-tier-banner" style="font-size: 12px; padding: 5px 10px;">Dismiss</button>
+      </div>
+    </div>
+  `;
+}
+
+/**
+ * §6 Flush stored (undelivered) messages to the newly-connected peer.
+ * Called from PeerMgr.attach whenever a new peer connects. Reads the
+ * raw envelope objects from the envelopes store and re-broadcasts them
+ * so no messages are silently dropped while offline.
+ */
+async function flushStoredMessages(current, workspaceId) {
+  const stored = (current.messages || []).filter(m => m.delivery === "stored" && !m.deleted);
+  if (stored.length === 0) return;
+  // Build a quick lookup id → envelope from IDB.
+  const ids = new Set(stored.map(m => m.id));
+  let envs;
+  try { envs = await idbGetAll(current.wsDB, "envelopes"); }
+  catch { return; }
+  let flushed = 0;
+  for (const env of envs) {
+    if (!ids.has(env.id)) continue;
+    try {
+      await PeerMgr.sendEnvelope(workspaceId, env);
+      // Update in-memory delivery flag so the check icon updates.
+      const msg = current.messages.find(m => m.id === env.id);
+      if (msg) { msg.delivery = "sent"; flushed++; }
+    } catch (e) {
+      console.warn("flush stored failed for", env.id, e);
+    }
+  }
+  if (flushed > 0 && State.view === "workspace") setState({});
 }
 
 function renderMessage(m, members, myUserId, opts = {}) {
@@ -5048,6 +5153,8 @@ const PeerMgr = {
       // rebroadcast lets peers 2+ hops away learn about us via the
       // gossip path.
       sendPeerAnnounce(State.current).catch(e => console.warn("peer_announce on attach failed:", e));
+      // §6: flush any messages that were stored locally while we had no peer.
+      flushStoredMessages(State.current, workspaceId).catch(e => console.warn("flush stored:", e));
     }
   },
 
@@ -7546,7 +7653,7 @@ async function openSearchPalette() {
     <div class="search-palette">
       <div class="search-input-row">
         <span class="search-input-icon">⌕</span>
-        <input id="search-input" type="text" placeholder="Search messages…" autocomplete="off">
+        <input id="search-input" type="text" placeholder="Search messages… (from:name, in:#channel)" autocomplete="off">
         <span class="search-kbd">Esc</span>
       </div>
       <div class="search-results" id="search-results">
@@ -7565,19 +7672,67 @@ async function openSearchPalette() {
     if (e.target === overlay) overlay.remove();
   });
 
+  /**
+   * §6 Search filter parser. Extracts `from:name` and `in:#channel`
+   * tokens from the raw query, returning { baseQuery, fromFilter, inFilter }.
+   * Both filters are lowercased for case-insensitive matching.
+   */
+  function parseSearchQuery(raw) {
+    let q = raw;
+    let fromFilter = null, inFilter = null;
+    // from:name — match by display name (prefix)
+    q = q.replace(/\bfrom:(\S+)/gi, (_, name) => { fromFilter = name.toLowerCase(); return ""; });
+    // in:#channel or in:channel
+    q = q.replace(/\bin:#?(\S+)/gi, (_, ch) => { inFilter = ch.toLowerCase(); return ""; });
+    return { baseQuery: q.trim(), fromFilter, inFilter };
+  }
+
+  /** Apply from:/in: post-filters against already-scored MiniSearch hits. */
+  function applySearchFilters(hits, fromFilter, inFilter, wsId, members, channels) {
+    if (!fromFilter && !inFilter) return hits;
+    return hits.filter(hit => {
+      if (fromFilter) {
+        const isCurrentWs = wsId && hit.ws === wsId;
+        const memberName = isCurrentWs
+          ? (members.find(m => m.id === hit.from)?.name || "")
+          : hit.from;
+        if (!memberName.toLowerCase().includes(fromFilter)) return false;
+      }
+      if (inFilter) {
+        const isCurrentWs = wsId && hit.ws === wsId;
+        const chName = isCurrentWs
+          ? (channels.find(c => c.id === hit.ch)?.name || hit.ch || "")
+          : (hit.ch || "");
+        if (!chName.toLowerCase().includes(inFilter)) return false;
+      }
+      return true;
+    });
+  }
+
   // Live search.
   let debounceTimer = null;
   $input.addEventListener("input", () => {
     clearTimeout(debounceTimer);
     debounceTimer = setTimeout(() => {
-      const q = $input.value.trim();
-      if (!q) {
+      const raw = $input.value.trim();
+      if (!raw) {
         $results.innerHTML = `<div class="search-empty">Type to search across all messages</div>`;
         return;
       }
-      const hits = ms.search(q, { limit: 40 });
+      const { baseQuery: q, fromFilter, inFilter } = parseSearchQuery(raw);
+      const wsId = State.current?.meta?.id;
+      const members = State.current?.members || [];
+      const channels = State.current?.channels || [];
+      // If only filters provided (no freetext), start from all indexed docs.
+      const rawHits = q ? ms.search(q, { limit: 100 }) : allDocs;
+      const hits = applySearchFilters(rawHits, fromFilter, inFilter, wsId, members, channels).slice(0, 40);
       if (hits.length === 0) {
-        $results.innerHTML = `<div class="search-empty">No results for "${escapeHTML(q)}"</div>`;
+        const filterDesc = [
+          q ? `"${escapeHTML(q)}"` : "",
+          fromFilter ? `from:${escapeHTML(fromFilter)}` : "",
+          inFilter ? `in:#${escapeHTML(inFilter)}` : "",
+        ].filter(Boolean).join(" ");
+        $results.innerHTML = `<div class="search-empty">No results${filterDesc ? " for " + filterDesc : ""}</div>`;
         return;
       }
       // Group by workspace.
@@ -8304,6 +8459,9 @@ if (/[?&]debug=1/.test(location.search)) {
     sendMemberRemove, draftPromotion, addCoSignPromotion, finalizePromotion,
     exportWorkspace, importWorkspace, openSearchPalette, SearchIndex,
     sanitizeUrl, isAdmin,
+    // Slice 6
+    memberTier, composePlaceholder, renderTierEscalationBanner,
+    flushStoredMessages,
     get Y() { return Y; },
     get MiniSearch() { return MiniSearch; },
     bytesToB64Url, b64UrlToBytes, bytesToHex, bytesToB64,
@@ -8372,6 +8530,28 @@ window.addEventListener("keydown", (e) => {
   if ((e.metaKey || e.ctrlKey) && e.key === "k" && State.view === "workspace") {
     e.preventDefault();
     openSearchPalette().catch(console.warn);
+    return;
+  }
+
+  // §6 WT-29: Cmd/Ctrl+T — return to workspace picker (landing).
+  if ((e.metaKey || e.ctrlKey) && e.key === "t" && !e.shiftKey && State.view === "workspace") {
+    e.preventDefault();
+    setState({ view: "landing" });
+    return;
+  }
+
+  // §6 WT-29: Cmd/Ctrl+1–9 — switch workspace by position in recently-opened list.
+  if ((e.metaKey || e.ctrlKey) && /^[1-9]$/.test(e.key) && !e.shiftKey && !e.altKey) {
+    const idx = parseInt(e.key, 10) - 1;
+    const workspaces = State.workspaces || [];
+    if (idx < workspaces.length) {
+      const target = workspaces[idx];
+      if (!State.current || target.id !== State.current.meta.id) {
+        e.preventDefault();
+        openWorkspaceById(target.id).catch(console.warn);
+      }
+      // If already in target workspace, let the key fall through (e.g. tab 1).
+    }
     return;
   }
 
