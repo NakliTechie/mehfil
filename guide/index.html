@@ -311,6 +311,7 @@
     <li><a href="#admin">Admin controls</a></li>
     <li><a href="#relay">Relay setup</a></li>
     <li><a href="#bridge">LAN bridge</a></li>
+    <li><a href="#huddles">Huddles</a></li>
   </ul>
   <div class="section-label">Mobile</div>
   <ul>
@@ -645,6 +646,54 @@ mehfil-bridge
     </div>
 
     <p>Full setup guide including launchd / systemd configs: <a href="../docs/bridge-setup.md">docs/bridge-setup.md</a></p>
+  </section>
+
+  <!-- ─────────────────────────────── HUDDLES ─── -->
+  <section id="huddles">
+    <h2><span class="icon">🎙</span> Huddles</h2>
+    <p class="lead">A huddle is a live audio call inside a workspace. Anyone online can start one and anyone else can jump in — no scheduling, no meeting link, no third-party service. Audio travels directly peer-to-peer, encrypted end-to-end.</p>
+
+    <h3>Starting a huddle</h3>
+    <ol class="steps">
+      <li>Click the <strong>🎙</strong> button in the bottom-left corner of the sidebar (next to the settings gear).</li>
+      <li>Your browser asks for microphone permission — allow it.</li>
+      <li>A <strong>huddle bar</strong> appears above the message composer, showing your avatar. You're live.</li>
+    </ol>
+
+    <div class="callout tip">
+      <span class="icon">💡</span>
+      <div>The 🎙 button turns <span style="color:#22c55e;font-weight:600;">green</span> whenever you're in a huddle. Click it again to leave instantly.</div>
+    </div>
+
+    <h3>Joining someone else's huddle</h3>
+    <p>When another member starts a huddle, you'll see their avatar appear in the huddle bar at the bottom of the screen. Click <strong>🎙</strong> to join. Your browser will ask for mic permission if it hasn't already.</p>
+    <p>Connections form automatically — you don't need to do anything beyond clicking join. Within a couple of seconds, audio is flowing directly between everyone in the call.</p>
+
+    <h3>Controls</h3>
+    <ul>
+      <li><strong>🎤 Mute / unmute</strong> — the mic button in the huddle bar. When muted your avatar dims and no audio is sent. Your connection stays open so you can unmute any time.</li>
+      <li><strong>Leave</strong> — the Leave button closes all your audio connections and removes you from the bar for everyone else.</li>
+    </ul>
+
+    <h3>Speaking indicators</h3>
+    <p>Each participant's avatar shows a <strong>pulsing ring</strong> when they're actively speaking. This is driven by a volume analyser on the incoming audio — no voice-activity algorithm, just raw mic level sampled every 150 ms. It disappears immediately when the person stops talking.</p>
+
+    <h3>How it works under the hood</h3>
+    <p>Huddles use <strong>WebRTC</strong> — the same browser technology used for video calls in Google Meet or Zoom, but here it's audio-only and entirely within Mehfil. When you join, Mehfil broadcasts an encrypted <em>huddle.join</em> envelope to every connected member. Each person already in the call responds with a WebRTC offer — a "here's how to reach me" packet. You exchange answers, then ICE candidates (possible network paths) trickle in until a direct route is found. The result is a mesh: with three people in a call there are three separate audio connections, A↔B, A↔C, B↔C.</p>
+    <p>The signaling (offers, answers, ICE) uses the same encrypted envelope system as messages, so it's protected by your workspace key. The audio itself is encrypted by WebRTC's mandatory DTLS-SRTP — standard in all modern browsers.</p>
+
+    <div class="callout info">
+      <span class="icon">ℹ️</span>
+      <div><strong>No audio ever touches a server.</strong> The relay and bridge are for message delivery only. Huddle audio is always direct, browser-to-browser, over an encrypted peer-to-peer connection.</div>
+    </div>
+
+    <h3>Limitations</h3>
+    <ul>
+      <li><strong>Live only:</strong> huddles are ephemeral — nothing is recorded or stored. If you reload the page, you'll need to rejoin.</li>
+      <li><strong>Online peers only:</strong> because audio is peer-to-peer, you can only hear members who are currently connected. The relay doesn't buffer audio.</li>
+      <li><strong>Restrictive networks:</strong> on very locked-down corporate networks where WebRTC is blocked, the audio connection may not establish. Message delivery (via relay/bridge) is unaffected.</li>
+      <li><strong>Mobile:</strong> works in Chrome on Android. iOS Safari has partial WebRTC audio support — behaviour varies by iOS version. A relay is recommended for mobile users so messages aren't missed while the tab is in the background.</li>
+    </ul>
   </section>
 
   <!-- ─────────────────────────────── MOBILE ─── -->
