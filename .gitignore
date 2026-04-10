@@ -1,8 +1,11 @@
 *
 !index.html
 !README.md
+!SECURITY.md
 !LICENSE
 !.gitignore
 !MEHFIL-SPEC.md
 !MEHFIL-WALKTHROUGHS.md
 !PROTOCOL.md
+!docs/
+!docs/*.md

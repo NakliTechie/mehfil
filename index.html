@@ -1370,25 +1370,89 @@ const Crypto = {
  *    - Only someone with the blob bytes (from OPFS or a future
  *      relay upload) can decrypt the actual file.
  *
- *  25MB hard cap per attachment (spec §14.1). LRU eviction and
- *  per-workspace quota enforcement are Slice 5 work.
+ *  25MB hard cap per attachment (spec §14.1).
+ *  500MB per-workspace quota with LRU eviction (Slice 5 — shipped).
+ *  LRU is tracked in-memory per session; unknown-age blobs (post-
+ *  reload) are treated as oldest so they evict first.
  * ------------------------------------------------------------ */
 const MAX_ATTACHMENT_SIZE = 25 * 1024 * 1024;
+const BLOB_QUOTA_BYTES    = 500 * 1024 * 1024; // 500 MB per workspace
 
 const BlobStore = {
+  _lru: new Map(), // Map<wsId, Map<blobId, lastAccessTs>>
+
+  _lruFor(wsId) {
+    if (!this._lru.has(wsId)) this._lru.set(wsId, new Map());
+    return this._lru.get(wsId);
+  },
+
+  _touch(wsId, blobId) {
+    this._lruFor(wsId).set(blobId, Date.now());
+  },
+
   async _getWorkspaceDir(workspaceId) {
     const root = await navigator.storage.getDirectory();
     return root.getDirectoryHandle("mehfil_" + workspaceId, { create: true });
+  },
+
+  /** Total ciphertext bytes stored for this workspace in OPFS. */
+  async usage(workspaceId) {
+    const dir = await this._getWorkspaceDir(workspaceId);
+    let total = 0;
+    for await (const [, handle] of dir.entries()) {
+      if (handle.kind !== "file") continue;
+      const file = await handle.getFile();
+      total += file.size;
+    }
+    return total;
+  },
+
+  /**
+   * Evict least-recently-used blobs until usage is ≤80% of quota.
+   * Blobs with no in-memory access record (i.e. accessed in a prior
+   * session) get ts=0 so they are first in line.
+   */
+  async evictLRU(workspaceId) {
+    const dir    = await this._getWorkspaceDir(workspaceId);
+    const lru    = this._lruFor(workspaceId);
+    const target = Math.floor(BLOB_QUOTA_BYTES * 0.8);
+
+    // Snapshot all blobs with sizes and access timestamps.
+    const entries = [];
+    let used = 0;
+    for await (const [name, handle] of dir.entries()) {
+      if (handle.kind !== "file") continue;
+      const file = await handle.getFile();
+      entries.push({ name, size: file.size, ts: lru.get(name) ?? 0 });
+      used += file.size;
+    }
+
+    if (used <= BLOB_QUOTA_BYTES) return; // nothing to do
+
+    entries.sort((a, b) => a.ts - b.ts); // oldest first
+
+    for (const entry of entries) {
+      if (used <= target) break;
+      try {
+        await dir.removeEntry(entry.name);
+        lru.delete(entry.name);
+        used -= entry.size;
+      } catch (e) {
+        console.warn("[BlobStore] evict failed:", entry.name, e);
+      }
+    }
+    console.info(`[BlobStore] eviction done — ws ${workspaceId} now ~${(used/1024/1024).toFixed(1)} MB`);
+  },
+
+  async _checkQuota(workspaceId) {
+    const used = await this.usage(workspaceId);
+    if (used > BLOB_QUOTA_BYTES) await this.evictLRU(workspaceId);
   },
 
   /**
    * Encrypt `plaintextBytes` with a fresh per-blob key, write the
    * ciphertext to OPFS, and return `{blob_id, key, iv}` for the
    * caller to stuff into an attachment.ref envelope.
-   *
-   * Uses a random 16-byte blob id (not a content hash) so identical
-   * files stored twice get distinct entries. Content-addressing is
-   * a Slice 5+ optimization.
    */
   async put(workspaceId, plaintextBytes) {
     if (plaintextBytes.length > MAX_ATTACHMENT_SIZE) {
@@ -1406,15 +1470,15 @@ const BlobStore = {
     await writable.write(ct);
     await writable.close();
 
+    this._touch(workspaceId, blobId);
+    this._checkQuota(workspaceId).catch(e => console.warn("[BlobStore] quota check:", e));
+
     return { blob_id: blobId, key: rawKey, iv, size: plaintextBytes.length };
   },
 
   /**
-   * Read a blob from OPFS, decrypt with the per-blob key + IV,
-   * return the plaintext bytes. Returns null if the blob isn't
-   * stored locally (e.g. this client is a recipient who hasn't
-   * fetched the blob from the sender yet — Slice 3c ships local-
-   * only attachments, full peer blob transfer is a later slice).
+   * Read a blob from OPFS, decrypt with the per-blob key + IV.
+   * Returns null if not stored locally.
    */
   async get(workspaceId, blobId, rawKey, iv) {
     const dir = await this._getWorkspaceDir(workspaceId);
@@ -1422,23 +1486,22 @@ const BlobStore = {
     try {
       handle = await dir.getFileHandle(blobId, { create: false });
     } catch (e) {
-      return null;   // not found — sender hasn't shared the bytes yet
+      return null;
     }
     const file = await handle.getFile();
     const ct = new Uint8Array(await file.arrayBuffer());
     const aesKey = await Crypto.importAesRaw(rawKey);
     try {
-      return new Uint8Array(await crypto.subtle.decrypt({ name: "AES-GCM", iv }, aesKey, ct));
+      const pt = new Uint8Array(await crypto.subtle.decrypt({ name: "AES-GCM", iv }, aesKey, ct));
+      this._touch(workspaceId, blobId);
+      return pt;
     } catch (e) {
       console.warn("blob decrypt failed", blobId, e);
       return null;
     }
   },
 
-  /**
-   * Does the local OPFS have the blob? Used to decide whether to
-   * render an attachment inline or as a "not available yet" stub.
-   */
+  /** Does the local OPFS have the blob? */
   async has(workspaceId, blobId) {
     const dir = await this._getWorkspaceDir(workspaceId);
     try {
@@ -1449,13 +1512,7 @@ const BlobStore = {
     }
   },
 
-  /**
-   * Read the raw ciphertext bytes from OPFS without decrypting.
-   * Used by the blob transfer sender side: we chunk + stream the
-   * ciphertext as-is so the receiver's OPFS becomes a byte-identical
-   * copy. Both sides then decrypt locally with the per-blob key from
-   * the attachment.ref envelope.
-   */
+  /** Read raw ciphertext (no decrypt). Used by blob transfer sender. */
   async getCiphertext(workspaceId, blobId) {
     const dir = await this._getWorkspaceDir(workspaceId);
     let handle;
@@ -1465,16 +1522,13 @@ const BlobStore = {
       return null;
     }
     const file = await handle.getFile();
+    this._touch(workspaceId, blobId);
     return new Uint8Array(await file.arrayBuffer());
   },
 
   /**
-   * Write already-encrypted bytes to OPFS at a specific blob_id.
-   * This is the inverse operation to getCiphertext — used by the
-   * blob transfer receiver side to write reassembled ciphertext
-   * directly without re-encrypting. The caller is responsible for
-   * ensuring the bytes are genuine ciphertext (they were produced
-   * by a prior BlobStore.put somewhere).
+   * Write already-encrypted bytes to OPFS (blob transfer receiver).
+   * Caller guarantees bytes are genuine ciphertext from a prior BlobStore.put.
    */
   async putCiphertext(workspaceId, blobId, ciphertextBytes) {
     const dir = await this._getWorkspaceDir(workspaceId);
@@ -1482,6 +1536,9 @@ const BlobStore = {
     const writable = await handle.createWritable();
     await writable.write(ciphertextBytes);
     await writable.close();
+
+    this._touch(workspaceId, blobId);
+    this._checkQuota(workspaceId).catch(e => console.warn("[BlobStore] quota check:", e));
   }
 };
 
@@ -2752,7 +2809,7 @@ function renderWorkspace() {
     }
     // Note: we deliberately don't revokeObjectURL because the image needs
     // to stay rendered for the lifetime of the view. These get GC'd when
-    // the page unloads. Slice 5 may add an LRU eviction pass.
+    // the page unloads. LRU eviction runs automatically via BlobStore._checkQuota.
   });
 
   // Message actions (edit / delete / react / thread) — hover-revealed buttons.
@@ -3954,6 +4011,12 @@ function wireSettingsTab(tab, wrap, current, me, wsName) {
       await idbPut(current.wsDB, "keys", current.meta, "workspace_meta");
       // §35: start relay transport immediately.
       RelayMgr.startForWorkspace(current);
+      // Propagate relay config to peers via workspace.patch so they
+      // can use the relay without manual reconfiguration.
+      if (current.doc) {
+        const update = WorkspaceDoc.setRelays(current.doc, current.relays);
+        sendWorkspacePatch(current, update).catch(e => console.warn("relay patch:", e));
+      }
       wrap.remove();
       setState({ modal: null });
     };
@@ -3966,6 +4029,11 @@ function wireSettingsTab(tab, wrap, current, me, wsName) {
           await idbPut(current.wsDB, "keys", current.meta, "workspace_meta");
           // §35: restart (or stop) relay transport after removal.
           RelayMgr.startForWorkspace(current);
+          // Propagate the removal to peers.
+          if (current.doc) {
+            const update = WorkspaceDoc.setRelays(current.doc, current.relays);
+            sendWorkspacePatch(current, update).catch(e => console.warn("relay patch:", e));
+          }
           wrap.remove();
           setState({ modal: null });
         }
@@ -6103,6 +6171,20 @@ const WorkspaceDoc = {
     return out;
   },
 
+  /**
+   * Store relay configs in the Yjs doc so peers receive them via workspace.patch.
+   * Relays carry a bearer token — peers need it to push/poll the relay themselves.
+   */
+  setRelays(doc, relays) {
+    return this.mutate(doc, () => {
+      doc.getMap("meta").set("relays", JSON.parse(JSON.stringify(relays || [])));
+    });
+  },
+
+  getRelays(doc) {
+    return doc.getMap("meta").get("relays") || [];
+  },
+
   // ========== Pending promotions (Slice 5 / §4.3) ==========
   // Stored in the Yjs doc so they're shared with peers via workspace.patch.
 
@@ -6775,6 +6857,14 @@ const EnvelopeDispatch = {
             gwsRec.name = newName;
             await idbPut(State.globalDB, "workspaces", gwsRec);
           }
+        }
+        // Mirror relay config changes propagated by admins.
+        const newRelays = WorkspaceDoc.getRelays(current.doc);
+        if (Array.isArray(newRelays) && JSON.stringify(newRelays) !== JSON.stringify(current.relays || [])) {
+          current.relays      = newRelays;
+          current.meta.relays = newRelays;
+          await idbPut(current.wsDB, "keys", current.meta, "workspace_meta");
+          RelayMgr.startForWorkspace(current);
         }
         break;
       }
