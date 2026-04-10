@@ -2,7 +2,7 @@
 
 Browser-native, local-first team chat. Single HTML file. No accounts. No central server. Messages are end-to-end encrypted, signed by the sender, and stored on the devices of workspace members — never in the cloud.
 
-> **Status: v1.1 shipped.** All 8 slices plus multi-device identity are complete.
+> **Status: v1.2 shipped.** Multi-device identity, multi-admin UI, and sender-keys for group DMs are all complete.
 
 ## What works
 
@@ -11,7 +11,7 @@ Browser-native, local-first team chat. Single HTML file. No accounts. No central
 - `#general` channel is created automatically; add more with the `+` button
 - Private channels (per-member ECDH key wrapping) and public channels
 - 1:1 DMs — click any member in the People sidebar; channel id is deterministically derived
-- Group DMs — "+ Start group DM" in the sidebar, pick 2+ members
+- Group DMs — "+ Start group DM" in the sidebar, pick 2+ members; per-sender keys so removing a member only retires their key
 - Edit + delete your own messages (hover to reveal ✎ / 🗑)
 - Per-channel drafts persist across page reloads
 - Emoji reactions (`👍 ❤️ 😂 😮 😢 🙏 👀 ✅`), @mentions with autocomplete, threaded replies
@@ -38,7 +38,8 @@ Browser-native, local-first team chat. Single HTML file. No accounts. No central
 
 **Admin**
 - Member removal with full workspace + channel rekey
-- Promote-by-consensus (2-of-N admin co-signature)
+- Promote-by-consensus (2-of-N admin co-signature); role badges on the People sidebar
+- ★ Propose-as-admin button on any member row (visible to admins and owners)
 - Workspace-wide search (MiniSearch, `from:name` / `in:#channel` filters)
 - Export / import workspace as an encrypted `.workspace` file
 - Relay config propagates to peers via `workspace.patch`
@@ -126,15 +127,13 @@ Production paths (no `?as=`) are unaffected. Combine with `?debug=1` to expose e
 
 ## Upcoming
 
-- **Multi-admin UI** — Admins section in the member list, voluntary admin transfer (consensus mechanism already in place)
-- **Sender-keys for group DMs** — per-sender ratcheted keys so member removal only retires one key, not the whole group
 - **Multi-office bridge federation** — two bridges in two offices syncing through a shared relay; within-office traffic stays local
 - **Huddles** — audio via WebRTC mesh
 - **Canvas** — Yjs collaborative doc as a first-class channel type
 
 ## Architecture
 
-`index.html` is the entire app — markup, styles, and ~10,300 lines of vanilla JS, no framework, no build step. Web Crypto only. Custom canonical MessagePack codec (no external lib). IndexedDB per spec §9.1: `envelopes` is the source of truth, everything else is a projection rebuilt on replay. State is a single object; render is a pure function of state. Yjs (lazy-loaded from esm.sh) handles workspace metadata CRDT.
+`index.html` is the entire app — markup, styles, and ~10,600 lines of vanilla JS, no framework, no build step. Web Crypto only. Custom canonical MessagePack codec (no external lib). IndexedDB per spec §9.1: `envelopes` is the source of truth, everything else is a projection rebuilt on replay. State is a single object; render is a pure function of state. Yjs (lazy-loaded from esm.sh) handles workspace metadata CRDT.
 
 Two companion services live in separate repos:
 
