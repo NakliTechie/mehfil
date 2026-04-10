@@ -217,11 +217,71 @@
   }
   .back-link:hover { color: var(--accent); }
 
+  /* ── Mobile nav toggle ── */
+  #nav-toggle {
+    display: none;
+    position: fixed;
+    top: 12px; left: 12px;
+    z-index: 30;
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 8px 12px;
+    font-size: 16px;
+    cursor: pointer;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.08);
+  }
+  #nav-overlay {
+    display: none;
+    position: fixed;
+    inset: 0;
+    background: rgba(0,0,0,0.35);
+    z-index: 19;
+  }
+
+  /* ── Mobile responsive ── */
+  @media (max-width: 720px) {
+    :root { --sidebar-w: 0px; }
+
+    body { display: block; }
+
+    nav {
+      transform: translateX(-100%);
+      transition: transform 0.22s ease;
+      width: 260px;
+      z-index: 20;
+    }
+    nav.open { transform: translateX(0); }
+
+    #nav-toggle { display: block; }
+    #nav-overlay.open { display: block; }
+
+    main {
+      margin-left: 0;
+      padding: 52px 20px 60px;
+    }
+
+    .hero { padding: 28px 22px 24px; border-radius: 10px; }
+    .hero h1 { font-size: 26px; }
+    .hero p  { font-size: 14px; }
+
+    h1 { font-size: 24px; }
+    h2 { font-size: 18px; }
+
+    .shot { margin: 16px 0; }
+
+    pre { font-size: 12px !important; padding: 12px !important; }
+  }
+
   /* ── Scroll spy highlight ── */
   html { scroll-behavior: smooth; }
 </style>
 </head>
 <body>
+
+<!-- ── Mobile nav toggle ── -->
+<button id="nav-toggle" aria-label="Open navigation">☰</button>
+<div id="nav-overlay"></div>
 
 <!-- ── Sidebar ── -->
 <nav id="nav">
@@ -251,6 +311,10 @@
     <li><a href="#admin">Admin controls</a></li>
     <li><a href="#relay">Relay setup</a></li>
     <li><a href="#bridge">LAN bridge</a></li>
+  </ul>
+  <div class="section-label">Mobile</div>
+  <ul>
+    <li><a href="#mobile">Using on mobile</a></li>
   </ul>
 </nav>
 
@@ -583,10 +647,75 @@ mehfil-bridge
     <p>Full setup guide including launchd / systemd configs: <a href="../docs/bridge-setup.md">docs/bridge-setup.md</a></p>
   </section>
 
+  <!-- ─────────────────────────────── MOBILE ─── -->
+  <section id="mobile">
+    <h2><span class="icon">📲</span> Using Mehfil on mobile</h2>
+    <p class="lead">Mehfil runs in any modern mobile browser — no app store required. Open <code>index.html</code> from a local server on your network, or visit your GitHub Pages URL from your phone.</p>
+
+    <div class="callout tip">
+      <span class="icon">💡</span>
+      <div>On iOS, tap the Share button in Safari and choose <strong>Add to Home Screen</strong> to pin Mehfil as a standalone app icon. On Android, Chrome shows an "Add to Home screen" banner automatically.</div>
+    </div>
+
+    <h3>Getting the app on your phone</h3>
+    <ol class="steps">
+      <li>Run <code>python3 -m http.server 8103</code> on your laptop (or use the GitHub Pages URL).</li>
+      <li>Find your laptop's local IP address (<code>ifconfig</code> / System Settings → Wi-Fi).</li>
+      <li>On your phone — same Wi-Fi — open <code>http://192.168.x.x:8103</code> in the browser.</li>
+      <li>Optionally: save to home screen for a full-screen app experience.</li>
+    </ol>
+
+    <h3>Joining an existing workspace on mobile</h3>
+    <p>The easiest path is a <strong>6-word pairing code</strong> from the desktop. No URLs to copy-paste between devices.</p>
+    <ol class="steps">
+      <li>On your desktop: Settings → Devices → <strong>+ Pair a new device</strong>. Six words appear.</li>
+      <li>On your phone: tap <strong>Add this device to an existing identity</strong> on the landing screen, type the six words, tap Join.</li>
+      <li>Confirm the trust card matches on both screens. Your identity and all workspace keys transfer automatically.</li>
+    </ol>
+
+    <p>Alternatively, if someone is inviting you fresh: tap <strong>Join by code</strong> on the landing screen and enter the invite code your workspace admin shared.</p>
+
+    <h3>Mobile-specific tips</h3>
+    <ul>
+      <li><strong>Composer:</strong> tap the text area to open the keyboard. Tap Send (or press Return on hardware keyboards with "Return sends" enabled).</li>
+      <li><strong>Sidebar:</strong> on narrow screens the sidebar is hidden by default — tap the <strong>☰</strong> button (top-left) in the guide, or the channel/person name in the header to navigate.</li>
+      <li><strong>File attachments:</strong> tap 📎 to open the system photo picker or file browser. The 25 MB limit applies on mobile too.</li>
+      <li><strong>Reactions &amp; threads:</strong> long-press or tap the reaction icon that appears when you tap a message.</li>
+      <li><strong>Search:</strong> no keyboard shortcut on mobile — a Search button appears at the top of the workspace.</li>
+      <li><strong>WebRTC peer connections:</strong> work normally on mobile Chrome and Safari. If you're on a restrictive network, configure a relay so messages route via the cloud instead.</li>
+    </ul>
+
+    <h3>Limitations on mobile</h3>
+    <ul>
+      <li><strong>Background sync:</strong> iOS Safari aggressively suspends tabs. If you close the browser, you won't receive messages until you reopen it. A relay ensures nothing is lost — messages are stored until your device polls.</li>
+      <li><strong>Push notifications:</strong> not yet supported. The relay buffers messages for up to 90 days; they arrive the next time you open the app.</li>
+      <li><strong>OPFS storage:</strong> file attachments are stored in the browser's Origin Private File System. On iOS this may be cleared if the browser storage is full or the OS evicts it — back up important files externally.</li>
+    </ul>
+
+    <div class="callout info">
+      <span class="icon">ℹ️</span>
+      <div>All encryption (Ed25519 + X25519 + AES-256-GCM) runs via the native Web Crypto API, which is available on all modern mobile browsers. No performance difference vs desktop for key operations.</div>
+    </div>
+  </section>
+
 </main>
 
 <script>
-  // Scroll-spy: highlight the active nav link based on scroll position
+  // ── Mobile nav toggle ──────────────────────────────────────────────────────
+  const navEl      = document.getElementById('nav');
+  const toggleBtn  = document.getElementById('nav-toggle');
+  const overlay    = document.getElementById('nav-overlay');
+
+  function openNav()  { navEl.classList.add('open'); overlay.classList.add('open'); }
+  function closeNav() { navEl.classList.remove('open'); overlay.classList.remove('open'); }
+
+  toggleBtn.addEventListener('click', openNav);
+  overlay.addEventListener('click', closeNav);
+
+  // Close when a nav link is clicked (single-page anchors)
+  navEl.querySelectorAll('a[href^="#"]').forEach(a => a.addEventListener('click', closeNav));
+
+  // ── Scroll-spy ────────────────────────────────────────────────────────────
   const sections = document.querySelectorAll('section[id]');
   const navLinks = document.querySelectorAll('nav a[href^="#"]');
 

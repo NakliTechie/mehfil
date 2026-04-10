@@ -2366,8 +2366,13 @@ function renderLanding() {
   $app.innerHTML = `
     <div class="center">
       <div class="card">
-        <h1>Mehfil</h1>
-        <p class="sub">Browser-native team chat. No accounts, no servers, your data stays on your devices.</p>
+        <div style="display:flex;align-items:flex-start;justify-content:space-between;gap:8px;">
+          <div>
+            <h1>Mehfil</h1>
+            <p class="sub">Browser-native team chat. No accounts, no servers, your data stays on your devices.</p>
+          </div>
+          <button id="btn-how" title="How does this work?" style="flex-shrink:0;width:28px;height:28px;border-radius:50%;border:1.5px solid var(--border);background:var(--bg-elev);color:var(--fg-dim);font-size:14px;font-weight:600;cursor:pointer;display:flex;align-items:center;justify-content:center;padding:0;margin-top:2px;">?</button>
+        </div>
         <div class="stack">
           <button class="primary" id="btn-start">Start a workspace</button>
           <button id="btn-join" disabled title="Open a join link instead">Join a workspace</button>
@@ -2392,6 +2397,7 @@ function renderLanding() {
     "a backup file, you'll need to be re-invited under a new identity. Back up your " +
     "key after your first message — we'll prompt you."
   );
+  document.getElementById("btn-how").onclick = openHowItWorksModal;
   // Wire workspace list entries.
   document.querySelectorAll("[data-ws-open]").forEach(el => {
     el.onclick = () => openWorkspaceById(el.getAttribute("data-ws-open"));
@@ -3705,6 +3711,64 @@ function renderBackupModal() {
  *  existing workspaces stay where they are but only the restored
  *  identity can access envelopes encrypted to it.
  * ------------------------------------------------------------ */
+
+/* ------------------------------------------------------------
+ *  How-it-works modal — landing page "?" button
+ * ------------------------------------------------------------ */
+function openHowItWorksModal() {
+  const wrap = document.createElement("div");
+  wrap.className = "modal-bg";
+  wrap.innerHTML = `
+    <div class="card" style="max-width:480px;">
+      <div class="row" style="margin-bottom:16px;">
+        <h1 style="margin:0;font-size:20px;flex:1;">How Mehfil works</h1>
+        <button class="icon-btn" id="how-close" style="font-size:18px;padding:2px 7px;">✕</button>
+      </div>
+
+      <div style="display:flex;flex-direction:column;gap:16px;">
+        <div style="display:flex;gap:14px;align-items:flex-start;">
+          <span style="font-size:22px;flex-shrink:0;">🔑</span>
+          <div>
+            <strong style="font-size:14px;">No accounts, no passwords</strong>
+            <p class="sub" style="margin-top:4px;font-size:13px;line-height:1.5;">Mehfil generates a cryptographic key pair in your browser the first time you start a workspace. That key pair <em>is</em> your identity — no email, no server account.</p>
+          </div>
+        </div>
+        <div style="display:flex;gap:14px;align-items:flex-start;">
+          <span style="font-size:22px;flex-shrink:0;">🔒</span>
+          <div>
+            <strong style="font-size:14px;">End-to-end encrypted</strong>
+            <p class="sub" style="margin-top:4px;font-size:13px;line-height:1.5;">Every message is signed and encrypted before it leaves your device. Only people in your workspace hold the keys — not Mehfil, not a server, not us.</p>
+          </div>
+        </div>
+        <div style="display:flex;gap:14px;align-items:flex-start;">
+          <span style="font-size:22px;flex-shrink:0;">📡</span>
+          <div>
+            <strong style="font-size:14px;">Peer-to-peer, or via a relay you control</strong>
+            <p class="sub" style="margin-top:4px;font-size:13px;line-height:1.5;">Messages flow directly between browsers over WebRTC when both people are online. Add your own Cloudflare relay for async delivery, or run the Go bridge on your LAN for zero-cloud messaging.</p>
+          </div>
+        </div>
+        <div style="display:flex;gap:14px;align-items:flex-start;">
+          <span style="font-size:22px;flex-shrink:0;">💾</span>
+          <div>
+            <strong style="font-size:14px;">Your data stays on your devices</strong>
+            <p class="sub" style="margin-top:4px;font-size:13px;line-height:1.5;">Messages and keys are stored in your browser's IndexedDB. Nothing is stored on a central server. Back up your identity key — it's the only recovery path if you lose your device.</p>
+          </div>
+        </div>
+      </div>
+
+      <div style="margin-top:22px;padding-top:16px;border-top:1px solid var(--border);display:flex;justify-content:space-between;align-items:center;">
+        <a href="guide/index.html" target="_blank" style="font-size:13px;color:var(--accent);text-decoration:none;font-weight:500;">Read the full guide ↗</a>
+        <button class="primary" id="how-ok" style="padding:7px 20px;font-size:14px;">Got it</button>
+      </div>
+    </div>
+  `;
+  document.body.appendChild(wrap);
+  const close = () => wrap.remove();
+  wrap.querySelector("#how-close").onclick = close;
+  wrap.querySelector("#how-ok").onclick = close;
+  wrap.addEventListener("click", e => { if (e.target === wrap) close(); });
+}
+
 function openRestoreModal() {
   const wrap = document.createElement("div");
   wrap.className = "modal-bg";
