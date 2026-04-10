@@ -1219,6 +1219,13 @@ const Crypto = {
     return new Uint8Array(h);
   },
 
+  /** SHA-256 of a string or Uint8Array, returned as 64-char lowercase hex. */
+  async sha256Hex(input) {
+    const data = typeof input === "string" ? new TextEncoder().encode(input) : input;
+    const buf  = await crypto.subtle.digest("SHA-256", data);
+    return [...new Uint8Array(buf)].map(b => b.toString(16).padStart(2, "0")).join("");
+  },
+
   async genIdentity() {
     // Ed25519 keypair. Web Crypto support is now wide; we throw a clean
     // error if missing so the user gets a real message instead of a stack.
@@ -2229,6 +2236,7 @@ function parseMentions(body, members) {
 const State = {
   view: "boot",        // boot | landing | name-input | workspace | error
                        //       | join-verify | join-name-color | join-waiting
+                       //       | revoked
   error: null,
   globalDB: null,
   identity: null,
@@ -2247,6 +2255,9 @@ const State = {
   // Thread panel — parent message id if open, null if closed.
   // The panel closes automatically when currentChannel changes.
   threadOpen: null,
+  // Device pairing session (v1.1). Set while a pairing handshake is in
+  // progress on either side; cleared on completion, cancellation, or timeout.
+  pairingSession: null,
 };
 
 const $app = document.getElementById("app");
@@ -2266,6 +2277,7 @@ function render() {
   if (State.view === "join-verify")     return renderJoinVerify();
   if (State.view === "join-name-color") return renderJoinNameColor();
   if (State.view === "join-waiting")    return renderJoinWaiting();
+  if (State.view === "revoked")         return renderRevoked();
   $app.textContent = "Unknown view: " + State.view;
 }
 
@@ -2281,6 +2293,27 @@ function renderError() {
   </div>`;
 }
 
+function renderRevoked() {
+  const wsName = State.current?.meta?.name || "a workspace";
+  $app.innerHTML = `
+    <div class="center">
+      <div class="card" style="text-align: center; max-width: 420px;">
+        <h1 style="font-size: 22px; margin-bottom: 8px;">Device revoked</h1>
+        <p class="sub" style="margin-bottom: 20px;">
+          This device was removed from <strong>${escapeHTML(wsName)}</strong>.
+          Your keys have been cleared from this device.
+          To rejoin, ask a workspace admin for a new invite.
+        </p>
+        <button class="primary" id="btn-revoked-back">Back to home</button>
+      </div>
+    </div>
+  `;
+  document.getElementById("btn-revoked-back").onclick = async () => {
+    const workspaces = await idbGetAll(State.globalDB, "workspaces");
+    setState({ view: "landing", current: null, workspaces });
+  };
+}
+
 function renderLanding() {
   $app.innerHTML = `
     <div class="center">
@@ -2291,6 +2324,7 @@ function renderLanding() {
           <button class="primary" id="btn-start">Start a workspace</button>
           <button id="btn-join" disabled title="Open a join link instead">Join a workspace</button>
           <button id="btn-join-code">Join by code</button>
+          <button id="btn-add-device">Add this device to an existing identity</button>
           <button id="btn-restore">I have a backup file</button>
         </div>
         ${State.workspaces.length ? renderWorkspaceList() : ""}
@@ -2302,6 +2336,7 @@ function renderLanding() {
   `;
   document.getElementById("btn-start").onclick = () => setState({ view: "name-input" });
   document.getElementById("btn-join-code").onclick = openPairingCodeJoinModal;
+  document.getElementById("btn-add-device").onclick = openDevicePairJoinerModal;
   document.getElementById("btn-restore").onclick = openRestoreModal;
   document.getElementById("link-lost").onclick = () => alert(
     "Mehfil has no central recovery. If you lose all your devices and don't have " +
@@ -3708,6 +3743,7 @@ function renderSettingsModal() {
       </div>
       <div class="settings-tabs">
         <button class="settings-tab ${tab === "identity"  ? "active" : ""}" data-stab="identity">Identity</button>
+        <button class="settings-tab ${tab === "devices"   ? "active" : ""}" data-stab="devices">Devices</button>
         <button class="settings-tab ${tab === "workspace" ? "active" : ""}" data-stab="workspace">Workspace</button>
         ${isAdminUser ? `<button class="settings-tab ${tab === "admin" ? "active" : ""}" data-stab="admin">Admin</button>` : ""}
       </div>
@@ -3733,10 +3769,53 @@ function renderSettingsModal() {
 }
 
 function renderSettingsTabBody(tab, current, me, isAdminUser, wsName) {
-  if (tab === "identity") return renderSettingsIdentityTab(me);
+  if (tab === "identity")  return renderSettingsIdentityTab(me);
+  if (tab === "devices")   return renderSettingsDevicesTab(current, me);
   if (tab === "workspace") return renderSettingsWorkspaceTab(wsName, current);
   if (tab === "admin" && isAdminUser) return renderSettingsAdminTab(current, me);
   return "";
+}
+
+function renderSettingsDevicesTab(current, me) {
+  const myDeviceId = current.meta.device_id;
+  const lastSeen   = current.deviceLastSeen || {};
+  const fmtDevice  = id => `<code style="font-size:11px;">${escapeHTML(id.slice(0, 12))}…</code>`;
+  const fmtTime    = ts => ts ? `last seen ${formatDate(ts)}` : "last seen unknown";
+
+  const otherDevices = (me.devices || []).filter(d => d !== myDeviceId);
+  const othersHtml = otherDevices.length === 0
+    ? `<div style="color:var(--fg-dim);font-size:12px;padding:8px 0;">No other paired devices.</div>`
+    : otherDevices.map(d => `
+        <div class="relay-row" style="align-items:center;">
+          <div class="relay-row-info">
+            ${fmtDevice(d)}
+            <div style="font-size:11px;color:var(--fg-dim);">${fmtTime(lastSeen[me.id + ":" + d])}</div>
+          </div>
+          <button class="danger" data-revoke-device="${escapeHTML(d)}" style="font-size:12px;padding:4px 10px;">Revoke</button>
+        </div>`).join("");
+
+  const relay = (current.relays || [])[0];
+  const canPair = !!relay;
+
+  return `
+    <div class="field">
+      <label>This device</label>
+      <div style="background:var(--bg-sunken);border-radius:6px;padding:10px;font-size:12px;">
+        <code>${escapeHTML(myDeviceId)}</code>
+        <span style="color:var(--fg-dim);margin-left:8px;">(current)</span>
+      </div>
+    </div>
+    <div class="field">
+      <label>Paired devices</label>
+      ${othersHtml}
+    </div>
+    <div style="margin-top:8px;">
+      ${canPair
+        ? `<button class="primary" id="btn-add-device-pair">+ Pair a new device</button>`
+        : `<button class="primary" disabled title="Add a relay first (Settings → Workspace → Relays)">+ Pair a new device</button>
+           <div style="font-size:11px;color:var(--fg-dim);margin-top:6px;">Requires a relay — add one in the Workspace tab first.</div>`}
+    </div>
+  `;
 }
 
 function renderSettingsIdentityTab(me) {
@@ -3942,6 +4021,27 @@ function wireSettingsTab(tab, wrap, current, me, wsName) {
   if (tab === "identity") {
     const btn = wrap.querySelector("#s-backup-btn");
     if (btn) btn.onclick = () => { wrap.remove(); openBackupModal(); };
+
+  } else if (tab === "devices") {
+    const $addBtn = wrap.querySelector("#btn-add-device-pair");
+    if ($addBtn) {
+      $addBtn.onclick = () => { wrap.remove(); openDevicePairInitiatorModal(current); };
+    }
+    wrap.querySelectorAll("[data-revoke-device]").forEach(btn => {
+      const deviceId = btn.dataset.revokeDevice;
+      btn.onclick = async () => {
+        if (!confirm(`Revoke device ${deviceId.slice(0, 12)}…?\n\nIt will no longer be able to send messages as you. Old messages it sent remain valid.`)) return;
+        btn.disabled = true;
+        try {
+          await sendDeviceRevoke(current, deviceId);
+          wrap.remove();
+          renderSettingsModal();
+        } catch (e) {
+          alert("Revoke failed: " + e.message);
+          btn.disabled = false;
+        }
+      };
+    });
 
   } else if (tab === "workspace") {
     const $err = wrap.querySelector("#rename-err");
@@ -7001,6 +7101,48 @@ const EnvelopeDispatch = {
         break;
       }
 
+      case "device.add": {
+        // A device belonging to an existing member has been added.
+        // inner: { device_id: string, ts: number }
+        // Sender (env.from) must already be a workspace member.
+        const daMember = current.members.find(m => m.id === env.from);
+        if (!daMember) { console.warn("device.add from unknown member, ignoring", env.from); break; }
+        if (!Array.isArray(daMember.devices)) daMember.devices = [];
+        if (!daMember.devices.includes(inner.device_id)) {
+          daMember.devices.push(inner.device_id);
+          await idbPut(current.wsDB, "members", daMember);
+        }
+        if (!current.deviceLastSeen) current.deviceLastSeen = {};
+        current.deviceLastSeen[env.from + ":" + inner.device_id] = inner.ts || env.ts;
+        break;
+      }
+
+      case "device.revoke": {
+        // A device has been revoked by its owner or an admin.
+        // inner: { device_id: string, ts: number }
+        const myUserId  = bytesToB64Url(State.identity.pubkey);
+        const drSender  = current.members.find(m => m.id === env.from);
+        const isAdminDr = drSender && (drSender.role === "owner" || drSender.role === "admin");
+        // Find which member owns this device.
+        const drOwner = current.members.find(m =>
+          Array.isArray(m.devices) && m.devices.includes(inner.device_id)
+        );
+        if (!drOwner) { console.warn("device.revoke: device not found in any member", inner.device_id); break; }
+        const isSelfRevoke = (drOwner.id === env.from);
+        if (!isSelfRevoke && !isAdminDr) {
+          console.warn("device.revoke from non-admin non-owner, ignoring"); break;
+        }
+        drOwner.devices = drOwner.devices.filter(d => d !== inner.device_id);
+        await idbPut(current.wsDB, "members", drOwner);
+        if (current.deviceLastSeen) delete current.deviceLastSeen[drOwner.id + ":" + inner.device_id];
+        // Self-detection: if OUR current device was just revoked, wipe keys + show revoked screen.
+        if (drOwner.id === myUserId && inner.device_id === current.meta.device_id) {
+          await handleSelfRevocation(current.meta.id);
+          return;
+        }
+        break;
+      }
+
       default:
         console.warn("Unhandled envelope type:", env.type);
     }
@@ -8207,6 +8349,99 @@ async function sendMemberRemove(current, removedUserId) {
   current.meta.member_count = current.members.length;
 }
 
+/**
+ * Called when we receive a device.revoke envelope that revokes our own current
+ * device. Clears workspace keys from IDB so messages can't be decrypted, then
+ * navigates to the revoked screen.
+ */
+async function handleSelfRevocation(wsId) {
+  try {
+    const wsDB = await openWorkspaceDB(wsId);
+    const tx = wsDB.transaction("keys", "readwrite");
+    const store = tx.objectStore("keys");
+    const keysReq = store.getAllKeys();
+    await new Promise(res => { keysReq.onsuccess = res; keysReq.onerror = res; });
+    for (const k of (keysReq.result || [])) {
+      if (k === "root" || String(k).startsWith("ch:")) store.delete(k);
+    }
+    await new Promise((res, rej) => { tx.oncomplete = res; tx.onerror = rej; });
+    wsDB.close();
+  } catch (e) {
+    console.warn("handleSelfRevocation: key wipe failed", e);
+  }
+  RelayMgr.stop(wsId);
+  BridgeMgr.stop(wsId);
+  PeerMgr.detach(wsId);
+  setState({ view: "revoked" });
+}
+
+/**
+ * Broadcast a device.add envelope so other workspace members learn about
+ * a newly paired device. Called by Device A after confirming the pairing
+ * and by Device B after importing the identity and seeding the workspace.
+ */
+async function sendDeviceAdd(current, newDeviceId) {
+  const myUserId = bytesToB64Url(State.identity.pubkey);
+  const signKey  = await Crypto.importSignKey(State.identity.privkey_pkcs8);
+  const meta     = current.meta;
+  meta.lc_counter = (meta.lc_counter || 0) + 1;
+  const env = await Envelope.build({
+    workspaceId:  meta.id,
+    channelId:    null,
+    channelKey:   current.rootKey,
+    signKey,
+    signerPubkey: State.identity.pubkey,
+    deviceId:     meta.device_id,
+    type:         "device.add",
+    inner:        { device_id: newDeviceId, ts: Date.now() },
+    vectorClock:  [[myUserId, meta.lc_counter]]
+  });
+  await idbPut(current.wsDB, "envelopes", env);
+  PeerMgr.sendEnvelope(meta.id, env).catch(e => console.warn("device.add peer:", e));
+  RelayMgr.send(meta.id, MP.encode(env)).catch(e => console.warn("device.add relay:", e));
+  await idbPut(current.wsDB, "keys", meta, "workspace_meta");
+  // Apply locally so the Devices tab reflects the change immediately.
+  const me = current.members.find(m => m.id === myUserId);
+  if (me && !me.devices.includes(newDeviceId)) {
+    me.devices.push(newDeviceId);
+    await idbPut(current.wsDB, "members", me);
+  }
+}
+
+/**
+ * Revoke a specific device from this identity. Broadcasts device.revoke to all
+ * workspace peers. Called from Settings → Devices.
+ */
+async function sendDeviceRevoke(current, targetDeviceId) {
+  const myUserId = bytesToB64Url(State.identity.pubkey);
+  const me = current.members.find(m => m.id === myUserId);
+  if (!me) throw new Error("Not a member of this workspace.");
+  if (me.devices.length <= 1 && me.devices.includes(targetDeviceId)) {
+    throw new Error("Cannot revoke your only device — you would lose access.");
+  }
+  const signKey = await Crypto.importSignKey(State.identity.privkey_pkcs8);
+  const meta    = current.meta;
+  meta.lc_counter = (meta.lc_counter || 0) + 1;
+  const env = await Envelope.build({
+    workspaceId:  meta.id,
+    channelId:    null,
+    channelKey:   current.rootKey,
+    signKey,
+    signerPubkey: State.identity.pubkey,
+    deviceId:     meta.device_id,
+    type:         "device.revoke",
+    inner:        { device_id: targetDeviceId, ts: Date.now() },
+    vectorClock:  [[myUserId, meta.lc_counter]]
+  });
+  await idbPut(current.wsDB, "envelopes", env);
+  PeerMgr.sendEnvelope(meta.id, env).catch(e => console.warn("device.revoke peer:", e));
+  RelayMgr.send(meta.id, MP.encode(env)).catch(e => console.warn("device.revoke relay:", e));
+  await idbPut(current.wsDB, "keys", meta, "workspace_meta");
+  // Apply locally.
+  me.devices = me.devices.filter(d => d !== targetDeviceId);
+  await idbPut(current.wsDB, "members", me);
+}
+
 /* ============================================================
  *  §33  Promote-by-consensus (Slice 5 / WT-23)
  *
@@ -9185,6 +9420,424 @@ async function joinWorkspaceFromBundle(bundle, relayUrl, relayToken) {
 }
 
 /* ------------------------------------------------------------
+ *  §36b  Device pairing (v1.1 — WT-26, 27, 28)
+ *
+ *  Three-message handshake over the relay's /pairing endpoint:
+ *    codeHash            → challenge  (Device A posts, Device B fetches)
+ *    SHA-256("resp:"+c)  → response   (Device B posts, Device A fetches)
+ *    SHA-256("keys:"+c)  → key bundle (Device A posts, Device B fetches)
+ *
+ *  Key transport: ephemeral X25519 ECDH → AES-256-GCM over a msgpack bundle
+ *  carrying the Ed25519+X25519 identity keys + workspace root/channel keys.
+ *  The outer layer is additionally PairingCode.encrypt'd so the relay sees
+ *  only opaque ciphertext.
+ *
+ *  Device B gets the relay bearer token from the challenge payload so it can
+ *  post back without having an existing workspace configuration.
+ * ------------------------------------------------------------ */
+
+/**
+ * Initiator side (Device A — has the identity).
+ * Called from Settings → Devices → + Pair a new device.
+ */
+async function openDevicePairInitiatorModal(current) {
+  const relay = (current.relays || [])[0];
+  if (!relay) { alert("Add a relay first (Settings → Workspace → Relays)."); return; }
+
+  const wrap = document.createElement("div");
+  wrap.className = "modal-bg";
+  wrap.innerHTML = `
+    <div class="card" style="max-width:420px;text-align:center;">
+      <h1 style="font-size:18px;margin-bottom:8px;">Pair a new device</h1>
+      <p class="sub">Generating secure pairing code…</p>
+    </div>
+  `;
+  document.body.appendChild(wrap);
+
+  let pairingAesKey, codeHash, respHash, keysHash, words, ephemXPrivA, ephemXPubA;
+
+  try {
+    const generated = await PairingCode.generate();
+    pairingAesKey = generated.key;
+    codeHash      = generated.codeHash;
+    words         = generated.words;
+    const codeStr = generated.codeStr;
+
+    // Derive additional relay slot hashes — still valid 64-char hex SHA-256.
+    respHash = await Crypto.sha256Hex("resp:" + codeStr);
+    keysHash = await Crypto.sha256Hex("keys:" + codeStr);
+
+    const ephem = await Crypto.genX25519();
+    ephemXPrivA = ephem.x25519_priv_pkcs8;
+    ephemXPubA  = ephem.x25519_pub;
+
+    const fpHash    = await Crypto.sha256(State.identity.pubkey);
+    const challenge = {
+      type:          "device.pair.challenge",
+      ws:            current.meta.id,
+      ws_name:       current.meta.name,
+      initiator_fp:  bytesToHex(fpHash.slice(0, 16)),
+      ephem_x_pub_A: bytesToB64(ephemXPubA),
+      relay_url:     relay.url,
+      relay_token:   relay.token || "",
+      expires:       Date.now() + 5 * 60 * 1000
+    };
+    const encChallenge = await PairingCode.encrypt(pairingAesKey, challenge);
+    const r = await fetch(`${relay.url.replace(/\/$/, "")}/pairing`, {
+      method:  "POST",
+      headers: { "Content-Type": "application/json",
+                 ...(relay.token ? { "Authorization": "Bearer " + relay.token } : {}) },
+      body:    JSON.stringify({ code_hash: codeHash, payload: encChallenge, ttl_ms: 300_000 })
+    });
+    if (!r.ok) throw new Error(`Relay returned ${r.status}`);
+  } catch (e) {
+    wrap.remove();
+    alert("Failed to start device pairing: " + e.message);
+    return;
+  }
+
+  const relayBase = relay.url.replace(/\/$/, "");
+  const authHdr   = relay.token ? { "Authorization": "Bearer " + relay.token } : {};
+
+  wrap.querySelector(".card").innerHTML = `
+    <h1 style="font-size:18px;margin-bottom:4px;">Pair a new device</h1>
+    <p class="sub" style="margin-bottom:16px;">On the new device, open Mehfil → <strong>Add this device to an existing identity</strong>, then enter these 6 words:</p>
+    <div style="display:flex;gap:8px;flex-wrap:wrap;justify-content:center;margin-bottom:20px;">
+      ${words.map((w, i) => `
+        <div style="background:var(--bg-sunken);border-radius:6px;padding:8px 12px;min-width:72px;text-align:center;">
+          <div style="font-size:10px;color:var(--fg-dim);margin-bottom:2px;">${i + 1}</div>
+          <div style="font-size:15px;font-weight:600;">${escapeHTML(w)}</div>
+        </div>`).join("")}
+    </div>
+    <p class="sub" style="font-size:12px;" id="pair-status">Waiting for the new device to enter the code…</p>
+    <button id="pair-cancel" style="margin-top:12px;">Cancel</button>
+  `;
+  const cancelFn = () => {
+    clearInterval(State.pairingSession?.pollTimer);
+    State.pairingSession = null;
+    wrap.remove();
+  };
+  wrap.querySelector("#pair-cancel").onclick = cancelFn;
+  wrap.addEventListener("click", e => { if (e.target === wrap) cancelFn(); });
+
+  State.pairingSession = { pollTimer: null, pairingAesKey, ephemXPrivA, ephemXPubA, keysHash, current };
+
+  // Poll for Device B's response.
+  State.pairingSession.pollTimer = setInterval(async () => {
+    try {
+      const r = await fetch(`${relayBase}/pairing/${respHash}`, { headers: authHdr });
+      if (r.status === 404) return;
+      if (!r.ok) throw new Error(`Relay error ${r.status}`);
+      const { payload } = await r.json();
+      clearInterval(State.pairingSession.pollTimer);
+
+      const response = await PairingCode.decrypt(pairingAesKey, payload);
+      if (response.type !== "device.pair.response") throw new Error("Unexpected response type");
+
+      const ephem_ed_pub_B = b64ToBytes(response.ephem_ed_pub_B);
+      const fpB     = await Crypto.sha256(ephem_ed_pub_B);
+      const fpHex   = bytesToHex(fpB.slice(0, 16));
+      const fpFmt   = fpHex.match(/.{4}/g).join(" ");
+      const trustSvg = await TrustCard.renderFromPubkey(ephem_ed_pub_B, 80);
+
+      const $card = wrap.querySelector(".card");
+      $card.innerHTML = `
+        <h1 style="font-size:18px;margin-bottom:8px;">Confirm new device</h1>
+        <p class="sub" style="margin-bottom:4px;">Device: <strong>${escapeHTML((response.device_label || "").slice(0, 60))}</strong></p>
+        <p class="sub" style="margin-bottom:12px;">Confirm this fingerprint matches what the new device shows:</p>
+        <div style="display:flex;flex-direction:column;align-items:center;gap:10px;margin-bottom:16px;">
+          ${trustSvg}
+          <code style="font-size:13px;letter-spacing:0.08em;">${escapeHTML(fpFmt)}</code>
+        </div>
+        <div class="err" id="pair-confirm-err"></div>
+        <div class="row" style="gap:8px;justify-content:flex-end;margin-top:8px;">
+          <button id="pair-decline">Decline</button>
+          <button class="primary" id="pair-confirm">Fingerprint matches — confirm</button>
+        </div>
+      `;
+      $card.querySelector("#pair-decline").onclick = () => { State.pairingSession = null; wrap.remove(); };
+      $card.querySelector("#pair-confirm").onclick = async () => {
+        const $err = $card.querySelector("#pair-confirm-err");
+        $card.querySelector("#pair-confirm").disabled = true;
+        try {
+          const privKey = await Crypto.importX25519Priv(State.pairingSession.ephemXPrivA);
+          const pubKey  = await Crypto.importX25519Pub(b64ToBytes(response.ephem_x_pub_B));
+          const kek     = await Crypto.deriveX25519AesKey(privKey, pubKey);
+
+          const rootRaw = await idbGet(current.wsDB, "keys", "root");
+          const gchRaw  = await idbGet(current.wsDB, "keys", "ch:" + current.meta.general_channel_id);
+          const me      = current.members.find(m => m.id === bytesToB64Url(State.identity.pubkey));
+
+          const keyBundle = MP.encode({
+            ed_pkcs8:      State.identity.privkey_pkcs8,
+            x_pkcs8:       State.identity.x25519_priv_pkcs8,
+            ed_pub:        State.identity.pubkey,
+            x_pub:         State.identity.x25519_pub,
+            identity_name: me?.name || "",
+            workspaces:    [{
+              id:                  current.meta.id,
+              name:                current.meta.name,
+              root_key:            rootRaw,
+              general_channel_id:  current.meta.general_channel_id,
+              general_channel_key: gchRaw,
+              relays:              current.relays || [],
+              new_device_id:       response.new_device_id
+            }]
+          });
+
+          const { iv, ct } = await Crypto.aesEncrypt(kek, keyBundle);
+          const encKeys = await PairingCode.encrypt(pairingAesKey, {
+            type:   "device.pair.keys",
+            iv_b64: bytesToB64(iv),
+            ct_b64: bytesToB64(ct)
+          });
+          const kr = await fetch(`${relayBase}/pairing`, {
+            method:  "POST",
+            headers: { "Content-Type": "application/json", ...authHdr },
+            body:    JSON.stringify({ code_hash: State.pairingSession.keysHash,
+                                      payload: encKeys, ttl_ms: 300_000 })
+          });
+          if (!kr.ok) throw new Error(`Relay returned ${kr.status}`);
+
+          await sendDeviceAdd(current, response.new_device_id);
+          State.pairingSession = null;
+
+          $card.innerHTML = `
+            <h1 style="font-size:18px;margin-bottom:8px;">Device paired ✓</h1>
+            <p class="sub" style="margin-bottom:16px;">The new device has been added to your identity. It will sync workspace history via the relay.</p>
+            <button class="primary" id="pair-done">Done</button>
+          `;
+          $card.querySelector("#pair-done").onclick = () => wrap.remove();
+        } catch (e) {
+          $err.textContent = e.message;
+          $card.querySelector("#pair-confirm").disabled = false;
+        }
+      };
+    } catch (e) {
+      const $s = wrap.querySelector("#pair-status");
+      if ($s) $s.textContent = "Polling error: " + e.message;
+    }
+  }, 3000);
+}
+
+/**
+ * Joiner side (Device B — no identity yet).
+ * Called from the landing page "Add this device to an existing identity" button.
+ */
+function openDevicePairJoinerModal() {
+  const wrap = document.createElement("div");
+  wrap.className = "modal-bg";
+  wrap.innerHTML = `
+    <div class="card" style="max-width:420px;">
+      <h1 style="font-size:18px;margin-bottom:8px;">Add this device to an existing identity</h1>
+      <p class="sub" style="margin-bottom:12px;">On your other device, go to Settings → Devices → Pair a new device. Enter the 6 words shown here.</p>
+      <div class="field">
+        <label>Pairing code (6 words)</label>
+        <input id="dpair-code" type="text" placeholder="word1 word2 word3 word4 word5 word6"
+               autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false"
+               style="font-size:14px;letter-spacing:0.03em;">
+      </div>
+      <div class="err" id="dpair-err"></div>
+      <div class="row" style="margin-top:16px;gap:8px;justify-content:flex-end;">
+        <button id="dpair-cancel">Cancel</button>
+        <button class="primary" id="dpair-join">Continue</button>
+      </div>
+    </div>
+  `;
+  document.body.appendChild(wrap);
+
+  const $input = wrap.querySelector("#dpair-code");
+  const $err   = wrap.querySelector("#dpair-err");
+  const $btn   = wrap.querySelector("#dpair-join");
+  $input.focus();
+
+  const cancelFn = () => {
+    clearInterval(State.pairingSession?.pollTimer);
+    State.pairingSession = null;
+    wrap.remove();
+  };
+  wrap.querySelector("#dpair-cancel").onclick = cancelFn;
+  wrap.addEventListener("click", e => { if (e.target === wrap) cancelFn(); });
+
+  const join = async () => {
+    const raw   = $input.value.trim();
+    const words = raw.toLowerCase().split(/\s+/).filter(Boolean);
+    if (words.length !== 6) { $err.textContent = "Enter exactly 6 words."; return; }
+
+    $btn.disabled = true;
+    $btn.textContent = "Looking up…";
+    $err.textContent = "";
+
+    try {
+      const codeStr = words.join(" ");
+      const { key: pairingAesKey, codeHash } = await PairingCode.fromString(codeStr);
+      const respHash = await Crypto.sha256Hex("resp:" + codeStr);
+      const keysHash = await Crypto.sha256Hex("keys:" + codeStr);
+
+      // Discover relay URL from existing workspaces or prompt.
+      let relayUrl = "", relayToken = "";
+      for (const ws of (State.workspaces || [])) {
+        try {
+          const wsDB = await openWorkspaceDB(ws.id);
+          const meta = await idbGet(wsDB, "keys", "workspace_meta");
+          wsDB.close();
+          if (meta?.relays?.length) { relayUrl = meta.relays[0].url; relayToken = meta.relays[0].token || ""; break; }
+        } catch {}
+      }
+      if (!relayUrl) {
+        relayUrl = prompt("Enter the relay URL:");
+        if (!relayUrl) { $btn.disabled = false; $btn.textContent = "Continue"; return; }
+        relayToken = prompt("Bearer token (leave blank if none):") || "";
+      }
+
+      const relayBase = relayUrl.replace(/\/$/, "");
+      const authHdr   = relayToken ? { "Authorization": "Bearer " + relayToken } : {};
+
+      // Fetch challenge from relay.
+      const cr = await fetch(`${relayBase}/pairing/${codeHash}`, { headers: authHdr });
+      if (cr.status === 404) throw new Error("Code not found or expired. Ask for a fresh code.");
+      if (!cr.ok) throw new Error(`Relay error ${cr.status}`);
+      const { payload: chalPayload } = await cr.json();
+      const challenge = await PairingCode.decrypt(pairingAesKey, chalPayload);
+      if (challenge.type !== "device.pair.challenge") throw new Error("Unexpected challenge type");
+      if (Date.now() > challenge.expires) throw new Error("This code has expired. Ask for a fresh one.");
+
+      // Generate ephemeral keys for this device.
+      const ephem_ed_B    = await Crypto.genIdentity();
+      const ephem_x_B     = await Crypto.genX25519();
+      const new_device_id = bytesToB64Url(Crypto.rand(8));
+
+      const fpB    = await Crypto.sha256(ephem_ed_B.pubkey);
+      const fpHex  = bytesToHex(fpB.slice(0, 16));
+      const fpFmt  = fpHex.match(/.{4}/g).join(" ");
+      const trustSvg = await TrustCard.renderFromPubkey(ephem_ed_B.pubkey, 72);
+
+      // Use relay token from challenge (Device A included it so Device B can post back).
+      const actualBase  = (challenge.relay_url || relayBase).replace(/\/$/, "");
+      const actualToken = challenge.relay_token || relayToken;
+      const postHdr     = { "Content-Type": "application/json",
+                            ...(actualToken ? { "Authorization": "Bearer " + actualToken } : {}) };
+
+      const encResp = await PairingCode.encrypt(pairingAesKey, {
+        type:           "device.pair.response",
+        ephem_ed_pub_B: bytesToB64(ephem_ed_B.pubkey),
+        ephem_x_pub_B:  bytesToB64(ephem_x_B.x25519_pub),
+        device_label:   navigator.userAgent.slice(0, 80),
+        new_device_id
+      });
+      const rr = await fetch(`${actualBase}/pairing`, {
+        method:  "POST",
+        headers: postHdr,
+        body:    JSON.stringify({ code_hash: respHash, payload: encResp, ttl_ms: 300_000 })
+      });
+      if (!rr.ok) throw new Error(`Relay returned ${rr.status} when posting response`);
+
+      // Show fingerprint for user to verify against Device A's display.
+      wrap.querySelector(".card").innerHTML = `
+        <h1 style="font-size:18px;margin-bottom:8px;">Show this fingerprint to Device A</h1>
+        <p class="sub" style="margin-bottom:12px;">Device A will show you a fingerprint — confirm it matches before approving.</p>
+        <div style="display:flex;flex-direction:column;align-items:center;gap:10px;margin-bottom:16px;">
+          ${trustSvg}
+          <code style="font-size:13px;letter-spacing:0.08em;">${escapeHTML(fpFmt)}</code>
+        </div>
+        <p class="sub" style="font-size:12px;" id="dpair-wait">Waiting for Device A to confirm…</p>
+        <button id="dpair-cancel2" style="margin-top:12px;">Cancel</button>
+      `;
+      wrap.querySelector("#dpair-cancel2").onclick = cancelFn;
+
+      // Store session state and poll for key bundle.
+      State.pairingSession = {
+        pollTimer:      null,
+        pairingAesKey,
+        ephem_x_priv_B: ephem_x_B.x25519_priv_pkcs8,
+        ephem_x_pub_A:  challenge.ephem_x_pub_A,
+        new_device_id,
+        actualBase,
+        keysHash
+      };
+
+      State.pairingSession.pollTimer = setInterval(async () => {
+        try {
+          const kr = await fetch(`${actualBase}/pairing/${keysHash}`,
+            { headers: actualToken ? { "Authorization": "Bearer " + actualToken } : {} });
+          if (kr.status === 404) return;
+          if (!kr.ok) throw new Error(`Relay error ${kr.status}`);
+          const { payload: keyPayload } = await kr.json();
+          clearInterval(State.pairingSession.pollTimer);
+
+          const outer  = await PairingCode.decrypt(pairingAesKey, keyPayload);
+          if (outer.type !== "device.pair.keys") throw new Error("Unexpected payload type");
+
+          const privKey = await Crypto.importX25519Priv(State.pairingSession.ephem_x_priv_B);
+          const pubKey  = await Crypto.importX25519Pub(b64ToBytes(State.pairingSession.ephem_x_pub_A));
+          const kek     = await Crypto.deriveX25519AesKey(privKey, pubKey);
+          const pt      = await Crypto.aesDecrypt(kek, b64ToBytes(outer.iv_b64), b64ToBytes(outer.ct_b64));
+          const bundle  = MP.decode(pt);
+
+          // Import identity.
+          const importedIdentity = {
+            pubkey:            bundle.ed_pub,
+            privkey_pkcs8:     bundle.ed_pkcs8,
+            x25519_pub:        bundle.x_pub,
+            x25519_priv_pkcs8: bundle.x_pkcs8,
+            created_at:        Date.now(),
+            backed_up:         true
+          };
+          await Identity.save(State.globalDB, importedIdentity);
+          State.identity = importedIdentity;
+
+          // Seed workspace(s).
+          for (const ws of (bundle.workspaces || [])) {
+            if (await idbGet(State.globalDB, "workspaces", ws.id)) continue;
+            const wsDB = await openWorkspaceDB(ws.id);
+            await idbPut(wsDB, "keys", {
+              id:                 ws.id,
+              name:               ws.name,
+              general_channel_id: ws.general_channel_id,
+              device_id:          ws.new_device_id,
+              relays:             ws.relays || [],
+              created_at:         Date.now()
+            }, "workspace_meta");
+            await idbPut(wsDB, "keys", ws.root_key,            "root");
+            await idbPut(wsDB, "keys", ws.general_channel_key, "ch:" + ws.general_channel_id);
+            await idbPut(State.globalDB, "workspaces", {
+              id: ws.id, name: ws.name, created_at: Date.now(), last_opened_at: Date.now()
+            });
+            wsDB.close();
+          }
+
+          State.pairingSession = null;
+          wrap.remove();
+
+          // Open workspace; announce new device after it loads.
+          if (bundle.workspaces?.length) {
+            const ws0 = bundle.workspaces[0];
+            await openWorkspaceById(ws0.id);
+            if (State.current) {
+              sendDeviceAdd(State.current, ws0.new_device_id)
+                .catch(e => console.warn("device.add after pair:", e));
+            }
+          } else {
+            setState({ view: "landing", workspaces: await idbGetAll(State.globalDB, "workspaces") });
+          }
+        } catch (e) {
+          const $w = wrap.querySelector("#dpair-wait");
+          if ($w) $w.textContent = "Error: " + e.message;
+        }
+      }, 3000);
+
+    } catch (e) {
+      $err.textContent = e.message;
+      $btn.disabled = false;
+      $btn.textContent = "Continue";
+    }
+  };
+
+  $btn.onclick = join;
+  $input.onkeydown = e => { if (e.key === "Enter") join(); };
+}
+
+/* ------------------------------------------------------------
  *  §37  Bridge transport — LAN bridge adapter (Slice 8)
  *
  *  BridgeTransport polls GET /ws/:id/envelopes and pushes via PUT,
@@ -9510,6 +10163,9 @@ if (/[?&]debug=1/.test(location.search)) {
     // Slice 8
     BridgeTransport, BridgeMgr,
     detectBridge, openBridgeFpConfirmModal, showBridgeFpMismatchModal,
+    // v1.1
+    sendDeviceAdd, sendDeviceRevoke, handleSelfRevocation,
+    openDevicePairInitiatorModal, openDevicePairJoinerModal,
     get Y() { return Y; },
     get MiniSearch() { return MiniSearch; },
     bytesToB64Url, b64UrlToBytes, bytesToHex, bytesToB64,
