@@ -1,8 +1,8 @@
 # Mehfil
 
-Browser-native, local-first team chat. Single HTML file. No accounts. No central server. Messages are end-to-end encrypted, signed by the sender, and stored on the devices of workspace members — never on a central server.
+Browser-native, local-first team chat. Single HTML file. No accounts. No central server. Messages are end-to-end encrypted, signed by the sender, and stored on the devices of workspace members — never in the cloud.
 
-> **Status: v1 feature-complete.** All 8 slices shipped: protocol skeleton, solo + two-person workspaces, channels/DMs/attachments/reactions/threads/presence, multi-peer gossip mesh, causal delivery, Yjs workspace doc, search + admin, tier-aware UX, Cloudflare relay, and LAN bridge. See [PENDING.md](PENDING.md) for what's deferred to v1.1.
+> **Status: v1.1 shipped.** All 8 slices plus multi-device identity are complete. See [PENDING.md](PENDING.md) for what's deferred to v2.
 
 ## What works
 
@@ -15,20 +15,26 @@ Browser-native, local-first team chat. Single HTML file. No accounts. No central
 - Edit + delete your own messages (hover to reveal ✎ / 🗑)
 - Per-channel drafts persist across page reloads
 - Emoji reactions (`👍 ❤️ 😂 😮 😢 🙏 👀 ✅`), @mentions with autocomplete, threaded replies
-- File attachments up to 25 MB (encrypted in OPFS, chunked over WebRTC, 500 MB per-workspace quota with LRU eviction)
+- File attachments up to 25 MB (encrypted in OPFS, chunked over WebRTC, 500 MB per-workspace quota)
 
 **Security**
 - Ed25519 signing + X25519 ECDH + AES-256-GCM, all via native Web Crypto
 - Every envelope is signed and padded to an exact 1 KB boundary
 - Unskippable fingerprint + trust-card verification on every invite
 
+**Multi-device identity**
+- One Ed25519 identity, any number of devices
+- Pair a new device with a 6-word code — works in-room or remotely over the relay
+- Device list in Settings → Devices with last-seen timestamps
+- Any device (or any admin) can revoke a device; revoked device is shown a clear notice and its keys are wiped
+
 **Networking**
 - WebRTC peer-to-peer via Cloudflare STUN (no signaling server for 1:1)
-- Multi-peer gossip mesh with seen-set dedupe and rebroadcast (Mode B)
+- Multi-peer gossip mesh with seen-set dedupe and rebroadcast
 - Vector clock causal delivery buffer; gap detection + resync
-- **Cloudflare Workers relay** — store-and-forward for async / cross-internet delivery (see [docs/relay-setup.md](docs/relay-setup.md))
-- **LAN bridge** (`mehfil-bridge` Go binary) — 24h buffer on your local network, mDNS auto-discovery, fingerprint pinning (see [docs/bridge-setup.md](docs/bridge-setup.md))
-- "Join by code" invite — 6-word pairing code, no URL needed, valid 5 minutes
+- **Cloudflare Workers relay** — store-and-forward over the internet; async delivery; hosts pairing codes
+- **LAN bridge** (`mehfil-bridge` Go binary) — 24h buffer on your local network, mDNS auto-discovery, fingerprint pinning
+- "Join by code" — 6-word pairing code, no URL needed, valid 5 minutes
 
 **Admin**
 - Member removal with full workspace + channel rekey
@@ -63,6 +69,51 @@ Or open `index.html` directly. Requires Web Crypto Ed25519: Chrome 113+, Firefox
 
 > Both URLs must be exchanged. The handshake is two-way.
 
+## Relay — store-and-forward over the internet
+
+The **Mehfil Relay** is an optional Cloudflare Workers service. Deploy your own in five minutes:
+
+```bash
+git clone https://github.com/NakliTechie/relay-cloudflare
+cd relay-cloudflare
+wrangler kv namespace create MEHFIL_KV   # paste the id into wrangler.toml
+wrangler secret put MEHFIL_TOKEN         # choose a long random bearer token
+wrangler deploy
+```
+
+Once deployed, add the relay URL + token in **Settings → Workspace → Relays → + Add relay**. Mehfil immediately starts pushing outgoing envelopes to the relay and polling for missed ones. Other workspace members who have the same relay configured will receive messages even when you're not simultaneously online.
+
+What the relay does:
+- Stores encrypted envelopes for **90 days** (1 KB each, padded)
+- Lets devices poll for missed messages on reconnect
+- Hosts **pairing codes** — the "Join by code" and "Add this device" flows both use relay slots
+
+What the relay never does: hold keys, decrypt messages, or identify users. It sees only padded ciphertext addressed to a workspace id.
+
+Full setup guide including cost estimate and self-hosted alternative: [docs/relay-setup.md](docs/relay-setup.md).
+
+## Bridge — 24-hour buffer on your LAN
+
+The **Mehfil Bridge** (`mehfil-bridge`) is a small Go binary you run on any always-on machine — a desktop, home server, or Raspberry Pi. It buffers messages for devices that aren't online at the same time, without involving any cloud service.
+
+```bash
+# macOS (Homebrew)
+brew install naklitechie/tap/mehfil-bridge
+mehfil-bridge
+# prints: Bridge fingerprint: a3f8 92c1 5b04 e7d2
+```
+
+On first connect Mehfil fetches the bridge's Ed25519 fingerprint and asks you to compare it to the one printed in your terminal. The fingerprint is then pinned — if it ever changes (e.g. a rogue device on your LAN), Mehfil refuses to connect.
+
+What the bridge does:
+- Announces itself via **mDNS** (`_mehfil._tcp.local`, port 8765) — Mehfil finds it automatically
+- Buffers the last **24 hours** of workspace envelopes in memory (nothing on disk)
+- Exposes the same `/ws/:id/envelopes` HTTP API as the relay, so the same client transport works for both
+
+Add it in **Settings → Workspace → LAN Bridge → + Add bridge**, then click **Auto-detect**. The tier escalation banner is suppressed once a bridge is configured.
+
+Full setup guide including background service configs (launchd / systemd): [docs/bridge-setup.md](docs/bridge-setup.md).
+
 ## Dev: `?as=` namespace isolation
 
 Append `?as=<label>` to prefix every IndexedDB and OPFS path with `as<label>_`, giving you multiple isolated identities in the same browser at the same origin:
@@ -73,30 +124,24 @@ http://localhost:8103/?as=bose#join=...
 
 Production paths (no `?as=`) are unaffected. Combine with `?debug=1` to expose every internal module on `window.__mehfil` for loopback tests — see `PROTOCOL.md §dev` for the convention.
 
-## Add a relay or bridge
+## Upcoming
 
-For workspaces that need to stay in sync across the internet or between devices that aren't simultaneously online:
-
-- **Relay** (cloud, cross-internet): [docs/relay-setup.md](docs/relay-setup.md)
-- **Bridge** (LAN, no cloud): [docs/bridge-setup.md](docs/bridge-setup.md)
-
-## Slice history
-
-| Slice | Walkthroughs | Status |
-|---|---|---|
-| 0 — Protocol skeleton | — | ✅ |
-| 1 — Solo workspace | WT-01, 02, 03 | ✅ |
-| 2 — Two-person Mode A | WT-04, 05, 07, 08 | ✅ |
-| 3 — Channels, DMs, attachments, reactions, threads, presence | WT-13–17, 20 | ✅ |
-| 4 — Gossip mesh, causal delivery, Yjs doc, gap detection | WT-09, 31 | ✅ |
-| 5 — Search + admin (member removal, rekey, promote, export) | WT-18, 19, 21–23, 33, 34 | ✅ |
-| 6 — Tier-aware UX, workspace launcher, search filters | WT-10, 29, 30, 35 | ✅ |
-| 7 — Cloudflare relay + pairing-by-code | WT-06, 21 | ✅ |
-| 8 — LAN bridge (Go binary + client integration) | WT-11, 32 | ✅ |
+- **Multi-admin UI** — Admins section in the member list, voluntary admin transfer (consensus mechanism already in place)
+- **Sender-keys for group DMs** — per-sender ratcheted keys so member removal only retires one key, not the whole group
+- **Multi-office bridge federation** — two bridges in two offices syncing through a shared relay; within-office traffic stays local
+- **Huddles** — audio via WebRTC mesh
+- **Canvas** — Yjs collaborative doc as a first-class channel type
 
 ## Architecture
 
-`index.html` is the entire app — markup, styles, and ~9,500 lines of vanilla JS, no framework, no build step. Web Crypto only. Custom canonical MessagePack codec (no external lib — the npm package doesn't guarantee canonical encoding). IndexedDB per spec §9.1: `envelopes` is the source of truth, everything else is a projection rebuilt on replay. State is a single object; render is a pure function of state. Yjs (lazy-loaded from esm.sh) handles workspace metadata CRDT.
+`index.html` is the entire app — markup, styles, and ~10,300 lines of vanilla JS, no framework, no build step. Web Crypto only. Custom canonical MessagePack codec (no external lib). IndexedDB per spec §9.1: `envelopes` is the source of truth, everything else is a projection rebuilt on replay. State is a single object; render is a pure function of state. Yjs (lazy-loaded from esm.sh) handles workspace metadata CRDT.
+
+Two companion services live in separate repos:
+
+| Repo | Language | Purpose |
+|---|---|---|
+| [`relay-cloudflare`](https://github.com/NakliTechie/relay-cloudflare) | JS / Cloudflare Workers | Store-and-forward relay + pairing endpoint |
+| [`mehfil-bridge`](https://github.com/NakliTechie/mehfil-bridge) | Go | LAN buffer + mDNS discovery + WebRTC signaling |
 
 ## Documents
 
@@ -105,7 +150,7 @@ For workspaces that need to stay in sync across the internet or between devices 
 | `MEHFIL-SPEC.md` | v1 specification — the authoritative protocol description |
 | `MEHFIL-WALKTHROUGHS.md` | 35 testable user-flow scenarios across 8 phases |
 | `PROTOCOL.md` | Pinned implementation choices (msgpack, envelope format, key hierarchy, etc.) |
-| `PENDING.md` | All deferred items, open bugs, v1.1 backlog |
+| `PENDING.md` | All deferred items, open bugs, v2 backlog |
 | `SECURITY.md` | Threat model, cryptographic primitives, vulnerability reporting |
 | `docs/relay-setup.md` | How to deploy the Cloudflare Workers relay |
 | `docs/bridge-setup.md` | How to install and run the LAN bridge |
