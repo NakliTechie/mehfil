@@ -2108,8 +2108,10 @@ const Workspace = {
 
     // Load relay configs stored in meta (Slice 5 / WT-21).
     const relays = meta.relays || [];
+    // §37: Load bridge configs (Slice 8).
+    const bridges = meta.bridges || [];
 
-    return { wsDB, meta, channels, members, channelKeys, rootKey, messages, presence, hwm, causalBuffer, doc, gaps, relays };
+    return { wsDB, meta, channels, members, channelKeys, rootKey, messages, presence, hwm, causalBuffer, doc, gaps, relays, bridges };
   },
 
   async sendMessage({ wsDB, meta, identity, channelId, channelKey, body, vectorClock, mentions, threadId }) {
@@ -2330,6 +2332,8 @@ async function openWorkspaceById(wsId) {
   PresenceDriver.start(bundle);
   // §35: start relay transport if the workspace has a relay configured.
   RelayMgr.startForWorkspace(bundle);
+  // §37: start bridge transport if one is configured.
+  BridgeMgr.startForWorkspace(bundle);
 }
 
 function renderWorkspace() {
@@ -2371,10 +2375,11 @@ function renderWorkspace() {
   const fp = me.fp;   // pre-computed during Workspace.open
   const isOnlyMember = current.members.length === 1;
 
-  // Corner badge state derives from PeerMgr.
-  const peerStatus  = PeerMgr.status(current.meta.id);
-  const relayStatus = RelayMgr.status(current.meta.id);
-  const badge = computeBadge(peerStatus, current.members.length, relayStatus);
+  // Corner badge state derives from PeerMgr / RelayMgr / BridgeMgr.
+  const peerStatus   = PeerMgr.status(current.meta.id);
+  const relayStatus  = RelayMgr.status(current.meta.id);
+  const bridgeStatus = BridgeMgr.status(current.meta.id);
+  const badge = computeBadge(peerStatus, current.members.length, relayStatus, bridgeStatus);
 
   $app.innerHTML = `
     <div id="banner-slot"></div>
@@ -2868,7 +2873,7 @@ function renderWorkspace() {
   if ($threadScroll) $threadScroll.scrollTop = $threadScroll.scrollHeight;
 }
 
-function computeBadge(peerStatus, memberCount, relayStatus) {
+function computeBadge(peerStatus, memberCount, relayStatus, bridgeStatus) {
   if (memberCount === 1) {
     return { cls: "local", label: "Local only", title: "You're the only member — invite someone to connect", dotStyle: "" };
   }
@@ -2884,6 +2889,13 @@ function computeBadge(peerStatus, memberCount, relayStatus) {
   }
   if (relayStatus === "connecting") {
     return { cls: "connecting", label: "Relay connecting…", title: "Connecting to relay server", dotStyle: "background: var(--warn)" };
+  }
+  // §37: bridge fallback — relay also down but LAN bridge reachable.
+  if (bridgeStatus === "connected") {
+    return { cls: "relay", label: "Via bridge", title: "Delivering via LAN bridge", dotStyle: "" };
+  }
+  if (bridgeStatus === "connecting") {
+    return { cls: "connecting", label: "Bridge connecting…", title: "Connecting to LAN bridge", dotStyle: "background: var(--warn)" };
   }
   return { cls: "offline", label: "Offline", title: "No peers reachable — messages will queue", dotStyle: "background: var(--danger)" };
 }
@@ -2919,7 +2931,7 @@ function composePlaceholder(channel, current) {
 function renderTierEscalationBanner(current) {
   const n = current.members.length;
   if (n < 6) return "";
-  if ((current.relays || []).length > 0) return "";
+  if ((current.relays || []).length > 0 || (current.bridges || []).length > 0) return "";
   const dismissed = current.meta.tier_banner_dismissed || 0;
   if (dismissed && (Date.now() - dismissed) < 7 * 24 * 3600 * 1000) return "";
   return `
@@ -3703,6 +3715,19 @@ function renderSettingsWorkspaceTab(wsName, current) {
           <button class="danger" data-remove-relay="${i}" style="font-size: 11px; padding: 4px 8px;">Remove</button>
         </div>`).join("");
 
+  const bridges = current.bridges || [];
+  const bridgeRows = bridges.length === 0
+    ? `<div style="color: var(--fg-dim); font-size: 12px; padding: 8px 0;">No bridge configured. Using relay or WebRTC only.</div>`
+    : bridges.map((b, i) => `
+        <div class="relay-row">
+          <div class="relay-row-info">
+            <div style="font-size: 12px; font-weight: 500;">LAN Bridge</div>
+            <div class="relay-row-url">${escapeHTML(b.url)}</div>
+            ${b.fp ? `<div class="mono" style="font-size: 10px; color: var(--fg-dim); margin-top: 2px;">fp: ${escapeHTML(b.fp)}</div>` : `<div style="font-size: 10px; color: var(--warn);">fingerprint not yet pinned</div>`}
+          </div>
+          <button class="danger" data-remove-bridge="${i}" style="font-size: 11px; padding: 4px 8px;">Remove</button>
+        </div>`).join("");
+
   return `
     <div class="field">
       <label>Workspace name</label>
@@ -3739,6 +3764,39 @@ function renderSettingsWorkspaceTab(wsName, current) {
           <button id="relay-test" style="font-size: 12px;">Test connection</button>
           <button class="primary" id="relay-save">Save relay</button>
         </div>
+      </div>
+    </div>
+    <div class="field">
+      <label>LAN Bridge</label>
+      <div style="font-size: 12px; color: var(--fg-mute); margin-bottom: 8px;">
+        Store-and-forward buffer on your LAN. Devices sync even when not simultaneously online — no cloud required.
+      </div>
+      <div id="bridge-list">${bridgeRows}</div>
+      <button id="btn-add-bridge" style="margin-top: 8px; font-size: 12px; padding: 6px 12px;">+ Add bridge</button>
+      <div id="bridge-form" style="display: none; margin-top: 10px; padding: 12px; background: var(--bg-sunken); border-radius: 8px;">
+        <div class="field" style="margin-bottom: 8px;">
+          <label>Bridge URL</label>
+          <input type="text" id="bridge-url" placeholder="http://mehfil.local:8765" style="font-size: 13px;">
+        </div>
+        <div class="err" id="bridge-err"></div>
+        <div class="row" style="gap: 8px; flex-wrap: wrap; margin-bottom: 10px;">
+          <button id="bridge-autodetect" style="font-size: 12px; padding: 6px 10px;">Auto-detect</button>
+          <button id="bridge-cancel" style="font-size: 12px; padding: 6px 10px;">Cancel</button>
+          <div class="grow"></div>
+          <button class="primary" id="bridge-save" style="font-size: 12px;">Add bridge</button>
+        </div>
+        <details style="font-size: 11px; color: var(--fg-dim);">
+          <summary style="cursor: pointer; padding: 2px 0; user-select: none;">What does this do? / Install</summary>
+          <div style="margin-top: 8px; line-height: 1.7;">
+            Run <code>mehfil-bridge</code> on any device that stays on (desktop, Raspberry Pi).
+            It buffers the last 24 hours of messages so you sync when you come back online.<br><br>
+            <strong>Install on macOS:</strong><br>
+            <code style="display:block; background: var(--bg); border-radius:4px; padding: 4px 8px; margin: 4px 0;">brew install naklitechie/tap/mehfil-bridge</code>
+            <strong>Install on Linux / macOS (manual):</strong><br>
+            Download from <a href="https://github.com/NakliTechie/mehfil-bridge/releases" target="_blank" rel="noopener" style="color: var(--accent);">github.com/NakliTechie/mehfil-bridge/releases</a><br><br>
+            After starting, the bridge prints a fingerprint in the terminal. Mehfil will ask you to confirm it on first connect.
+          </div>
+        </details>
       </div>
     </div>
     ${relays.length > 0 ? `
@@ -3908,6 +3966,59 @@ function wireSettingsTab(tab, wrap, current, me, wsName) {
           await idbPut(current.wsDB, "keys", current.meta, "workspace_meta");
           // §35: restart (or stop) relay transport after removal.
           RelayMgr.startForWorkspace(current);
+          wrap.remove();
+          setState({ modal: null });
+        }
+      };
+    });
+
+    // §37: Bridge wiring
+    const $addBridge   = wrap.querySelector("#btn-add-bridge");
+    const $bridgeForm  = wrap.querySelector("#bridge-form");
+    $addBridge.onclick = () => { $bridgeForm.style.display = "block"; $addBridge.style.display = "none"; };
+    wrap.querySelector("#bridge-cancel").onclick = () => {
+      $bridgeForm.style.display = "none"; $addBridge.style.display = "";
+    };
+    wrap.querySelector("#bridge-autodetect").onclick = async () => {
+      const $be = wrap.querySelector("#bridge-err");
+      $be.textContent = "Detecting bridge…";
+      try {
+        const found = await detectBridge();
+        if (found) {
+          wrap.querySelector("#bridge-url").value = found.url;
+          $be.textContent = `Found bridge at ${found.url} — fp: ${found.fp}`;
+        } else {
+          $be.textContent = "No bridge found. Is mehfil-bridge running on this machine or LAN?";
+        }
+      } catch (e) {
+        $be.textContent = "Detection failed: " + e.message;
+      }
+    };
+    wrap.querySelector("#bridge-save").onclick = async () => {
+      const $be = wrap.querySelector("#bridge-err");
+      $be.textContent = "";
+      const url = wrap.querySelector("#bridge-url").value.trim();
+      if (!url) { $be.textContent = "URL required."; return; }
+      try { new URL(url); } catch (_) { $be.textContent = "Invalid URL."; return; }
+      const bridge = { url, fp: null, added_at: Date.now() };
+      if (!current.bridges) current.bridges = [];
+      current.bridges.push(bridge);
+      current.meta.bridges = current.bridges;
+      await idbPut(current.wsDB, "keys", current.meta, "workspace_meta");
+      // §37: start bridge transport (will prompt for fp on first connect).
+      BridgeMgr.startForWorkspace(current);
+      wrap.remove();
+      setState({ modal: null });
+    };
+    wrap.querySelectorAll("[data-remove-bridge]").forEach(btn => {
+      btn.onclick = async () => {
+        const idx = parseInt(btn.dataset.removeBridge, 10);
+        if (!isNaN(idx)) {
+          if (!current.bridges) current.bridges = [];
+          current.bridges.splice(idx, 1);
+          current.meta.bridges = current.bridges;
+          await idbPut(current.wsDB, "keys", current.meta, "workspace_meta");
+          BridgeMgr.stop(current.meta.id);
           wrap.remove();
           setState({ modal: null });
         }
@@ -5269,10 +5380,12 @@ const PeerMgr = {
       }
     }
     // §35: also push to relay if one is configured (store-and-forward).
+    // §37: also push to bridge if one is configured.
     // Non-ephemeral only — presence and typing heartbeats are per-device
-    // and make no sense forwarded via relay.
+    // and make no sense forwarded via store-and-forward transports.
     if (!EPHEMERAL_TYPES.has(env.type)) {
       RelayMgr.send(workspaceId, body).catch(e => console.warn("relay push:", e));
+      BridgeMgr.send(workspaceId, body).catch(e => console.warn("bridge push:", e));
     }
     return sentAny;
   },
@@ -8982,6 +9095,289 @@ async function joinWorkspaceFromBundle(bundle, relayUrl, relayToken) {
 }
 
 /* ------------------------------------------------------------
+ *  §37  Bridge transport — LAN bridge adapter (Slice 8)
+ *
+ *  BridgeTransport polls GET /ws/:id/envelopes and pushes via PUT,
+ *  identical API surface to the Cloudflare relay but:
+ *    - No bearer token (LAN trust model; physical network = auth boundary)
+ *    - Fingerprint pinning: first-connect modal, mismatch warning
+ *
+ *  BridgeMgr is the workspace-level manager: one BridgeTransport per
+ *  workspace, started on Workspace.open and stopped on workspace close.
+ *
+ *  detectBridge() tries mehfil.local:8765 then localhost:8765 (mDNS fallback).
+ * ------------------------------------------------------------ */
+
+/**
+ * BridgeTransport — manages polling and pushing for one workspace + bridge.
+ *
+ * Config: { url, pinnedFp, workspaceId, onFpConfirm, onFpMismatch }
+ *   url         — bridge base URL (no trailing slash)
+ *   pinnedFp    — previously confirmed hex fingerprint, or null on first use
+ *   workspaceId — used in /ws/:id/* paths
+ *   onFpConfirm — async (fp: string) => boolean — called on first connect
+ *   onFpMismatch — (expected, got) => void — called when stored fp doesn't match
+ */
+class BridgeTransport {
+  constructor({ url, pinnedFp, workspaceId, onFpConfirm, onFpMismatch }) {
+    this.url          = url.replace(/\/$/, "");
+    this.pinnedFp     = pinnedFp || null;
+    this.workspaceId  = workspaceId;
+    this.onFpConfirm  = onFpConfirm;
+    this.onFpMismatch = onFpMismatch;
+    this.cursor       = "";
+    this.pollTimer    = null;
+    this.status       = "connecting";
+    this._closed      = false;
+    this._fpVerified  = false;
+  }
+
+  _wsUrl(path) {
+    return `${this.url}/ws/${encodeURIComponent(this.workspaceId)}${path}`;
+  }
+
+  async _verifyFp() {
+    const resp = await fetch(`${this.url}/health`, { signal: AbortSignal.timeout(5000) });
+    if (!resp.ok) return false;
+    const json  = await resp.json();
+    const liveFp = json.fp;
+    if (!liveFp) return false;
+    if (!this.pinnedFp) {
+      // First connect: ask the user to confirm the fingerprint.
+      const confirmed = await this.onFpConfirm(liveFp);
+      if (!confirmed) { this._closed = true; return false; }
+      this.pinnedFp = liveFp;
+      return true;
+    }
+    if (this.pinnedFp !== liveFp) {
+      this.onFpMismatch(this.pinnedFp, liveFp);
+      this._closed = true;
+      return false;
+    }
+    return true;
+  }
+
+  async fetchCursor() {
+    try {
+      const resp = await fetch(this._wsUrl("/cursor"), { signal: AbortSignal.timeout(5000) });
+      if (!resp.ok) return;
+      const json = await resp.json();
+      this.cursor = json.cursor || "";
+    } catch (_) { /* best-effort */ }
+  }
+
+  async start() {
+    if (this._closed) return;
+    try {
+      const ok = await this._verifyFp();
+      if (!ok) return;
+      this._fpVerified = true;
+      await this.fetchCursor();
+      this.status = "connected";
+      this._poll();
+    } catch (e) {
+      this.status = "connecting";
+      console.warn("[BridgeTransport] start failed:", e.message);
+      // Retry in 10 s in case the bridge is slow to start.
+      if (!this._closed) this.pollTimer = setTimeout(() => this.start(), 10_000);
+    }
+  }
+
+  async _poll() {
+    if (this._closed) return;
+    try {
+      const url  = this._wsUrl(`/envelopes?since=${encodeURIComponent(this.cursor)}&limit=100`);
+      const resp = await fetch(url, { signal: AbortSignal.timeout(8000) });
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+      const items = await resp.json();
+      this.status = "connected";
+      if (items.length > 0) {
+        for (const item of items) this._ingest(item);
+        this.cursor = items[items.length - 1].seq;
+      }
+    } catch (e) {
+      if (!this._closed) {
+        this.status = "connecting";
+        console.warn("[BridgeTransport] poll error:", e.message);
+      }
+    }
+    if (!this._closed) {
+      this.pollTimer = setTimeout(() => this._poll(), 3000);
+    }
+  }
+
+  _ingest({ data }) {
+    if (!data) return;
+    try {
+      const bytes = b64ToBytes(data);
+      const env   = MP.decode(bytes);
+      if (!env?.id) return;
+      SeenSet.has(this.workspaceId, env.id).then(seen => {
+        if (seen) return;
+        SeenSet.add(this.workspaceId, env.id);
+        EnvelopeDispatch.receive(env, this.workspaceId);
+        // Rebroadcast to any connected WebRTC peers (gossip).
+        PeerMgr.sendEnvelope(this.workspaceId, env, null).catch(() => {});
+      });
+    } catch (e) {
+      console.warn("[BridgeTransport] ingest error:", e);
+    }
+  }
+
+  async send(envBytes) {
+    if (this._closed || !this._fpVerified) return;
+    try {
+      await fetch(this._wsUrl("/envelopes"), {
+        method:  "PUT",
+        body:    envBytes,
+        headers: { "Content-Type": "application/octet-stream" },
+        signal:  AbortSignal.timeout(5000)
+      });
+    } catch (e) {
+      console.warn("[BridgeTransport] send error:", e.message);
+    }
+  }
+
+  close() {
+    this._closed = true;
+    this.status  = "offline";
+    if (this.pollTimer) { clearTimeout(this.pollTimer); this.pollTimer = null; }
+  }
+}
+
+/** BridgeMgr — workspace-level bridge lifecycle manager. */
+const BridgeMgr = {
+  _transports: new Map(), // wsId → BridgeTransport
+
+  startForWorkspace(current) {
+    const wsId = current.meta.id;
+    // Tear down existing transport for this workspace.
+    const existing = this._transports.get(wsId);
+    if (existing) { existing.close(); this._transports.delete(wsId); }
+
+    const bridges = current.bridges || current.meta.bridges || [];
+    if (bridges.length === 0) return;
+
+    const cfg       = bridges[0]; // one active bridge per workspace
+    const transport = new BridgeTransport({
+      url:       cfg.url,
+      pinnedFp:  cfg.fp || null,
+      workspaceId: wsId,
+      onFpConfirm: async (fp) => new Promise(resolve => {
+        openBridgeFpConfirmModal(fp,
+          async () => {
+            // Confirmed — persist the pinned fingerprint.
+            cfg.fp              = fp;
+            current.meta.bridges = bridges;
+            await idbPut(current.wsDB, "keys", current.meta, "workspace_meta").catch(console.warn);
+            resolve(true);
+          },
+          () => resolve(false)
+        );
+      }),
+      onFpMismatch: (expected, got) => showBridgeFpMismatchModal(expected, got)
+    });
+    this._transports.set(wsId, transport);
+    transport.start().catch(e => console.warn("[BridgeMgr] start:", e));
+  },
+
+  stop(wsId) {
+    const t = this._transports.get(wsId);
+    if (t) { t.close(); this._transports.delete(wsId); }
+  },
+
+  async send(wsId, envBytes) {
+    const t = this._transports.get(wsId);
+    if (t) await t.send(envBytes);
+  },
+
+  status(wsId) {
+    const t = this._transports.get(wsId);
+    return t ? t.status : "offline";
+  }
+};
+
+/**
+ * detectBridge() — tries the two most likely bridge addresses.
+ * Returns { url, fp } if found, null otherwise.
+ */
+async function detectBridge() {
+  const candidates = [
+    "http://mehfil.local:8765",
+    "http://localhost:8765"
+  ];
+  for (const url of candidates) {
+    try {
+      const resp = await fetch(`${url}/health`, { signal: AbortSignal.timeout(3000) });
+      if (resp.ok) {
+        const json = await resp.json();
+        if (json.ok && json.fp) return { url, fp: json.fp };
+      }
+    } catch (_) { /* bridge not at this address */ }
+  }
+  return null;
+}
+
+/** First-connect fingerprint confirmation modal. */
+function openBridgeFpConfirmModal(fp, onConfirm, onCancel) {
+  const wrap = document.createElement("div");
+  wrap.className = "modal-bg";
+  wrap.innerHTML = `
+    <div class="card" style="max-width: 440px;">
+      <h1 style="margin: 0 0 12px; font-size: 18px;">Verify bridge fingerprint</h1>
+      <p style="font-size: 13px; color: var(--fg-mute); margin: 0 0 16px;">
+        A Mehfil Bridge is running on your network. Confirm that the fingerprint below
+        matches what was printed in your terminal when you started the bridge.
+      </p>
+      <div class="mono" style="background: var(--bg-sunken); border-radius: 8px; padding: 14px 16px;
+           font-size: 22px; letter-spacing: 3px; text-align: center; color: var(--fg);">
+        ${escapeHTML(fp)}
+      </div>
+      <p style="font-size: 12px; color: var(--fg-dim); margin: 10px 0 0;">
+        The fingerprint is printed on startup:<br>
+        <code style="font-size: 11px;">Bridge fingerprint: ${escapeHTML(fp)}</code>
+      </p>
+      <div class="row" style="margin-top: 20px; gap: 10px;">
+        <button id="bfp-cancel" style="flex: 1; padding: 9px 0;">Doesn't match — cancel</button>
+        <button class="primary" id="bfp-confirm" style="flex: 1; padding: 9px 0;">Matches ✓ — trust bridge</button>
+      </div>
+    </div>
+  `;
+  document.body.appendChild(wrap);
+  wrap.querySelector("#bfp-confirm").onclick = () => { wrap.remove(); onConfirm(); };
+  wrap.querySelector("#bfp-cancel").onclick  = () => { wrap.remove(); onCancel(); };
+}
+
+/** Fingerprint mismatch warning modal. */
+function showBridgeFpMismatchModal(expected, got) {
+  const wrap = document.createElement("div");
+  wrap.className = "modal-bg";
+  wrap.innerHTML = `
+    <div class="card" style="max-width: 440px; border: 2px solid var(--danger);">
+      <h1 style="margin: 0 0 12px; font-size: 18px; color: var(--danger);">⚠ Bridge fingerprint mismatch</h1>
+      <p style="font-size: 13px; color: var(--fg-mute); margin: 0 0 14px;">
+        The bridge is presenting a <strong>different fingerprint</strong> from the one you previously confirmed.
+        This could indicate a misconfiguration or a man-in-the-middle attack.
+        The bridge connection has been blocked.
+      </p>
+      <div style="font-size: 12px; background: var(--bg-sunken); border-radius: 6px; padding: 10px 14px; line-height: 1.9;">
+        <div><span style="color: var(--fg-dim);">Expected:</span> <span class="mono" style="color: var(--ok);">${escapeHTML(expected)}</span></div>
+        <div><span style="color: var(--fg-dim);">Got:&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;</span> <span class="mono" style="color: var(--danger);">${escapeHTML(got)}</span></div>
+      </div>
+      <p style="font-size: 12px; color: var(--fg-dim); margin: 12px 0 0;">
+        If you intentionally replaced your bridge (e.g. new machine), remove it in
+        Settings → Workspace → LAN Bridge and add it again.
+      </p>
+      <div class="row" style="margin-top: 18px; justify-content: flex-end;">
+        <button class="primary" id="bfp-mismatch-ok" style="background: var(--danger); border-color: var(--danger);">Understood</button>
+      </div>
+    </div>
+  `;
+  document.body.appendChild(wrap);
+  wrap.querySelector("#bfp-mismatch-ok").onclick = () => wrap.remove();
+}
+
+/* ------------------------------------------------------------
  *  §13  Boot
  * ------------------------------------------------------------ */
 // Debug hook: when the URL carries ?debug=1, expose every module on
@@ -9021,6 +9417,9 @@ if (/[?&]debug=1/.test(location.search)) {
     RelayTransport, RelayMgr,
     PairingCode, openPairingCodeSendModal, openPairingCodeJoinModal,
     joinWorkspaceFromBundle,
+    // Slice 8
+    BridgeTransport, BridgeMgr,
+    detectBridge, openBridgeFpConfirmModal, showBridgeFpMismatchModal,
     get Y() { return Y; },
     get MiniSearch() { return MiniSearch; },
     bytesToB64Url, b64UrlToBytes, bytesToHex, bytesToB64,
