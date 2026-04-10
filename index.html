@@ -1928,6 +1928,26 @@ const Workspace = {
       if (raw) channelKeys[ch.id] = await Crypto.importAesRaw(raw);
     }
 
+    // Load per-sender group DM keys (sender-keys pattern).
+    // Stored as "sk:<channelId>:<senderId>" in the keys store.
+    await new Promise((res, rej) => {
+      const tx = wsDB.transaction("keys", "readonly");
+      const req = tx.objectStore("keys").getAllKeys();
+      req.onsuccess = async () => {
+        for (const k of (req.result || [])) {
+          if (!String(k).startsWith("sk:")) continue;
+          const parts = String(k).split(":");
+          if (parts.length < 3) continue;
+          const channelId = parts[1];
+          const senderId  = parts.slice(2).join(":");
+          const raw = await idbGet(wsDB, "keys", k);
+          if (raw) channelKeys[channelId + ":" + senderId] = await Crypto.importAesRaw(raw);
+        }
+        res();
+      };
+      req.onerror = rej;
+    });
+
     // Replay envelopes to (re)build the message projection. Source of truth
     // is `envelopes`; `messages` is rebuilt on every open. Event sourcing.
     //
@@ -1951,7 +1971,12 @@ const Workspace = {
       // reference a channel id we haven't materialized yet — derive it
       // from the sorted (me, other) pair if the ch id matches any known
       // member's DM with us.
-      let key = env.ch ? channelKeys[env.ch] : rootKey;
+      // For group DM envelopes, try the per-sender key first (sender-keys
+      // pattern). Fall back to the shared channel key for older group DMs
+      // that predate sender-keys, and for non-group-DM channels.
+      let key = env.ch
+        ? (channelKeys[env.ch + ":" + env.from] || channelKeys[env.ch])
+        : rootKey;
       if (env.ch && !key) {
         // Try DM resolution against the members list loaded so far.
         const myUserId = bytesToB64Url(State.identity.pubkey);
@@ -2101,6 +2126,29 @@ const Workspace = {
             await idbPut(wsDB, "channels", chRec);
             await idbPut(wsDB, "keys", rawKey, "ch:" + inner.id);
             channelKeys[inner.id] = await Crypto.importAesRaw(rawKey);
+            break;
+          }
+          case "group_dm.sender_key": {
+            // Store the per-sender key so future messages in this group DM
+            // can be decrypted with the right key.
+            const { group_id, sender_id, wrapped_keys } = inner;
+            const myUserId2 = bytesToB64Url(State.identity.pubkey);
+            const myEntry = wrapped_keys && wrapped_keys[myUserId2];
+            if (!myEntry) break;
+            const sender = members.find(m => m.id === sender_id);
+            if (!sender || !sender.x25519_pub) break;
+            try {
+              const myPriv = await Crypto.importX25519Priv(State.identity.x25519_priv_pkcs8);
+              const theirPub = await Crypto.importX25519Pub(sender.x25519_pub);
+              const kek = await Crypto.deriveX25519AesKey(myPriv, theirPub);
+              const rawKey = new Uint8Array(await crypto.subtle.decrypt(
+                { name: "AES-GCM", iv: myEntry.iv }, kek, myEntry.ct
+              ));
+              await idbPut(wsDB, "keys", rawKey, "sk:" + group_id + ":" + sender_id);
+              channelKeys[group_id + ":" + sender_id] = await Crypto.importAesRaw(rawKey);
+            } catch (e) {
+              console.warn("replay: group_dm.sender_key unwrap failed", e);
+            }
             break;
           }
           // member.join / welcome are no-ops during replay: the `members`
@@ -2519,26 +2567,36 @@ function renderWorkspace() {
         ` : ""}
         <div class="sidebar-section">
           <h3>People</h3>
-          ${current.members.map(m => {
-            // Presence state: unknown members default to "offline".
-            // Status dot classes match the CSS colors defined for
-            // .presence-dot.{online,away,offline}.
-            const p = (current.presence || {})[m.id];
-            // §6: presence entries older than 90s are treated as stale → offline.
-            const stale = p && (Date.now() - p.updated_at) > 90_000;
-            const status = (p && !stale) ? p.status : "offline";
-            const title = p?.updated_at
-              ? (status === "online" ? "Online" : status === "away" ? "Away" : `Offline (last seen ${formatRelative(p.updated_at)})`)
-              : "Offline";
-            return `
-            <div class="ch-item ${m.id === myUserId ? "" : "people-clickable"}" data-pmember="${m.id === myUserId ? "" : escapeHTML(m.id)}" title="${escapeHTML(title)}" style="display: flex; align-items: center; gap: 8px;">
-              <div class="avatar-with-status">
-                <div class="avatar" style="width: 20px; height: 20px; font-size: 10px; background: ${avatarColorFor(m.id)}">${escapeHTML(initials(m.name))}</div>
-                <span class="presence-dot ${status}"></span>
+          ${(() => {
+            const isAdminViewer = me && (me.role === "owner" || me.role === "admin");
+            return current.members.map(m => {
+              // Presence state: unknown members default to "offline".
+              // Status dot classes match the CSS colors defined for
+              // .presence-dot.{online,away,offline}.
+              const p = (current.presence || {})[m.id];
+              // §6: presence entries older than 90s are treated as stale → offline.
+              const stale = p && (Date.now() - p.updated_at) > 90_000;
+              const status = (p && !stale) ? p.status : "offline";
+              const title = p?.updated_at
+                ? (status === "online" ? "Online" : status === "away" ? "Away" : `Offline (last seen ${formatRelative(p.updated_at)})`)
+                : "Offline";
+              const roleBadge = (m.role === "owner" || m.role === "admin")
+                ? `<span class="role-badge ${m.role === "owner" ? "owner" : "admin"}" style="font-size:9px;padding:1px 5px;margin-left:2px;">${m.role}</span>`
+                : "";
+              const proposeBtn = (isAdminViewer && m.id !== myUserId && m.role === "member")
+                ? `<button class="icon-btn" data-sidebar-propose="${escapeHTML(m.id)}" title="Propose as admin" style="font-size:10px;padding:2px 5px;margin-left:auto;opacity:0.55;">★</button>`
+                : "";
+              return `
+              <div class="ch-item ${m.id === myUserId ? "" : "people-clickable"}" data-pmember="${m.id === myUserId ? "" : escapeHTML(m.id)}" title="${escapeHTML(title)}" style="display: flex; align-items: center; gap: 8px;">
+                <div class="avatar-with-status">
+                  <div class="avatar" style="width: 20px; height: 20px; font-size: 10px; background: ${avatarColorFor(m.id)}">${escapeHTML(initials(m.name))}</div>
+                  <span class="presence-dot ${status}"></span>
+                </div>
+                <span>${escapeHTML(m.name)}${m.id === myUserId ? " <span style='color: var(--fg-dim); font-size: 11px;'>(you)</span>" : ""}${roleBadge}</span>
+                ${proposeBtn}
               </div>
-              <span>${escapeHTML(m.name)}${m.id === myUserId ? " <span style='color: var(--fg-dim); font-size: 11px;'>(you)</span>" : ""}</span>
-            </div>
-          `;}).join("")}
+            `;}).join("");
+          })()}
           ${current.members.length >= 3 ? `
             <div class="ch-item" id="btn-group-dm" style="color: var(--accent); margin-top: 4px;">
               + Start group DM
@@ -2659,6 +2717,23 @@ function renderWorkspace() {
         setState({ currentChannel: dmCh.id });
       } catch (e) {
         alert(e.message);
+      }
+    };
+  });
+
+  // "People" entries: ★ Propose-as-admin button (admins/owners only).
+  document.querySelectorAll("[data-sidebar-propose]").forEach(el => {
+    const mid = el.getAttribute("data-sidebar-propose");
+    if (!mid) return;
+    el.onclick = async (e) => {
+      e.stopPropagation();  // prevent the parent DM-click from firing
+      el.disabled = true;
+      try {
+        await draftPromotion(current, mid);
+        openSettings("admin");  // jump to Admin tab so user sees the pending proposal
+      } catch (err) {
+        alert("Could not propose promotion: " + err.message);
+        el.disabled = false;
       }
     };
   });
@@ -3445,7 +3520,14 @@ function renderBackupBanner() {
 async function sendMessageNow(body, opts = {}) {
   const { current } = State;
   const ch = current.channels.find(c => c.id === State.currentChannel);
-  const channelKey = current.channelKeys[ch.id];
+  // For group DMs (dm:true, no dm_with) use our own per-sender key when
+  // available (sender-keys pattern). Fall back to the shared channel key
+  // for older group DMs or channels that are not group DMs.
+  const _myId = bytesToB64Url(State.identity.pubkey);
+  const _isGroupDm = ch.dm && !ch.dm_with;
+  const channelKey = (_isGroupDm && current.channelKeys[ch.id + ":" + _myId])
+    ? current.channelKeys[ch.id + ":" + _myId]
+    : current.channelKeys[ch.id];
 
   // Parse @mentions out of the body so the envelope carries a canonical
   // list of tagged user_ids. The body text itself is unchanged.
@@ -6568,16 +6650,21 @@ const EnvelopeDispatch = {
     //    id derivation (§28). If that matches a (me, member) pair, the
     //    DM channel gets materialized on the fly and we proceed.
     let key;
-    if (env.ch && current.channelKeys[env.ch]) {
-      key = current.channelKeys[env.ch];
-    } else if (env.ch) {
-      const resolved = await tryResolveIncomingDm(current, env.ch);
-      if (resolved) {
-        key = current.channelKeys[env.ch];
+    if (env.ch) {
+      // Prefer per-sender key for group DMs (sender-keys pattern).
+      const senderKey = current.channelKeys[env.ch + ":" + env.from];
+      const sharedKey = current.channelKeys[env.ch];
+      if (senderKey || sharedKey) {
+        key = senderKey || sharedKey;
       } else {
-        // Channel unknown and not a DM we can derive — likely a private
-        // channel we're not a member of. Drop silently.
-        return;
+        const resolved = await tryResolveIncomingDm(current, env.ch);
+        if (resolved) {
+          key = current.channelKeys[env.ch + ":" + env.from] || current.channelKeys[env.ch];
+        } else {
+          // Channel unknown and not a DM we can derive — likely a private
+          // channel we're not a member of. Drop silently.
+          return;
+        }
       }
     } else {
       key = current.rootKey;   // workspace-level envelopes
@@ -6615,12 +6702,16 @@ const EnvelopeDispatch = {
           // + handle steps instead of re-entering receive() so the
           // causal check doesn't fire a second time.
           let relKey;
-          if (releasedEnv.ch && current.channelKeys[releasedEnv.ch]) {
-            relKey = current.channelKeys[releasedEnv.ch];
-          } else if (releasedEnv.ch) {
-            const res = await tryResolveIncomingDm(current, releasedEnv.ch);
-            if (res) relKey = current.channelKeys[releasedEnv.ch];
-            else return;
+          if (releasedEnv.ch) {
+            const relSenderKey = current.channelKeys[releasedEnv.ch + ":" + releasedEnv.from];
+            const relSharedKey = current.channelKeys[releasedEnv.ch];
+            if (relSenderKey || relSharedKey) {
+              relKey = relSenderKey || relSharedKey;
+            } else {
+              const res = await tryResolveIncomingDm(current, releasedEnv.ch);
+              if (res) relKey = current.channelKeys[releasedEnv.ch + ":" + releasedEnv.from] || current.channelKeys[releasedEnv.ch];
+              else return;
+            }
           } else {
             relKey = current.rootKey;
           }
@@ -6765,6 +6856,31 @@ const EnvelopeDispatch = {
         break;
       }
 
+      case "group_dm.sender_key": {
+        // A group DM participant is publishing (or refreshing) their per-sender
+        // AES key, wrapped for every current group member via X25519 ECDH.
+        // inner: { group_id, sender_id, wrapped_keys: { user_id: {iv, ct} } }
+        const { group_id, sender_id, wrapped_keys: skWrapped } = inner;
+        const myUserIdSk = bytesToB64Url(State.identity.pubkey);
+        const myEntrySk = skWrapped && skWrapped[myUserIdSk];
+        if (!myEntrySk) break;  // not addressed to us
+        const skSender = current.members.find(m => m.id === sender_id);
+        if (!skSender || !skSender.x25519_pub) break;
+        try {
+          const myPrivSk = await Crypto.importX25519Priv(State.identity.x25519_priv_pkcs8);
+          const theirPubSk = await Crypto.importX25519Pub(skSender.x25519_pub);
+          const kekSk = await Crypto.deriveX25519AesKey(myPrivSk, theirPubSk);
+          const rawKeySk = new Uint8Array(await crypto.subtle.decrypt(
+            { name: "AES-GCM", iv: myEntrySk.iv }, kekSk, myEntrySk.ct
+          ));
+          await idbPut(current.wsDB, "keys", rawKeySk, "sk:" + group_id + ":" + sender_id);
+          current.channelKeys[group_id + ":" + sender_id] = await Crypto.importAesRaw(rawKeySk);
+        } catch (e) {
+          console.warn("group_dm.sender_key unwrap failed", e);
+        }
+        break;
+      }
+
       case "channel.create": {
         // Add the new channel to the local projection and import its key.
         // Public channels carry a raw key in the inner payload (the envelope
@@ -6883,6 +6999,16 @@ const EnvelopeDispatch = {
           }
           current.meta.member_count = current.members.length;
           await idbPut(current.wsDB, "keys", current.meta, "workspace_meta");
+        }
+        // Import per-sender group DM keys from the snapshot so the joiner
+        // can decrypt group DM history without waiting for individual
+        // group_dm.sender_key envelopes to replay.
+        if (Array.isArray(inner.snapshot.senderKeys)) {
+          for (const { channelId, senderId, raw } of inner.snapshot.senderKeys) {
+            if (!channelId || !senderId || !raw) continue;
+            await idbPut(current.wsDB, "keys", raw, "sk:" + channelId + ":" + senderId);
+            current.channelKeys[channelId + ":" + senderId] = await Crypto.importAesRaw(raw);
+          }
         }
         // After welcome, the joiner can finally enter the workspace shell.
         if (State.view === "join-waiting") {
@@ -7163,7 +7289,8 @@ const EnvelopeDispatch = {
  *  §22  member.welcome + history replay helpers
  * ------------------------------------------------------------ */
 async function sendWelcome(current, targetUserId) {
-  // Build the snapshot: channels with their raw keys, current members.
+  // Build the snapshot: channels with their raw keys, current members,
+  // and per-sender group DM keys so the joiner can decrypt group DM history.
   const snapshotChannels = [];
   for (const ch of current.channels) {
     const raw = await idbGet(current.wsDB, "keys", "ch:" + ch.id);
@@ -7176,8 +7303,30 @@ async function sendWelcome(current, targetUserId) {
       key: raw
     });
   }
+
+  // Collect all "sk:" sender keys so the joiner can decrypt group DM history.
+  const senderKeys = await new Promise((res, rej) => {
+    const tx  = current.wsDB.transaction("keys", "readonly");
+    const req = tx.objectStore("keys").getAllKeys();
+    req.onsuccess = async () => {
+      const out = [];
+      for (const k of (req.result || [])) {
+        if (!String(k).startsWith("sk:")) continue;
+        const parts = String(k).split(":");
+        if (parts.length < 3) continue;
+        const channelId = parts[1];
+        const senderId  = parts.slice(2).join(":");
+        const raw = await idbGet(current.wsDB, "keys", k);
+        if (raw) out.push({ channelId, senderId, raw });
+      }
+      res(out);
+    };
+    req.onerror = rej;
+  });
+
   const snapshot = {
     channels: snapshotChannels,
+    senderKeys,
     members: current.members.map(m => ({
       id: m.id, name: m.name, color: m.color, role: m.role,
       devices: m.devices, joined_at: m.joined_at,
@@ -7691,7 +7840,70 @@ async function createGroupDm(current, otherMembers) {
   ch.dm = true;
   ch.dm_with = null;
   await idbPut(current.wsDB, "channels", ch);
+
+  // Publish our per-sender key for this group DM so members can decrypt
+  // our messages. The shared channel key from sendChannelCreate remains
+  // as fallback for older clients that predate sender-keys.
+  await sendGroupDmSenderKey(current, ch, otherMembers);
+
   return ch;
+}
+
+/**
+ * Publish (or refresh) our per-sender AES key for a group DM, wrapped
+ * individually for each current member via X25519 ECDH. Recipients store
+ * it under "sk:<channelId>:<myUserId>" and use it to decrypt our messages.
+ *
+ * Envelope type: "group_dm.sender_key", workspace-level, encrypted under
+ * root key. Not ephemeral — persisted to the envelopes store so new joiners
+ * who receive history can reconstruct the key on replay.
+ */
+async function sendGroupDmSenderKey(current, groupChannel, members) {
+  const myUserId = bytesToB64Url(State.identity.pubkey);
+  const aesKey   = await Crypto.genAesKey();
+  const rawKey   = await Crypto.exportAesRaw(aesKey);
+
+  // Wrap the raw key per-member via X25519 ECDH (same pattern as private
+  // channel creation in sendChannelCreate).
+  const myX25519Priv = await Crypto.importX25519Priv(State.identity.x25519_priv_pkcs8);
+  const wrapped_keys = {};
+  const recipients   = (members || groupChannel.members || []).filter(m => {
+    const id = typeof m === "string" ? m : m.id;
+    return id !== myUserId;
+  });
+  for (const entry of recipients) {
+    const mid    = typeof entry === "string" ? entry : entry.id;
+    const member = current.members.find(m => m.id === mid);
+    if (!member || !member.x25519_pub) continue;
+    const theirPub = await Crypto.importX25519Pub(member.x25519_pub);
+    const kek      = await Crypto.deriveX25519AesKey(myX25519Priv, theirPub);
+    const iv       = Crypto.rand(12);
+    const ct       = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv }, kek, rawKey));
+    wrapped_keys[mid] = { iv, ct };
+  }
+
+  // Persist locally so we can use our own sender key immediately.
+  await idbPut(current.wsDB, "keys", rawKey, "sk:" + groupChannel.id + ":" + myUserId);
+  current.channelKeys[groupChannel.id + ":" + myUserId] = aesKey;
+
+  // Broadcast the envelope.
+  const signKey = await Crypto.importSignKey(State.identity.privkey_pkcs8);
+  const meta    = current.meta;
+  meta.lc_counter = (meta.lc_counter || 0) + 1;
+  await idbPut(current.wsDB, "keys", meta, "workspace_meta");
+  const env = await Envelope.build({
+    workspaceId:   meta.id,
+    channelId:     null,          // workspace-level
+    channelKey:    current.rootKey,
+    signKey,
+    signerPubkey:  State.identity.pubkey,
+    deviceId:      meta.device_id,
+    type:          "group_dm.sender_key",
+    inner:         { group_id: groupChannel.id, sender_id: myUserId, wrapped_keys },
+    vectorClock:   [[myUserId, meta.lc_counter]]
+  });
+  await idbPut(current.wsDB, "envelopes", env);
+  await PeerMgr.sendEnvelope(meta.id, env);
 }
 
 /* ------------------------------------------------------------
@@ -8362,7 +8574,7 @@ async function handleSelfRevocation(wsId) {
     const keysReq = store.getAllKeys();
     await new Promise(res => { keysReq.onsuccess = res; keysReq.onerror = res; });
     for (const k of (keysReq.result || [])) {
-      if (k === "root" || String(k).startsWith("ch:")) store.delete(k);
+      if (k === "root" || String(k).startsWith("ch:") || String(k).startsWith("sk:")) store.delete(k);
     }
     await new Promise((res, rej) => { tx.oncomplete = res; tx.onerror = rej; });
     wsDB.close();
@@ -10166,6 +10378,8 @@ if (/[?&]debug=1/.test(location.search)) {
     // v1.1
     sendDeviceAdd, sendDeviceRevoke, handleSelfRevocation,
     openDevicePairInitiatorModal, openDevicePairJoinerModal,
+    // v1.2
+    sendGroupDmSenderKey, draftPromotion,
     get Y() { return Y; },
     get MiniSearch() { return MiniSearch; },
     bytesToB64Url, b64UrlToBytes, bytesToHex, bytesToB64,
