@@ -2,7 +2,7 @@
 
 Browser-native, local-first team chat. Single HTML file. No accounts. No central server. Messages are end-to-end encrypted, signed by the sender, and stored on the devices of workspace members — never in the cloud.
 
-> **Status: v1.2 shipped.** Multi-device identity, multi-admin UI, and sender-keys for group DMs are all complete.
+> **Status: v2 in progress.** Multi-office bridge federation and huddles (WebRTC audio mesh) shipped. Canvas up next.
 
 ## What works
 
@@ -27,6 +27,11 @@ Browser-native, local-first team chat. Single HTML file. No accounts. No central
 - Pair a new device with a 6-word code — works in-room or remotely over the relay
 - Device list in Settings → Devices with last-seen timestamps
 - Any device (or any admin) can revoke a device; revoked device is shown a clear notice and its keys are wiped
+
+**Huddles**
+- 🎙 button in sidebar starts a live audio call — WebRTC mesh, no server
+- Anyone online can join; audio is encrypted under the workspace key
+- Speaking rings animate on active microphones; mute toggle; leave at any time
 
 **Networking**
 - WebRTC peer-to-peer via Cloudflare STUN (no signaling server for 1:1)
@@ -127,10 +132,13 @@ http://localhost:8103/?as=bose#join=...
 
 Production paths (no `?as=`) are unaffected. Combine with `?debug=1` to expose every internal module on `window.__mehfil` for loopback tests — see `PROTOCOL.md §dev` for the convention.
 
+## What's new in v2
+
+- **Multi-office bridge federation** — run `BRIDGE_NAME="NYC" RELAY_URL=... mehfil-bridge` in each office; bridges sync through the relay. People sidebar groups members by office.
+- **Huddles** — 🎙 button in the sidebar footer starts a live audio call. Anyone online can join; audio is WebRTC peer-to-peer, encrypted under the workspace key. Speaking rings animate on active mics.
+
 ## Upcoming
 
-- **Multi-office bridge federation** — two bridges in two offices syncing through a shared relay; within-office traffic stays local
-- **Huddles** — audio via WebRTC mesh
 - **Canvas** — Yjs collaborative doc as a first-class channel type
 
 ## Architecture
