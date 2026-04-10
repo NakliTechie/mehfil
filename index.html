@@ -2576,7 +2576,7 @@ function renderWorkspace() {
           <h3>People</h3>
           ${(() => {
             const isAdminViewer = me && (me.role === "owner" || me.role === "admin");
-            return current.members.map(m => {
+            const renderMember = m => {
               // Presence state: unknown members default to "offline".
               // Status dot classes match the CSS colors defined for
               // .presence-dot.{online,away,offline}.
@@ -2602,7 +2602,31 @@ function renderWorkspace() {
                 <span>${escapeHTML(m.name)}${m.id === myUserId ? " <span style='color: var(--fg-dim); font-size: 11px;'>(you)</span>" : ""}${roleBadge}</span>
                 ${proposeBtn}
               </div>
-            `;}).join("");
+            `;};
+            // Office grouping: if any member has a bridge_name, render grouped sections.
+            const hasOffices = current.members.some(m => m.bridge_name);
+            if (!hasOffices) return current.members.map(renderMember).join("");
+            // Build ordered group map: local (null) first, then remotes sorted by name.
+            const groupMap = new Map();
+            for (const m of current.members) {
+              const key = m.bridge_name || null;
+              if (!groupMap.has(key)) groupMap.set(key, []);
+              groupMap.get(key).push(m);
+            }
+            const officeLabel = (name, topPad) =>
+              `<div style="font-size:10px;color:var(--fg-dim);padding:${topPad ? "8px" : "4px"} 0 2px 4px;text-transform:uppercase;letter-spacing:0.05em;user-select:none;">${escapeHTML(name)}</div>`;
+            let html = "";
+            const local = groupMap.get(null) || [];
+            if (local.length) {
+              html += officeLabel("Here", false);
+              html += local.map(renderMember).join("");
+            }
+            const remoteKeys = [...groupMap.keys()].filter(k => k !== null).sort();
+            for (const k of remoteKeys) {
+              html += officeLabel(k, local.length > 0 || html.length > 0);
+              html += groupMap.get(k).map(renderMember).join("");
+            }
+            return html;
           })()}
           ${current.members.length >= 3 ? `
             <div class="ch-item" id="btn-group-dm" style="color: var(--accent); margin-top: 4px;">
@@ -5149,11 +5173,12 @@ async function sendMemberJoin(current, selfMember) {
     inner: {
       profile: { name: selfMember.name, color: selfMember.color },
       devices: selfMember.devices,
-      x25519_pub: State.identity.x25519_pub   // Slice 3b: joiner publishes
+      x25519_pub: State.identity.x25519_pub,  // Slice 3b: joiner publishes
                                               // their X25519 pubkey so the
                                               // existing members can wrap
                                               // private channel keys for
                                               // them and derive DM keys.
+      bridge_name: BridgeMgr.name(meta.id) || undefined  // office label for sidebar grouping
     },
     vectorClock: [[userId, meta.lc_counter]]
   });
@@ -7010,7 +7035,8 @@ const EnvelopeDispatch = {
           role: "member",
           devices: inner.devices || [env.dev],
           joined_at: env.ts,
-          x25519_pub: inner.x25519_pub || null   // Slice 3b
+          x25519_pub: inner.x25519_pub || null,  // Slice 3b
+          bridge_name: inner.bridge_name || null  // office label for sidebar grouping
         };
         if (!current.members.find(m => m.id === newMember.id)) {
           await attachFingerprint(newMember);
@@ -10163,6 +10189,8 @@ class BridgeTransport {
     const json  = await resp.json();
     const liveFp = json.fp;
     if (!liveFp) return false;
+    // Capture the bridge's display name (set via BRIDGE_NAME env on the binary).
+    this.liveName = json.name || null;
     if (!this.pinnedFp) {
       // First connect: ask the user to confirm the fingerprint.
       const confirmed = await this.onFpConfirm(liveFp);
@@ -10315,6 +10343,12 @@ const BridgeMgr = {
   status(wsId) {
     const t = this._transports.get(wsId);
     return t ? t.status : "offline";
+  },
+
+  /** Return the live display name reported by the bridge's /health endpoint, or null. */
+  name(wsId) {
+    const t = this._transports.get(wsId);
+    return (t && t.liveName) ? t.liveName : null;
   }
 };
 
