@@ -6994,6 +6994,12 @@ const EnvelopeDispatch = {
         // AES key, wrapped for every current group member via X25519 ECDH.
         // inner: { group_id, sender_id, wrapped_keys: { user_id: {iv, ct} } }
         const { group_id, sender_id, wrapped_keys: skWrapped } = inner;
+        // Security: envelope sender must match the claimed key owner —
+        // prevents a member from publishing a rogue key for someone else.
+        if (env.from !== sender_id) {
+          console.warn("group_dm.sender_key: sender mismatch, ignoring");
+          break;
+        }
         const myUserIdSk = bytesToB64Url(State.identity.pubkey);
         const myEntrySk = skWrapped && skWrapped[myUserIdSk];
         if (!myEntrySk) break;  // not addressed to us
@@ -7266,6 +7272,12 @@ const EnvelopeDispatch = {
         // A new workspace root key has been distributed. `inner.wrapped_keys`
         // is a map of user_id → {iv, ct} wrapped with X25519. Find our entry
         // and unwrap the new root key.
+        // Security: only admins/owners may rotate the workspace root key.
+        const rkSender = current.members.find(m => m.id === env.from);
+        if (!rkSender || (rkSender.role !== "owner" && rkSender.role !== "admin")) {
+          console.warn("workspace.rekey from non-admin, ignoring");
+          break;
+        }
         const myUserId = bytesToB64Url(State.identity.pubkey);
         const myEntry = inner.wrapped_keys && inner.wrapped_keys[myUserId];
         if (!myEntry) {
@@ -7273,8 +7285,8 @@ const EnvelopeDispatch = {
           break;
         }
         // Unwrap: ECDH(my_x25519_priv, sender_x25519_pub) → KEK → decrypt.
-        const sender = current.members.find(m => m.id === env.from);
-        if (!sender || !sender.x25519_pub) {
+        const sender = rkSender; // already found above
+        if (!sender.x25519_pub) {
           console.warn("workspace.rekey: sender has no x25519_pub");
           break;
         }
@@ -7292,6 +7304,12 @@ const EnvelopeDispatch = {
         // is inside the envelope (encrypted under the workspace root key —
         // which is how we got here). For private channels, the key is wrapped
         // per-member in `inner.wrapped_keys`.
+        // Security: only admins/owners may rotate channel keys.
+        const crkSender = current.members.find(m => m.id === env.from);
+        if (!crkSender || (crkSender.role !== "owner" && crkSender.role !== "admin")) {
+          console.warn("channel.rekey from non-admin, ignoring");
+          break;
+        }
         const myUserId = bytesToB64Url(State.identity.pubkey);
         const chId = inner.channel_id;
         if (!chId) break;
@@ -7303,8 +7321,8 @@ const EnvelopeDispatch = {
           // Private channel: wrapped for us.
           const myEntry = inner.wrapped_keys[myUserId];
           if (!myEntry) break; // Not a member of this channel.
-          const sender = current.members.find(m => m.id === env.from);
-          if (!sender || !sender.x25519_pub) break;
+          const sender = crkSender; // already found above
+          if (!sender.x25519_pub) break;
           const myPriv = await Crypto.importX25519Priv(State.identity.x25519_priv_pkcs8);
           const theirPub = await Crypto.importX25519Pub(sender.x25519_pub);
           const kek = await Crypto.deriveX25519AesKey(myPriv, theirPub);
@@ -9763,9 +9781,10 @@ async function joinWorkspaceFromBundle(bundle, relayUrl, relayToken) {
   await idbPut(wsDB, "keys", rootKeyBytes, "root");
   await idbPut(wsDB, "keys", gchKeyBytes, `ch:${bundle.general_channel_id}`);
 
-  // Register identity key.
-  await idbPut(wsDB, "keys", State.identity.privkey, "sign_priv");
-  await idbPut(wsDB, "keys", State.identity.pubkey,  "sign_pub");
+  // Register identity public key — used to verify authorship of envelopes
+  // written by this device. The private key is stored in the global identity
+  // record (identity.privkey_pkcs8), never in the workspace DB.
+  await idbPut(wsDB, "keys", State.identity.pubkey, "sign_pub");
 
   // Register in global workspace list.
   await idbPut(State.globalDB, "workspaces", {
