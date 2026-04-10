@@ -58,6 +58,8 @@ python3 -m http.server 8103
 
 Or open `index.html` directly. Requires Web Crypto Ed25519: Chrome 113+, Firefox 130+, Safari 17+.
 
+**New here?** The [User Guide](guide/index.html) walks through every feature with screenshots — also accessible via the `?` button on the landing page or **Guide ↗** in Settings.
+
 ## Two-person quickstart
 
 1. Window 1: create a workspace, send a message, click "+ Invite someone".
@@ -146,6 +148,7 @@ Two companion services live in separate repos:
 
 | File | Purpose |
 |---|---|
+| `guide/index.html` | **User guide** — feature walkthroughs with screenshots, mobile guide |
 | `MEHFIL-SPEC.md` | v1 specification — the authoritative protocol description |
 | `MEHFIL-WALKTHROUGHS.md` | 35 testable user-flow scenarios across 8 phases |
 | `PROTOCOL.md` | Pinned implementation choices (msgpack, envelope format, key hierarchy, etc.) |
