@@ -893,6 +893,28 @@
   .relay-row:last-child { border-bottom: none; }
   .relay-row-info { flex: 1; min-width: 0; font-size: 12px; }
   .relay-row-url { font-family: var(--mono); font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+  /* ---- Huddle bar ---- */
+  .huddle-bar {
+    display: flex; align-items: center; gap: 8px;
+    padding: 5px 16px; background: var(--bg-sunken);
+    border-top: 1px solid var(--line); flex-shrink: 0;
+  }
+  .huddle-label { font-size: 11px; color: var(--fg-dim); flex-shrink: 0; letter-spacing: 0.02em; }
+  .huddle-avatars { display: flex; gap: 4px; flex: 1; align-items: center; overflow: hidden; }
+  .huddle-avatar {
+    width: 24px; height: 24px; border-radius: 50%; flex-shrink: 0;
+    font-size: 10px; font-weight: 600; color: #fff;
+    display: flex; align-items: center; justify-content: center;
+    transition: box-shadow 0.12s ease;
+  }
+  @keyframes huddle-speak { 0%,100% { box-shadow: 0 0 0 2px var(--accent); } 50% { box-shadow: 0 0 0 3px var(--accent); } }
+  .huddle-avatar.speaking { animation: huddle-speak 0.55s ease infinite; }
+  .huddle-actions { display: flex; gap: 4px; flex-shrink: 0; align-items: center; }
+  .huddle-muted { opacity: 0.35; }
+  #btn-huddle-leave { font-size: 11px; padding: 3px 8px; color: var(--danger); border-color: var(--danger); }
+  #btn-huddle { transition: color 0.15s; }
+  #btn-huddle.active { color: var(--ok); }
 </style>
 </head>
 <body>
@@ -2644,6 +2666,7 @@ function renderWorkspace() {
             <div class="me-name">${escapeHTML(me.name)}</div>
             <div class="me-fp" title="${escapeHTML(fp)}">${escapeHTML(fp)}</div>
           </div>
+          <button class="icon-btn${HuddleMgr.active && HuddleMgr.wsId === current.meta.id ? " active" : ""}" id="btn-huddle" title="${HuddleMgr.active && HuddleMgr.wsId === current.meta.id ? "In huddle — click to leave" : "Start a huddle"}">🎙</button>
           <button class="icon-btn" id="btn-settings" title="Settings">⚙</button>
         </div>
       </aside>
@@ -2660,6 +2683,7 @@ function renderWorkspace() {
           ${channelMessages.length === 0 && isOnlyMember ? renderEmptyState() : ""}
           ${channelMessages.map(m => renderMessage(m, current.members, myUserId, { replyCount: replyCounts.get(m.id) || 0 })).join("")}
         </div>
+        ${HuddleMgr.renderBar(current)}
         <div class="composer">
           <div class="composer-box" id="composer-box">
             <textarea id="composer" rows="2" placeholder="${composePlaceholder(channel, current)}" autofocus></textarea>
@@ -2731,6 +2755,21 @@ function renderWorkspace() {
     await idbPut(current.wsDB, "keys", current.meta, "workspace_meta");
     setState({});
   };
+
+  // Huddle button (sidebar footer)
+  const $huddle = document.getElementById("btn-huddle");
+  if ($huddle) $huddle.onclick = async () => {
+    if (HuddleMgr.active && HuddleMgr.wsId === current.meta.id) {
+      await HuddleMgr.leave();
+    } else {
+      await HuddleMgr.join(current.meta.id);
+    }
+  };
+  // Huddle bar controls
+  const $huddleMute = document.getElementById("btn-huddle-mute");
+  if ($huddleMute) $huddleMute.onclick = () => HuddleMgr.toggleMute();
+  const $huddleLeave = document.getElementById("btn-huddle-leave");
+  if ($huddleLeave) $huddleLeave.onclick = () => HuddleMgr.leave();
 
   const $groupDm = document.getElementById("btn-group-dm");
   if ($groupDm) $groupDm.onclick = openGroupDmModal;
@@ -6684,7 +6723,10 @@ const BlobTransfer = {
 // still signed + encrypted for authenticity + privacy, but live only in
 // memory — reloading the workspace starts presence from a blank slate.
 // Spec §4.1 marks `presence.update` and `typing.start` as ephemeral.
-const EPHEMERAL_TYPES = new Set(["presence.update", "typing.start"]);
+const EPHEMERAL_TYPES = new Set([
+  "presence.update", "typing.start",
+  "huddle.join", "huddle.leave", "huddle.signal"
+]);
 
 const EnvelopeDispatch = {
   async receive(workspaceId, env) {
@@ -7360,6 +7402,18 @@ const EnvelopeDispatch = {
         }
         break;
       }
+
+      case "huddle.join":
+        await HuddleMgr.onJoin(workspaceId, env);
+        break;
+
+      case "huddle.leave":
+        HuddleMgr.onLeave(workspaceId, env);
+        break;
+
+      case "huddle.signal":
+        await HuddleMgr.onSignal(workspaceId, env, inner);
+        break;
 
       default:
         console.warn("Unhandled envelope type:", env.type);
@@ -8676,6 +8730,7 @@ async function handleSelfRevocation(wsId) {
   RelayMgr.stop(wsId);
   BridgeMgr.stop(wsId);
   PeerMgr.detach(wsId);
+  if (HuddleMgr.wsId === wsId) HuddleMgr.leave().catch(() => {});
   setState({ view: "revoked" });
 }
 
@@ -10433,6 +10488,278 @@ function showBridgeFpMismatchModal(expected, got) {
 }
 
 /* ------------------------------------------------------------
+ *  §38  Huddles — encrypted WebRTC audio mesh
+ *
+ *  One huddle per workspace at a time. Any member can start one;
+ *  anyone online can jump in. Signaling uses the same envelope
+ *  infrastructure as messages — huddle.signal carries offer/answer/ICE
+ *  encrypted under the workspace root key. Audio is peer-to-peer via
+ *  RTCPeerConnection (separate from the data channel used for messages).
+ *
+ *  Envelope types (all ephemeral — not stored in IDB):
+ *    huddle.join   — announce presence in the huddle
+ *    huddle.leave  — announce departure
+ *    huddle.signal — WebRTC signaling (offer | answer | ICE candidate)
+ *                    inner: { to, sdp_type?, sdp?, ice? }
+ * ------------------------------------------------------------ */
+
+const HuddleMgr = (() => {
+  // Private state
+  let _ws          = null;       // active workspace id, or null
+  let _participants = [];        // [{id, name}] — includes self
+  let _pcs         = new Map();  // peerId → RTCPeerConnection
+  let _remoteAudios = new Map(); // peerId → <audio> element
+  let _localStream  = null;
+  let _muted        = false;
+  let _audioCtx     = null;
+  let _analysers    = new Map(); // peerId → {analyser, data, speaking}
+  let _speakTimer   = null;
+
+  // ── Helpers ────────────────────────────────────────────────
+
+  async function _sendEnvelope(wsId, type, inner) {
+    const current = State.current;
+    if (!current || current.meta.id !== wsId) return;
+    const meta     = current.meta;
+    const myUserId = bytesToB64Url(State.identity.pubkey);
+    const env = await Envelope.build({
+      workspaceId:  wsId,
+      channelId:    null,
+      channelKey:   current.rootKey,
+      signKey:      State.identity.signKey,
+      signerPubkey: State.identity.pubkey,
+      deviceId:     meta.device_id,
+      type,
+      inner,
+      vectorClock:  [[myUserId, meta.lc_counter]]
+    });
+    // Ephemeral: no idbPut.
+    await PeerMgr.sendEnvelope(wsId, env);
+  }
+
+  async function _sendSignal(wsId, to, payload) {
+    await _sendEnvelope(wsId, "huddle.signal", { to, ...payload });
+  }
+
+  function _getOrCreatePc(wsId, peerId) {
+    if (_pcs.has(peerId)) return _pcs.get(peerId);
+    const pc = new RTCPeerConnection(RTC_CONFIG);
+
+    // Add local audio
+    if (_localStream) _localStream.getTracks().forEach(t => pc.addTrack(t, _localStream));
+
+    // Trickle ICE — send each candidate as a signal envelope
+    pc.onicecandidate = ({ candidate }) => {
+      if (candidate) _sendSignal(wsId, peerId, { ice: candidate.toJSON() }).catch(() => {});
+    };
+
+    // Incoming remote audio track → play + hook up speaking analyser
+    pc.ontrack = ({ streams }) => {
+      const stream = streams[0];
+      if (!stream) return;
+      // Play audio
+      let audio = document.getElementById("huddle-audio-" + peerId.slice(0, 8));
+      if (!audio) {
+        audio = document.createElement("audio");
+        audio.id = "huddle-audio-" + peerId.slice(0, 8);
+        audio.autoplay = true;
+        document.body.appendChild(audio);
+      }
+      audio.srcObject = stream;
+      // Speaking analyser
+      if (_audioCtx) {
+        const source   = _audioCtx.createMediaStreamSource(stream);
+        const analyser = _audioCtx.createAnalyser();
+        analyser.fftSize = 256;
+        source.connect(analyser);
+        _analysers.set(peerId, { analyser, data: new Uint8Array(analyser.frequencyBinCount), speaking: false });
+        _remoteAudios.set(peerId, audio);
+      }
+    };
+
+    pc.onconnectionstatechange = () => {
+      if (pc.connectionState === "failed" || pc.connectionState === "closed") {
+        _pcs.delete(peerId);
+      }
+    };
+
+    _pcs.set(peerId, pc);
+    return pc;
+  }
+
+  function _removePeer(peerId) {
+    const pc = _pcs.get(peerId);
+    if (pc) { pc.close(); _pcs.delete(peerId); }
+    const audio = _remoteAudios.get(peerId);
+    if (audio) { audio.remove(); _remoteAudios.delete(peerId); }
+    const a = _analysers.get(peerId);
+    if (a) { try { a.analyser.disconnect(); } catch (_) {} _analysers.delete(peerId); }
+    const idx = _participants.findIndex(p => p.id === peerId);
+    if (idx !== -1) _participants.splice(idx, 1);
+  }
+
+  function _startSpeakTimer() {
+    _speakTimer = setInterval(() => {
+      for (const [peerId, { analyser, data, speaking }] of _analysers) {
+        analyser.getByteFrequencyData(data);
+        const vol = data.reduce((a, b) => a + b, 0) / data.length;
+        const isSpeaking = vol > 12;
+        if (isSpeaking !== speaking) {
+          _analysers.get(peerId).speaking = isSpeaking;
+          const av = document.getElementById("huddle-av-" + peerId.slice(0, 12));
+          if (av) av.classList.toggle("speaking", isSpeaking);
+        }
+      }
+    }, 150);
+  }
+
+  function _cleanup() {
+    for (const peerId of [..._pcs.keys()]) _removePeer(peerId);
+    _pcs.clear();
+    if (_localStream) { _localStream.getTracks().forEach(t => t.stop()); _localStream = null; }
+    if (_audioCtx) { _audioCtx.close().catch(() => {}); _audioCtx = null; }
+    if (_speakTimer) { clearInterval(_speakTimer); _speakTimer = null; }
+    _participants = [];
+    _ws = null;
+    _muted = false;
+  }
+
+  // ── Public API ─────────────────────────────────────────────
+
+  return {
+    get active()       { return _ws !== null; },
+    get muted()        { return _muted; },
+    get participants() { return _participants; },
+    get wsId()         { return _ws; },
+
+    /** Join (or start) the workspace huddle. */
+    async join(wsId) {
+      if (_ws) await this.leave();
+      let stream;
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+      } catch (e) {
+        alert("Microphone access denied. Please allow microphone access to use huddles.");
+        return;
+      }
+      _ws          = wsId;
+      _localStream = stream;
+      _muted       = false;
+      _participants = [];
+      _audioCtx    = new AudioContext();
+      _startSpeakTimer();
+
+      // Add self to participant list
+      const current = State.current;
+      const myId = bytesToB64Url(State.identity.pubkey);
+      const me = current && current.members.find(m => m.id === myId);
+      if (me) _participants.push({ id: me.id, name: me.name });
+
+      await _sendEnvelope(wsId, "huddle.join", {});
+      render();
+    },
+
+    /** Leave the huddle. */
+    async leave() {
+      if (!_ws) return;
+      const wsId = _ws;
+      await _sendEnvelope(wsId, "huddle.leave", {}).catch(() => {});
+      _cleanup();
+      render();
+    },
+
+    /** Toggle microphone mute. */
+    toggleMute() {
+      _muted = !_muted;
+      if (_localStream) _localStream.getAudioTracks().forEach(t => { t.enabled = !_muted; });
+      render();
+    },
+
+    // ── Dispatch hooks ─────────────────────────────────────
+
+    /** Called when a huddle.join envelope arrives from another peer. */
+    async onJoin(wsId, env) {
+      // Only act if we're already in the huddle for this workspace.
+      if (_ws !== wsId) return;
+      const current = State.current;
+      if (!current || current.meta.id !== wsId) return;
+      const peerId = env.from;
+      const myId   = bytesToB64Url(State.identity.pubkey);
+      if (peerId === myId) return;
+
+      // Add to participants list if not already there
+      const member = current.members.find(m => m.id === peerId);
+      if (member && !_participants.find(p => p.id === peerId)) {
+        _participants.push({ id: member.id, name: member.name });
+      }
+
+      // We are the offerer — create and send an offer
+      const pc    = _getOrCreatePc(wsId, peerId);
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+      // Trickle ICE: send offer SDP immediately, candidates will follow
+      await _sendSignal(wsId, peerId, { sdp_type: "offer", sdp: pc.localDescription.sdp });
+      render();
+    },
+
+    /** Called when a huddle.leave arrives. */
+    onLeave(wsId, env) {
+      if (_ws !== wsId) return;
+      const peerId = env.from;
+      _removePeer(peerId);
+      if (State.view === "workspace") render();
+    },
+
+    /** Called when a huddle.signal arrives. */
+    async onSignal(wsId, env, inner) {
+      // Only process if we're in this huddle AND this signal is addressed to us.
+      if (_ws !== wsId) return;
+      const myId = bytesToB64Url(State.identity.pubkey);
+      if (inner.to !== myId) return;
+      const peerId = env.from;
+      const pc     = _getOrCreatePc(wsId, peerId);
+
+      if (inner.sdp_type === "offer") {
+        await pc.setRemoteDescription({ type: "offer", sdp: inner.sdp });
+        const answer = await pc.createAnswer();
+        await pc.setLocalDescription(answer);
+        await _sendSignal(wsId, peerId, { sdp_type: "answer", sdp: pc.localDescription.sdp });
+      } else if (inner.sdp_type === "answer") {
+        if (pc.signalingState === "have-local-offer") {
+          await pc.setRemoteDescription({ type: "answer", sdp: inner.sdp });
+        }
+      } else if (inner.ice) {
+        await pc.addIceCandidate(inner.ice).catch(() => {});
+      }
+    },
+
+    /** Render the huddle bar HTML for the active workspace. */
+    renderBar(current) {
+      if (_ws !== current.meta.id) return "";
+      const myId = bytesToB64Url(State.identity.pubkey);
+      return `
+        <div class="huddle-bar" id="huddle-bar">
+          <span class="huddle-label">🎙 Live</span>
+          <div class="huddle-avatars">
+            ${_participants.map(p => `
+              <div class="huddle-avatar${p.id === myId ? "" : ""}"
+                   id="huddle-av-${escapeHTML(p.id.slice(0, 12))}"
+                   style="background: ${avatarColorFor(p.id)}"
+                   title="${escapeHTML(p.name)}">${escapeHTML(initials(p.name))}</div>
+            `).join("")}
+          </div>
+          <div class="huddle-actions">
+            <button class="icon-btn ${_muted ? "huddle-muted" : ""}" id="btn-huddle-mute"
+                    title="${_muted ? "Unmute" : "Mute"}">🎤</button>
+            <button id="btn-huddle-leave">Leave</button>
+          </div>
+        </div>
+      `;
+    }
+  };
+})();
+
+/* ------------------------------------------------------------
  *  §13  Boot
  * ------------------------------------------------------------ */
 // Debug hook: when the URL carries ?debug=1, expose every module on
@@ -10475,6 +10802,8 @@ if (/[?&]debug=1/.test(location.search)) {
     // Slice 8
     BridgeTransport, BridgeMgr,
     detectBridge, openBridgeFpConfirmModal, showBridgeFpMismatchModal,
+    // v2
+    HuddleMgr,
     // v1.1
     sendDeviceAdd, sendDeviceRevoke, handleSelfRevocation,
     openDevicePairInitiatorModal, openDevicePairJoinerModal,
