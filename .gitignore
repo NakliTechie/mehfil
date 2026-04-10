@@ -9,3 +9,8 @@
 !PROTOCOL.md
 !docs/
 !docs/*.md
+!guide/
+!guide/.gitignore
+!guide/index.html
+!guide/img/
+!guide/img/*.png

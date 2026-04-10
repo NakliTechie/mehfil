@@ -2376,8 +2376,9 @@ function renderLanding() {
           <button id="btn-restore">I have a backup file</button>
         </div>
         ${State.workspaces.length ? renderWorkspaceList() : ""}
-        <p class="sub" style="margin-top: 22px; font-size: 12px;">
+        <p class="sub" style="margin-top: 22px; font-size: 12px; display: flex; gap: 16px; justify-content: center;">
           <a id="link-lost">What if I lose my key?</a>
+          <a href="guide/index.html" target="_blank" style="color: var(--accent);">User guide ↗</a>
         </p>
       </div>
     </div>
@@ -3821,6 +3822,7 @@ function renderSettingsModal() {
     <div class="card" style="max-width: 540px; max-height: calc(100vh - 60px); overflow-y: auto;">
       <div class="row" style="margin-bottom: 4px;">
         <h1 style="margin: 0; font-size: 20px; flex: 1;">Settings</h1>
+        <a href="guide/index.html" target="_blank" style="font-size: 12px; color: var(--accent); text-decoration: none; margin-right: 10px; opacity: 0.75;" title="Open user guide">Guide ↗</a>
         <button class="icon-btn" id="settings-close" style="font-size: 18px; padding: 2px 7px;">✕</button>
       </div>
       <div class="settings-tabs">
