@@ -2,7 +2,7 @@
 
 Browser-native, local-first team chat. Single HTML file. No accounts. No central server. Messages are end-to-end encrypted, signed by the sender, and stored on the devices of workspace members — never in the cloud.
 
-> **Status: v1.1 shipped.** All 8 slices plus multi-device identity are complete. See [PENDING.md](PENDING.md) for what's deferred to v2.
+> **Status: v1.1 shipped.** All 8 slices plus multi-device identity are complete.
 
 ## What works
 
@@ -150,7 +150,6 @@ Two companion services live in separate repos:
 | `MEHFIL-SPEC.md` | v1 specification — the authoritative protocol description |
 | `MEHFIL-WALKTHROUGHS.md` | 35 testable user-flow scenarios across 8 phases |
 | `PROTOCOL.md` | Pinned implementation choices (msgpack, envelope format, key hierarchy, etc.) |
-| `PENDING.md` | All deferred items, open bugs, v2 backlog |
 | `SECURITY.md` | Threat model, cryptographic primitives, vulnerability reporting |
 | `docs/relay-setup.md` | How to deploy the Cloudflare Workers relay |
 | `docs/bridge-setup.md` | How to install and run the LAN bridge |
