@@ -16,6 +16,14 @@ Browser-native, local-first team chat. Single HTML file. No accounts. No central
 - Per-channel drafts persist across page reloads
 - Emoji reactions (`👍 ❤️ 😂 😮 😢 🙏 👀 ✅`), @mentions with autocomplete, threaded replies
 - File attachments up to 25 MB (encrypted in OPFS, chunked over WebRTC, 500 MB per-workspace quota)
+- Unread state — sidebar badges + bold channel names, `@N` mention badge, "New" divider in the message list, scroll-to-divider on channel open
+- Browser notifications (foreground tab only — no push server) with per-channel mute + workspace-wide Do Not Disturb; @mentions always break through
+- Pin any message to its channel (📌 hover action); pinned messages listed in a channel-header pill with jump-to
+- Slash commands with autocomplete — `/me`, `/shrug`, `/dm @name`, `/goto #name`, `/mute`, `/unmute`, `/dnd [on|off]`, `/pins`, `/invite`, `/call` (aka `/huddle`), `/search [q]`, `/topic <text>`, `/help`. Channel topics render next to the channel name.
+- ⌘K quick switcher — unified palette for channels, DMs, and members (type to filter, Enter to jump). Message search moved to ⌘⇧F.
+- Clickable message timestamps copy a `#msg/<ws>/<ch>/<msgId>` deep link; pasting one opens the workspace, switches channel, scrolls to the message, and flashes it.
+- Forward any message to another channel (📨 hover action) — the target channel's composer is prefilled as a blockquote attributed to the author; author reviews before sending.
+- Keyboard shortcuts: `⌘K` switcher · `⌘⇧F` search · `⌘⇧P` pins · `⌘⇧M` mute · `⌘⇧D` DND · `⌘,` settings · `↑` edit last · `?` or `⌘/` for the full list.
 
 **Security**
 - Ed25519 signing + X25519 ECDH + AES-256-GCM, all via native Web Crypto
