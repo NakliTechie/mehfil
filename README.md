@@ -24,6 +24,9 @@ Browser-native, local-first team chat. Single HTML file. No accounts. No central
 - Clickable message timestamps copy a `#msg/<ws>/<ch>/<msgId>` deep link; pasting one opens the workspace, switches channel, scrolls to the message, and flashes it.
 - Forward any message to another channel (📨 hover action) — the target channel's composer is prefilled as a blockquote attributed to the author; author reviews before sending.
 - Keyboard shortcuts: `⌘K` switcher · `⌘⇧F` search · `⌘⇧P` pins · `⌘⇧M` mute · `⌘⇧D` DND · `⌘,` settings · `↑` edit last · `?` or `⌘/` for the full list.
+- Custom status (emoji + text) with preset picker; broadcast on `presence.update`, displayed in the People sidebar.
+- Announcement channels — admins-only posting; sidebar `📢` icon; non-admins see a read-only banner; receive-side filter drops non-admin messages so forgery is cheap to defend.
+- User groups — named sets of members (Settings → Admin). `@groupname` in a message expands to notify every group member and renders as an accent pill.
 
 **Security**
 - Ed25519 signing + X25519 ECDH + AES-256-GCM, all via native Web Crypto

@@ -419,6 +419,15 @@
     border-radius: 4px;
     font-weight: 500;
   }
+  .mention-group {
+    background: color-mix(in srgb, var(--accent) 16%, transparent);
+    color: var(--accent);
+    padding: 0 6px;
+  }
+  .mention-group.mention-self {
+    background: var(--accent);
+    color: var(--accent-fg);
+  }
 
   .avatar-with-status {
     position: relative;
@@ -713,6 +722,44 @@
     opacity: 0; transition: opacity 0.14s;
   }
   .permalink-tip.show { opacity: 1; }
+  .composer-locked {
+    padding: 14px 18px;
+    background: var(--bg-sunken);
+    color: var(--fg-dim);
+    border-top: 1px solid var(--line);
+    font-size: 13px;
+    text-align: center;
+    cursor: default;
+  }
+  .custom-status {
+    font-size: 11px;
+    color: var(--fg-dim);
+    font-style: italic;
+    margin-left: 4px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    max-width: 120px;
+    display: inline-block;
+    vertical-align: bottom;
+  }
+  .me-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex: 1;
+    min-width: 0;
+    padding: 4px 6px;
+    border-radius: 6px;
+    cursor: pointer;
+    transition: background 0.08s;
+  }
+  .me-row:hover { background: var(--bg-elev); }
+  .me-custom {
+    font-size: 11px; color: var(--accent); font-style: italic;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    max-width: 140px;
+  }
   .msg-text { white-space: pre-wrap; word-wrap: break-word; }
 
   .composer {
@@ -2263,6 +2310,7 @@ const Workspace = {
             const chRec = {
               id: inner.id, name: inner.name, topic: inner.topic || "",
               private: !!inner.private, dm: !!inner.dm, dm_with: null,
+              announce: !!inner.announce,   // Slice F1-B
               members: inner.members || [],
               created_at: env.ts
             };
@@ -2420,12 +2468,20 @@ const Workspace = {
  * try to be clever about partial matches — the composer autocomplete
  * is the affordance that helps users type names correctly.
  */
-function parseMentions(body, members) {
+function parseMentions(body, members, groups = []) {
   const re = /@([\p{L}\p{N}_-]+)/gu;
   const found = new Set();
   let m;
   while ((m = re.exec(body)) !== null) {
     const name = m[1];
+    // Slice F1-C: group-name matches expand to the group's member ids.
+    // Groups take precedence over same-named members because groups are
+    // created intentionally and name collisions are the author's problem.
+    const group = groups.find(g => g.name === name);
+    if (group) {
+      for (const uid of (group.memberIds || [])) found.add(uid);
+      continue;
+    }
     const member = members.find(mem => mem.name === name);
     if (member) found.add(member.id);
   }
@@ -2841,10 +2897,12 @@ function renderWorkspace() {
             const showBadge = u.count > 0 && !isActive;
             const isMention = u.mentions > 0 && !isActive;
             const isMuted = (current.meta.muted_channels || []).includes(c.id);
+            const chHash = c.announce ? "📢" : (c.private ? "🔒" : "#");
+            const chTitleSuffix = c.announce ? " (announcement channel)" : "";
             return `
-            <div class="ch-item ${isActive ? "active" : ""} ${showBadge ? "unread" : ""} ${isMuted ? "muted" : ""}" data-ch="${escapeHTML(c.id)}">
+            <div class="ch-item ${isActive ? "active" : ""} ${showBadge ? "unread" : ""} ${isMuted ? "muted" : ""}" data-ch="${escapeHTML(c.id)}" title="${escapeHTML(c.name + chTitleSuffix)}">
               ${showBadge ? `<span class="unread-badge${isMention ? " mention" : ""}" title="${u.count} unread${u.mentions > 0 ? `, ${u.mentions} mention${u.mentions === 1 ? "" : "s"}` : ""}">${isMention ? `@${u.mentions}` : u.count}</span>` : ""}
-              <span class="hash">${c.private ? "🔒" : "#"}</span>${escapeHTML(c.name)}${isMuted ? ` <span class="muted-mark" title="Muted">🔕</span>` : ""}
+              <span class="hash">${chHash}</span>${escapeHTML(c.name)}${isMuted ? ` <span class="muted-mark" title="Muted">🔕</span>` : ""}
             </div>
           `;}).join("")}
         </div>
@@ -2897,14 +2955,23 @@ function renderWorkspace() {
               // §6: presence entries older than 90s are treated as stale → offline.
               const stale = p && (Date.now() - p.updated_at) > 90_000;
               const status = (p && !stale) ? p.status : "offline";
-              const title = p?.updated_at
-                ? (status === "online" ? "Online" : status === "away" ? "Away" : `Offline (last seen ${formatRelative(p.updated_at)})`)
-                : "Offline";
+              const custom = (p && !stale) ? p.custom : null;
+              const customLabel = custom
+                ? `${custom.emoji ? custom.emoji + " " : ""}${custom.text || ""}`.trim()
+                : "";
+              const title = customLabel
+                ? `${customLabel} · ${status === "online" ? "Online" : status === "away" ? "Away" : "Offline"}`
+                : (p?.updated_at
+                    ? (status === "online" ? "Online" : status === "away" ? "Away" : `Offline (last seen ${formatRelative(p.updated_at)})`)
+                    : "Offline");
               const roleBadge = (m.role === "owner" || m.role === "admin")
                 ? `<span class="role-badge ${m.role === "owner" ? "owner" : "admin"}" style="font-size:9px;padding:1px 5px;margin-left:2px;">${m.role}</span>`
                 : "";
               const proposeBtn = (isAdminViewer && m.id !== myUserId && m.role === "member")
                 ? `<button class="icon-btn" data-sidebar-propose="${escapeHTML(m.id)}" title="Propose as admin" style="font-size:10px;padding:2px 5px;margin-left:auto;opacity:0.55;">★</button>`
+                : "";
+              const customBadge = customLabel
+                ? `<span class="custom-status">${escapeHTML(customLabel).slice(0, 40)}</span>`
                 : "";
               return `
               <div class="ch-item ${m.id === myUserId ? "" : "people-clickable"}" data-pmember="${m.id === myUserId ? "" : escapeHTML(m.id)}" title="${escapeHTML(title)}" style="display: flex; align-items: center; gap: 8px;">
@@ -2912,7 +2979,7 @@ function renderWorkspace() {
                   <div class="avatar" style="width: 20px; height: 20px; font-size: 10px; background: ${avatarColorFor(m.id)}">${escapeHTML(initials(m.name))}</div>
                   <span class="presence-dot ${status}"></span>
                 </div>
-                <span>${escapeHTML(m.name)}${m.id === myUserId ? " <span style='color: var(--fg-dim); font-size: 11px;'>(you)</span>" : ""}${roleBadge}</span>
+                <span style="min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">${escapeHTML(m.name)}${m.id === myUserId ? " <span style='color: var(--fg-dim); font-size: 11px;'>(you)</span>" : ""}${roleBadge} ${customBadge}</span>
                 ${proposeBtn}
               </div>
             `;};
@@ -2952,10 +3019,18 @@ function renderWorkspace() {
           </div>
         </div>
         <div class="sidebar-foot">
-          <div class="avatar" style="background: ${avatarColorFor(me.id)}">${escapeHTML(initials(me.name))}</div>
-          <div class="me-info">
-            <div class="me-name">${escapeHTML(me.name)}</div>
-            <div class="me-fp" title="${escapeHTML(fp)}">${escapeHTML(fp)}</div>
+          <div class="me-row" id="btn-set-status" title="Set a custom status">
+            <div class="avatar" style="background: ${avatarColorFor(me.id)}">${escapeHTML(initials(me.name))}</div>
+            <div class="me-info">
+              <div class="me-name">${escapeHTML(me.name)}</div>
+              ${(() => {
+                const cs = State.identity.custom_status;
+                if (cs && (cs.text || cs.emoji)) {
+                  return `<div class="me-custom">${escapeHTML((cs.emoji || "") + " " + (cs.text || "")).trim().slice(0, 30)}</div>`;
+                }
+                return `<div class="me-fp" title="${escapeHTML(fp)}">${escapeHTML(fp)}</div>`;
+              })()}
+            </div>
           </div>
           <button class="icon-btn${HuddleMgr.active && HuddleMgr.wsId === current.meta.id ? " active" : ""}" id="btn-huddle" title="${HuddleMgr.active && HuddleMgr.wsId === current.meta.id ? "In huddle — click to leave" : "Start a huddle"}">🎙</button>
           <button class="icon-btn" id="btn-settings" title="Settings">⚙</button>
@@ -2994,16 +3069,27 @@ function renderWorkspace() {
           })()}
         </div>
         ${HuddleMgr.renderBar(current)}
-        <div class="composer">
-          <div class="composer-box" id="composer-box">
-            <textarea id="composer" rows="2" placeholder="${composePlaceholder(channel, current)}" autofocus></textarea>
-            <div class="composer-actions">
-              <input type="file" id="attach-input" style="display:none">
-              <button class="icon-btn" id="btn-attach" title="Attach a file">📎</button>
-            </div>
-          </div>
-          <div id="drop-hint" class="drop-hint" style="display:none">Drop the file to attach</div>
-        </div>
+        ${(() => {
+          // Slice F1-B: announcement channels — if you're not an admin,
+          // render a read-only banner in place of the composer.
+          if (channel.announce) {
+            const isAdm = me.role === "owner" || me.role === "admin";
+            if (!isAdm) {
+              return `<div class="composer composer-locked" title="Only admins can post in announcement channels">📢 Only admins can post in this channel.</div>`;
+            }
+          }
+          return `
+            <div class="composer">
+              <div class="composer-box" id="composer-box">
+                <textarea id="composer" rows="2" placeholder="${composePlaceholder(channel, current)}" autofocus></textarea>
+                <div class="composer-actions">
+                  <input type="file" id="attach-input" style="display:none">
+                  <button class="icon-btn" id="btn-attach" title="Attach a file">📎</button>
+                </div>
+              </div>
+              <div id="drop-hint" class="drop-hint" style="display:none">Drop the file to attach</div>
+            </div>`;
+        })()}
       </main>
       ${State.threadOpen ? renderThreadPanel(current, allChannelMessages, myUserId) : ""}
     </div>
@@ -3028,6 +3114,9 @@ function renderWorkspace() {
   document.getElementById("btn-settings").onclick = () => openSettings();
   document.getElementById("btn-invite").onclick = openInviteModal;
   document.getElementById("btn-new-channel").onclick = openCreateChannelModal;
+  // Slice F1-A: click the me-row to open the custom status picker.
+  const $setStatus = document.getElementById("btn-set-status");
+  if ($setStatus) $setStatus.onclick = () => setState({ modal: "status" });
 
   // Slice 4c: gap banner "Try to fetch" button. Walks the visible
   // gap list and broadcasts one resync.request per sender, asking
@@ -3122,8 +3211,10 @@ function renderWorkspace() {
     };
   });
 
-  // Composer wiring
+  // Composer wiring. Skipped entirely for read-only (announcement) channels
+  // where the textarea is replaced by a banner.
   const $composer = document.getElementById("composer");
+  if ($composer) {
   // Restore draft for this channel (if any).
   loadDraft(currentChannel).then(draft => {
     if (draft && !$composer.value) {
@@ -3148,12 +3239,17 @@ function renderWorkspace() {
     const m = upTo.match(/@([\p{L}\p{N}_-]*)$/u);
     if (!m) { closeMentionPopup(); return; }
     const prefix = m[1].toLowerCase();
-    // Filter members whose name starts with the prefix (case-insensitive).
-    // Include self so users can tag themselves (e.g. in a reminder to
-    // themselves); the UI doesn't forbid it.
-    mentionMatches = current.members.filter(mem =>
-      mem.name.toLowerCase().startsWith(prefix)
-    ).slice(0, 6);
+    // Slice F1-C: include user groups in the autocomplete candidates.
+    // Groups render first (they're typically smaller sets with distinct
+    // names), then members.
+    const groupsForAc = current.doc ? WorkspaceDoc.getGroups(current.doc) : [];
+    const groupMatches = groupsForAc
+      .filter(g => g.name.toLowerCase().startsWith(prefix))
+      .map(g => ({ kind: "group", id: g.id, name: g.name, count: (g.memberIds || []).length }));
+    const memberMatches = current.members
+      .filter(mem => mem.name.toLowerCase().startsWith(prefix))
+      .map(mem => ({ kind: "member", id: mem.id, name: mem.name }));
+    mentionMatches = [...groupMatches, ...memberMatches].slice(0, 6);
     if (mentionMatches.length === 0) { closeMentionPopup(); return; }
     if (mentionActiveIdx >= mentionMatches.length) mentionActiveIdx = 0;
     if (!mentionPopup) {
@@ -3161,12 +3257,22 @@ function renderWorkspace() {
       mentionPopup.className = "mention-autocomplete";
       document.body.appendChild(mentionPopup);
     }
-    mentionPopup.innerHTML = mentionMatches.map((mem, i) => `
-      <div class="mention-opt ${i === mentionActiveIdx ? "active" : ""}" data-idx="${i}">
-        <div class="avatar" style="width: 18px; height: 18px; font-size: 9px; background: ${avatarColorFor(mem.id)}">${escapeHTML(initials(mem.name))}</div>
-        <span>${escapeHTML(mem.name)}</span>
-      </div>
-    `).join("");
+    mentionPopup.innerHTML = mentionMatches.map((item, i) => {
+      if (item.kind === "group") {
+        return `
+          <div class="mention-opt ${i === mentionActiveIdx ? "active" : ""}" data-idx="${i}" style="display: flex; gap: 8px; align-items: center;">
+            <span class="switcher-icon plain" style="width: 18px; height: 18px;">👥</span>
+            <span>${escapeHTML(item.name)} <span style="font-size: 10px; color: var(--fg-dim);">· group of ${item.count}</span></span>
+          </div>
+        `;
+      }
+      return `
+        <div class="mention-opt ${i === mentionActiveIdx ? "active" : ""}" data-idx="${i}">
+          <div class="avatar" style="width: 18px; height: 18px; font-size: 9px; background: ${avatarColorFor(item.id)}">${escapeHTML(initials(item.name))}</div>
+          <span>${escapeHTML(item.name)}</span>
+        </div>
+      `;
+    }).join("");
     mentionPopup.querySelectorAll(".mention-opt").forEach(el => {
       el.onmousedown = (ev) => {
         ev.preventDefault();   // keep composer focus
@@ -3370,6 +3476,7 @@ function renderWorkspace() {
       alert("Couldn't attach: " + err.message);
     }
   };
+  }   // end if ($composer) — Slice F1-B read-only composer guard
 
   // Click-to-download handlers for attachments we don't have yet.
   // Triggers a BlobTransfer request to any attached peer. The UI
@@ -3555,6 +3662,7 @@ function renderWorkspace() {
   if (State.modal === "slash-help") renderSlashHelpModal();
   if (State.modal === "shortcuts") renderShortcutsModal();
   if (State.modal === "forward")   renderForwardModal();
+  if (State.modal === "status")    renderStatusModal();
 
   // Scroll to bottom — main channel messages, and the thread panel
   // scroller if it's open. Slice U1: if an unread divider is present
@@ -3715,10 +3823,12 @@ function renderMessage(m, members, myUserId, opts = {}) {
   // is already shown in msg-meta above, so we just render the action
   // text italic below (mentions still processed).
   const isAction = typeof m.body === "string" && m.body.startsWith("/me ");
+  // Slice F1-C: pass the current group list so group mentions render as pills.
+  const groups = State.current?.doc ? WorkspaceDoc.getGroups(State.current.doc) : [];
   const bodyHtml = isAction
-    ? `<div class="msg-text msg-action-body" data-msg-text="${escapeHTML(m.id)}"><em>${renderMessageBody(m.body.slice(4), m.mentions, members)}</em></div>`
+    ? `<div class="msg-text msg-action-body" data-msg-text="${escapeHTML(m.id)}"><em>${renderMessageBody(m.body.slice(4), m.mentions, members, groups)}</em></div>`
     : (m.body
-        ? `<div class="msg-text" data-msg-text="${escapeHTML(m.id)}">${renderMessageBody(m.body, m.mentions, members)}</div>`
+        ? `<div class="msg-text" data-msg-text="${escapeHTML(m.id)}">${renderMessageBody(m.body, m.mentions, members, groups)}</div>`
         : "");
   const reactionsHtml = renderReactionPills(m, members, myUserId);
 
@@ -3858,15 +3968,22 @@ function renderReactionPills(m, members, myUserId) {
  * constructed from pre-escaped substrings so no raw HTML ever hits the
  * output — XSS-safe (spec §15.2 "XSS via message rendering").
  */
-function renderMessageBody(body, mentions, members) {
-  if (!mentions || mentions.length === 0) return escapeHTML(body);
+function renderMessageBody(body, mentions, members, groups = []) {
+  // Group names we should render as pills — present when groups exist.
+  const groupByName = new Map();
+  for (const g of groups) groupByName.set(g.name, g);
+  if ((!mentions || mentions.length === 0) && groupByName.size === 0) {
+    return escapeHTML(body);
+  }
   // Resolve each mention id to a member record (keeps the rendering fast
   // even with dozens of members in scope).
   const mentionById = new Map();
-  for (const mid of mentions) {
+  for (const mid of (mentions || [])) {
     const member = members.find(m => m.id === mid);
     if (member) mentionById.set(mid, member);
   }
+  const myUid = bytesToB64Url(State.identity.pubkey);
+  const iAmInGroup = (g) => (g.memberIds || []).includes(myUid);
   // Regex: @ followed by word chars (letters, digits, _, -, .) up to
   // whatever the longest member name needs. Unicode letters are handled
   // via the 'u' flag. We deliberately don't match trailing punctuation
@@ -3881,10 +3998,18 @@ function renderMessageBody(body, mentions, members) {
     const end   = start + match[0].length;
     // Append the text before this match, escaped.
     out += escapeHTML(body.slice(last, start));
+    // Slice F1-C: group mention — render with group-pill styling. Highlights
+    // when the viewer is a member of the group.
+    const group = groupByName.get(name);
+    if (group) {
+      out += `<span class="mention mention-group${iAmInGroup(group) ? " mention-self" : ""}" title="Group · ${(group.memberIds||[]).length} members">@${escapeHTML(name)}</span>`;
+      last = end;
+      continue;
+    }
     // Is this mention in the signed mentions list?
     const member = [...mentionById.values()].find(mem => mem.name === name);
     if (member) {
-      out += `<span class="mention" style="background: ${member.id === bytesToB64Url(State.identity.pubkey) ? "var(--accent)" : "transparent"}; color: ${member.id === bytesToB64Url(State.identity.pubkey) ? "var(--accent-fg)" : avatarColorFor(member.id)};">@${escapeHTML(name)}</span>`;
+      out += `<span class="mention" style="background: ${member.id === myUid ? "var(--accent)" : "transparent"}; color: ${member.id === myUid ? "var(--accent-fg)" : avatarColorFor(member.id)};">@${escapeHTML(name)}</span>`;
     } else {
       // Not a validated mention — render as literal text.
       out += escapeHTML(match[0]);
@@ -4072,10 +4197,19 @@ function renderBackupBanner() {
 async function sendMessageNow(body, opts = {}) {
   const { current } = State;
   const ch = current.channels.find(c => c.id === State.currentChannel);
+  const _myId = bytesToB64Url(State.identity.pubkey);
+  // Slice F1-B: gate sends to announcement channels to admin/owner.
+  // This is a local UX guard — receivers also drop non-admin messages
+  // on announce channels (see message.create case in EnvelopeDispatch).
+  if (ch && ch.announce) {
+    const me = current.members.find(m => m.id === _myId);
+    if (!(me?.role === "owner" || me?.role === "admin")) {
+      throw new Error("Only admins can post in this channel.");
+    }
+  }
   // For group DMs (dm:true, no dm_with) use our own per-sender key when
   // available (sender-keys pattern). Fall back to the shared channel key
   // for older group DMs or channels that are not group DMs.
-  const _myId = bytesToB64Url(State.identity.pubkey);
   const _isGroupDm = ch.dm && !ch.dm_with;
   const channelKey = (_isGroupDm && current.channelKeys[ch.id + ":" + _myId])
     ? current.channelKeys[ch.id + ":" + _myId]
@@ -4083,7 +4217,10 @@ async function sendMessageNow(body, opts = {}) {
 
   // Parse @mentions out of the body so the envelope carries a canonical
   // list of tagged user_ids. The body text itself is unchanged.
-  const mentions = parseMentions(body, current.members);
+  // Slice F1-C: include groups so @groupname tokens expand to their
+  // member ids in the signed mentions list.
+  const _groupsForMentions = current.doc ? WorkspaceDoc.getGroups(current.doc) : [];
+  const mentions = parseMentions(body, current.members, _groupsForMentions);
 
   // Thread reply? Callers can pass an explicit threadId; otherwise we
   // default to State.threadOpen so the thread-panel composer calls the
@@ -4276,6 +4413,93 @@ const SHORTCUTS = [
   { group: "Misc",       keys: "⌘/",        desc: "This help overlay (works anywhere)" },
   { group: "Misc",       keys: "Esc",       desc: "Close overlays and pickers" },
 ];
+
+/* ------------------------------------------------------------
+ *  Slice F1-A  Custom status picker
+ *  Preset emoji + text combinations inspired by Slack's defaults,
+ *  plus a free-form text field. Selecting a preset fills the form
+ *  but doesn't auto-submit, so the user can tweak before saving.
+ *  Status is broadcast via presence.update the moment it's saved.
+ * ------------------------------------------------------------ */
+const STATUS_PRESETS = [
+  { emoji: "📅", text: "In a meeting" },
+  { emoji: "🎯", text: "Focused" },
+  { emoji: "🚗", text: "Commuting" },
+  { emoji: "🍽️", text: "At lunch" },
+  { emoji: "🏖️", text: "On vacation" },
+  { emoji: "🤒", text: "Out sick" },
+  { emoji: "🧑‍💻", text: "Working remotely" },
+];
+
+function renderStatusModal() {
+  if (document.querySelector('.modal-bg[data-status]')) return;
+  const cur = State.identity.custom_status || { emoji: "", text: "" };
+
+  const wrap = document.createElement("div");
+  wrap.className = "modal-bg";
+  wrap.dataset.status = "1";
+  wrap.innerHTML = `
+    <div class="card" style="max-width: 420px;">
+      <div class="row" style="margin-bottom: 12px;">
+        <h1 style="margin: 0; font-size: 18px; flex: 1;">Set a status</h1>
+        <button class="icon-btn" id="status-close" style="font-size: 18px; padding: 2px 7px;">✕</button>
+      </div>
+      <div class="row" style="gap: 8px; margin-bottom: 14px;">
+        <input type="text" id="status-emoji" maxlength="8" placeholder="🎯" style="width: 48px; text-align: center; font-size: 18px;" value="${escapeHTML(cur.emoji || "")}">
+        <input type="text" id="status-text" maxlength="80" placeholder="What's happening?" style="flex: 1; font-size: 14px;" value="${escapeHTML(cur.text || "")}">
+      </div>
+      <div style="font-size: 11px; color: var(--fg-dim); text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 8px;">Suggestions</div>
+      <div style="display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 16px;">
+        ${STATUS_PRESETS.map((p, i) => `
+          <button class="status-preset" data-preset="${i}" style="font-size: 12px; padding: 5px 10px; background: var(--bg-sunken); border: 1px solid var(--line); border-radius: 14px; cursor: pointer; color: var(--fg);">
+            ${p.emoji} ${escapeHTML(p.text)}
+          </button>
+        `).join("")}
+      </div>
+      <div class="row" style="gap: 8px;">
+        ${cur.text || cur.emoji
+          ? `<button class="danger" id="status-clear">Clear status</button>`
+          : ""}
+        <div class="grow"></div>
+        <button id="status-cancel">Cancel</button>
+        <button class="primary" id="status-save">Save</button>
+      </div>
+    </div>
+  `;
+  document.body.appendChild(wrap);
+  const $emoji = wrap.querySelector("#status-emoji");
+  const $text  = wrap.querySelector("#status-text");
+  wrap.querySelector("#status-close").onclick  = () => { wrap.remove(); closeModal(); };
+  wrap.querySelector("#status-cancel").onclick = () => { wrap.remove(); closeModal(); };
+  wrap.onclick = (e) => { if (e.target === wrap) { wrap.remove(); closeModal(); } };
+  wrap.querySelectorAll("[data-preset]").forEach(btn => {
+    btn.onclick = () => {
+      const p = STATUS_PRESETS[parseInt(btn.dataset.preset, 10)];
+      $emoji.value = p.emoji;
+      $text.value = p.text;
+      $text.focus();
+    };
+  });
+  const $clear = wrap.querySelector("#status-clear");
+  if ($clear) $clear.onclick = async () => {
+    $clear.disabled = true;
+    await setCustomStatus(null);
+    wrap.remove();
+    setState({ modal: null });
+  };
+  wrap.querySelector("#status-save").onclick = async () => {
+    const emoji = $emoji.value.trim();
+    const text  = $text.value.trim();
+    if (!emoji && !text) {
+      await setCustomStatus(null);
+    } else {
+      await setCustomStatus({ emoji, text });
+    }
+    wrap.remove();
+    setState({ modal: null });
+  };
+  ($text.value ? $text : $emoji).focus();
+}
 
 /* ------------------------------------------------------------
  *  Slice K1  Forward a message to another channel
@@ -5041,6 +5265,24 @@ function renderSettingsAdminTab(current, me) {
     `;
   }).join("");
 
+  // Slice F1-C: user groups.
+  const groups = current.doc ? WorkspaceDoc.getGroups(current.doc) : [];
+  const groupRows = groups.length === 0
+    ? `<div style="color: var(--fg-dim); font-size: 12px; padding: 8px 0;">No user groups yet. Groups expand to their members when mentioned.</div>`
+    : groups.map(g => {
+        const memberNames = (g.memberIds || [])
+          .map(uid => current.members.find(mm => mm.id === uid)?.name || "?")
+          .join(", ");
+        return `
+          <div class="relay-row">
+            <div class="relay-row-info">
+              <div style="font-size: 13px; font-weight: 500;">@${escapeHTML(g.name)} <span style="color:var(--fg-dim); font-weight: 400; font-size: 11px;">· ${(g.memberIds||[]).length} members</span></div>
+              <div style="font-size: 11px; color: var(--fg-dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">${escapeHTML(memberNames)}</div>
+            </div>
+            <button class="danger" data-remove-group="${escapeHTML(g.id)}" style="font-size: 11px; padding: 4px 8px;">Delete</button>
+          </div>`;
+      }).join("");
+
   return `
     <div class="field">
       <label>Members</label>
@@ -5052,6 +5294,38 @@ function renderSettingsAdminTab(current, me) {
         <div id="admin-promo-list">${promoCards}</div>
       </div>
     ` : ""}
+    <div class="field">
+      <label>User groups</label>
+      <div style="font-size: 12px; color: var(--fg-mute); margin-bottom: 8px;">
+        Named sets of members. Mentioning <code>@groupname</code> notifies everyone in the group.
+      </div>
+      <div id="group-list">${groupRows}</div>
+      <button id="btn-add-group" style="margin-top: 8px; font-size: 12px; padding: 6px 12px;">+ Create group</button>
+      <div id="group-form" style="display: none; margin-top: 10px; padding: 12px; background: var(--bg-sunken); border-radius: 8px;">
+        <div class="field" style="margin-bottom: 8px;">
+          <label>Name</label>
+          <input type="text" id="group-name" placeholder="e.g. engineering" maxlength="40" style="font-size: 13px;">
+        </div>
+        <div class="field" style="margin-bottom: 8px;">
+          <label>Members</label>
+          <div id="group-member-list" style="max-height: 180px; overflow-y: auto; padding: 4px 0;">
+            ${current.members.map(mm => `
+              <label style="display: flex; align-items: center; gap: 8px; padding: 3px 0; cursor: pointer;">
+                <input type="checkbox" class="group-member-cb" data-mid="${escapeHTML(mm.id)}">
+                <div class="avatar" style="width: 18px; height: 18px; font-size: 9px; background: ${avatarColorFor(mm.id)}">${escapeHTML(initials(mm.name))}</div>
+                <span style="font-size: 12px;">${escapeHTML(mm.name)}</span>
+              </label>
+            `).join("")}
+          </div>
+        </div>
+        <div class="err" id="group-err"></div>
+        <div class="row">
+          <button id="group-cancel">Cancel</button>
+          <div class="grow"></div>
+          <button class="primary" id="group-save">Create group</button>
+        </div>
+      </div>
+    </div>
     <div class="err" id="admin-err"></div>
   `;
 }
@@ -5338,6 +5612,73 @@ function wireSettingsTab(tab, wrap, current, me, wsName) {
           setState({ modal: null });
         } catch (e) {
           $err.textContent = e.message;
+          btn.disabled = false;
+        }
+      };
+    });
+
+    // Slice F1-C: user groups — create/delete.
+    const $addGroup = wrap.querySelector("#btn-add-group");
+    const $groupForm = wrap.querySelector("#group-form");
+    if ($addGroup) {
+      $addGroup.onclick = () => {
+        $groupForm.style.display = "block";
+        $addGroup.style.display = "none";
+      };
+    }
+    wrap.querySelector("#group-cancel")?.addEventListener("click", () => {
+      $groupForm.style.display = "none";
+      $addGroup.style.display = "";
+      wrap.querySelector("#group-name").value = "";
+      wrap.querySelectorAll(".group-member-cb").forEach(cb => { cb.checked = false; });
+      wrap.querySelector("#group-err").textContent = "";
+    });
+    wrap.querySelector("#group-save")?.addEventListener("click", async () => {
+      const $ge = wrap.querySelector("#group-err");
+      $ge.textContent = "";
+      const name = wrap.querySelector("#group-name").value.trim();
+      if (!name) { $ge.textContent = "Name is required."; return; }
+      if (!/^[a-z0-9][a-z0-9-]{0,39}$/i.test(name)) {
+        $ge.textContent = "Letters, digits, and hyphens only.";
+        return;
+      }
+      const existing = WorkspaceDoc.getGroups(current.doc);
+      if (existing.some(g => g.name.toLowerCase() === name.toLowerCase())) {
+        $ge.textContent = "A group with this name already exists.";
+        return;
+      }
+      const memberIds = [...wrap.querySelectorAll(".group-member-cb:checked")].map(cb => cb.getAttribute("data-mid"));
+      if (memberIds.length === 0) { $ge.textContent = "Pick at least one member."; return; }
+      wrap.querySelector("#group-save").disabled = true;
+      try {
+        const group = {
+          id: bytesToB64Url(Crypto.rand(8)),
+          name,
+          memberIds,
+          createdBy: me.id,
+          createdAt: Date.now(),
+        };
+        const update = WorkspaceDoc.addGroup(current.doc, group);
+        await sendWorkspacePatch(current, update);
+        wrap.remove();
+        openSettings("admin");
+      } catch (e) {
+        $ge.textContent = e.message;
+        wrap.querySelector("#group-save").disabled = false;
+      }
+    });
+    wrap.querySelectorAll("[data-remove-group]").forEach(btn => {
+      btn.onclick = async () => {
+        const groupId = btn.dataset.removeGroup;
+        if (!confirm("Delete this group? Past mentions keep their effect; future @groupname stops expanding.")) return;
+        btn.disabled = true;
+        try {
+          const update = WorkspaceDoc.removeGroup(current.doc, groupId);
+          await sendWorkspacePatch(current, update);
+          wrap.remove();
+          openSettings("admin");
+        } catch (e) {
+          alert("Delete failed: " + e.message);
           btn.disabled = false;
         }
       };
@@ -5685,6 +6026,9 @@ function openCreateChannelModal() {
   // always included implicitly.
   const myUserId = bytesToB64Url(State.identity.pubkey);
   const others = State.current.members.filter(m => m.id !== myUserId && m.x25519_pub);
+  // Slice F1-B: only owners/admins can mark channels as announcement-only.
+  const me = State.current.members.find(m => m.id === myUserId);
+  const isAdminUser = me && (me.role === "owner" || me.role === "admin");
   wrap.innerHTML = `
     <div class="card" style="max-width: 460px;">
       <h1>Create a channel</h1>
@@ -5704,6 +6048,16 @@ function openCreateChannelModal() {
           <span>Private channel</span>
         </label>
       </div>
+      ${isAdminUser ? `
+      <div class="field">
+        <label style="display: flex; align-items: center; gap: 8px; cursor: pointer;">
+          <input type="checkbox" id="ch-announce">
+          <span>Announcement channel</span>
+        </label>
+        <div style="font-size: 11px; color: var(--fg-dim); margin-left: 24px; margin-top: 2px;">
+          Only admins can post. Everyone else reads.
+        </div>
+      </div>` : ""}
       <div class="field" id="ch-members-field" style="display: none;">
         <label>Who's in it?</label>
         ${others.length === 0 ? `<div class="sub">No other members yet — invite someone first.</div>` : others.map(m => `
@@ -5738,6 +6092,7 @@ function openCreateChannelModal() {
     const name = wrap.querySelector("#ch-name").value.trim();
     const topic = wrap.querySelector("#ch-topic").value.trim();
     const isPrivate = $private.checked;
+    const isAnnounce = !!wrap.querySelector("#ch-announce")?.checked;
     if (!name) { $err.textContent = "Name is required."; return; }
     if (!/^[a-z0-9][a-z0-9-]{0,39}$/i.test(name)) {
       $err.textContent = "Letters, digits, and hyphens only.";
@@ -5760,7 +6115,7 @@ function openCreateChannelModal() {
 
     wrap.querySelector("#ch-create").disabled = true;
     try {
-      const ch = await sendChannelCreate(State.current, name, topic, { isPrivate, memberIds });
+      const ch = await sendChannelCreate(State.current, name, topic, { isPrivate, isAnnounce, memberIds });
       close();
       setState({ currentChannel: ch.id });
     } catch (e) {
@@ -7352,6 +7707,32 @@ const WorkspaceDoc = {
     return doc.getMap("meta").get("relays") || [];
   },
 
+  // ========== User groups (Slice F1-C) ==========
+  // Stored in the Yjs doc so membership syncs to every member via
+  // workspace.patch. Shape: `groups` is a Y.Map keyed by group_id,
+  // each value is `{id, name, memberIds: [...], createdBy, createdAt}`.
+
+  addGroup(doc, group) {
+    return this.mutate(doc, () => {
+      const groups = doc.getMap("groups");
+      groups.set(group.id, JSON.parse(JSON.stringify(group)));
+    });
+  },
+
+  removeGroup(doc, groupId) {
+    return this.mutate(doc, () => {
+      const groups = doc.getMap("groups");
+      if (groups.has(groupId)) groups.delete(groupId);
+    });
+  },
+
+  getGroups(doc) {
+    const groups = doc.getMap("groups");
+    const out = [];
+    groups.forEach((v) => { if (v) out.push({ ...v, memberIds: [...(v.memberIds || [])] }); });
+    return out;
+  },
+
   // ========== Pinned messages (Slice P1 / spec §5.4) ==========
   // Stored in the Yjs doc so pins sync to every member via
   // workspace.patch. Shape: `pins` is a Y.Map keyed by channel_id,
@@ -7755,6 +8136,23 @@ const EnvelopeDispatch = {
   async handle(current, env, inner) {
     switch (env.type) {
       case "message.create":
+        // Slice F1-B: on announcement channels, drop any message whose
+        // sender isn't currently an owner or admin. The sender-side gate
+        // in sendMessageNow is an honest-client UX check; this receive-
+        // side filter keeps the projection clean against forged/stale
+        // senders. Role is computed against our current membership view
+        // so a demoted admin's in-flight messages stop appearing on peers
+        // as soon as the demotion arrives.
+        {
+          const _ch = current.channels.find(c => c.id === env.ch);
+          if (_ch && _ch.announce) {
+            const sender = current.members.find(m => m.id === env.from);
+            if (!(sender?.role === "owner" || sender?.role === "admin")) {
+              console.warn("announce channel: dropping non-admin message", env.id);
+              break;
+            }
+          }
+        }
         // Skip if already projected (can happen when replaying history to a
         // joiner who races their own send).
         if (!current.messages.find(m => m.id === env.id)) {
@@ -7970,6 +8368,7 @@ const EnvelopeDispatch = {
           private: !!inner.private,
           dm: !!inner.dm,   // group DMs carry dm:true in the envelope
           dm_with: null,    // null for group DMs; 1:1 DMs don't use this path
+          announce: !!inner.announce,   // Slice F1-B
           members: inner.members || [],
           created_at: env.ts
         };
@@ -8072,9 +8471,16 @@ const EnvelopeDispatch = {
         // `updated_at` is local wall clock so the stale sweep (§30b
         // below) can flip this entry to "offline" after 90s without
         // depending on the peer's clock.
+        // Slice F1-A: carry custom status (`custom: {text, emoji}`)
+        // when the peer has set one. Optional field — absent in older
+        // builds; defaults to null.
         if (!current.presence) current.presence = {};
+        const custom = (inner.custom && (inner.custom.text || inner.custom.emoji))
+          ? { text: String(inner.custom.text || "").slice(0, 80), emoji: String(inner.custom.emoji || "").slice(0, 8) }
+          : null;
         current.presence[env.from] = {
           status: inner.status,
+          custom,
           updated_at: Date.now()
         };
         break;
@@ -8477,7 +8883,7 @@ async function replayHistory(current, targetUserId) {
  * The envelope is still encrypted under the workspace root key so
  * non-member workspace users can't even see the channel name or topic.
  */
-async function sendChannelCreate(current, name, topic, { isPrivate = false, isDm = false, memberIds = null } = {}) {
+async function sendChannelCreate(current, name, topic, { isPrivate = false, isDm = false, isAnnounce = false, memberIds = null } = {}) {
   const aesKey = await Crypto.genAesKey();
   const rawKey = await Crypto.exportAesRaw(aesKey);
   const chId = bytesToB64Url(Crypto.rand(16));
@@ -8511,6 +8917,7 @@ async function sendChannelCreate(current, name, topic, { isPrivate = false, isDm
       id: chId, name, topic: topic || "",
       private: true,
       dm: isDm,
+      announce: !!isAnnounce,
       members: chosenMembers,
       wrapped_keys,
       wrapper: myUserId   // needed on the receive side to pick the right
@@ -8523,6 +8930,7 @@ async function sendChannelCreate(current, name, topic, { isPrivate = false, isDm
       id: chId, name, topic: topic || "",
       private: false,
       dm: false,
+      announce: !!isAnnounce,
       members: chosenMembers,
       key: rawKey
     };
@@ -8545,6 +8953,7 @@ async function sendChannelCreate(current, name, topic, { isPrivate = false, isDm
   const chRec = {
     id: chId, name, topic: topic || "",
     private: isPrivate, dm: isDm, dm_with: null,
+    announce: !!isAnnounce,
     members: chosenMembers, created_at: env.ts
   };
   current.channels.push(chRec);
@@ -9403,10 +9812,22 @@ async function sendPresence(current, status) {
   if (!current || !State.identity) return;
   const myUserId = bytesToB64Url(State.identity.pubkey);
 
+  // Slice F1-A: include custom status (text + emoji) in the envelope if
+  // the user has set one on this identity. Persisted on the identity
+  // record so it survives reload; cleared via `setCustomStatus(null)`.
+  const cs = State.identity.custom_status;
+  const customPayload = (cs && (cs.text || cs.emoji))
+    ? { text: (cs.text || "").slice(0, 80), emoji: (cs.emoji || "").slice(0, 8) }
+    : null;
+
   // Mirror locally first — even if the broadcast fails (no peer attached),
   // the sidebar should still reflect our own state.
   if (!current.presence) current.presence = {};
-  current.presence[myUserId] = { status, updated_at: Date.now() };
+  current.presence[myUserId] = {
+    status,
+    custom: customPayload,
+    updated_at: Date.now()
+  };
 
   // No peer → nothing to broadcast. The local update above is enough.
   if (!PeerMgr.hasPeers(current.meta.id)) {
@@ -9422,6 +9843,8 @@ async function sendPresence(current, status) {
     // presence counter bumps. The lc_counter is advisory here; since
     // presence envelopes don't go in the envelopes store, a stale
     // counter on reload is harmless (next real envelope will catch up).
+    const inner = { status };
+    if (customPayload) inner.custom = customPayload;
     const env = await Envelope.build({
       workspaceId: meta.id,
       channelId: null,               // workspace-level envelope
@@ -9430,7 +9853,7 @@ async function sendPresence(current, status) {
       signerPubkey: State.identity.pubkey,
       deviceId: meta.device_id,
       type: "presence.update",
-      inner: { status },
+      inner,
       vectorClock: [[myUserId, meta.lc_counter]]
     });
     // NO idbPut — presence is ephemeral (§EPHEMERAL_TYPES).
@@ -9439,6 +9862,29 @@ async function sendPresence(current, status) {
     console.warn("presence build failed:", e);
   }
   if (State.view === "workspace") render();
+}
+
+/**
+ * Slice F1-A: set or clear the current user's custom status. Persists
+ * to the identity record so it survives reload, and broadcasts a fresh
+ * presence heartbeat so peers pick it up without waiting 30s.
+ */
+async function setCustomStatus(status) {
+  if (!State.identity) return;
+  if (status && (status.text || status.emoji)) {
+    State.identity.custom_status = {
+      text: (status.text || "").slice(0, 80),
+      emoji: (status.emoji || "").slice(0, 8),
+      set_at: Date.now(),
+    };
+  } else {
+    delete State.identity.custom_status;
+  }
+  await Identity.save(State.globalDB, State.identity);
+  if (State.current) {
+    const s = document.hasFocus() ? "online" : "away";
+    await sendPresence(State.current, s);
+  }
 }
 
 // Module-level heartbeat state. Cleared on workspace close so a new
@@ -12223,7 +12669,9 @@ if (/[?&]debug=1/.test(location.search)) {
     // Slice Q1
     openQuickSwitcher, buildPermalink, parsePermalinkHash, navigateToPermalink, copyPermalink,
     // Slice K1
-    SHORTCUTS
+    SHORTCUTS,
+    // Slice F1
+    setCustomStatus, STATUS_PRESETS
   };
 }
 
