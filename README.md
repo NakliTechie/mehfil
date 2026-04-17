@@ -2,42 +2,58 @@
 
 Browser-native, local-first team chat. Single HTML file. No accounts. No central server. Messages are end-to-end encrypted, signed by the sender, and stored on the devices of workspace members — never in the cloud.
 
-> **Status: v2 in progress.** Multi-office bridge federation and huddles (WebRTC audio mesh) shipped. Canvas up next.
+> **Status:** v2 + Slack-benchmark feature parity shipped (unread state, notifications, pins, slash commands, ⌘K switcher, permalinks, keyboard shortcuts, custom status, announcement channels, user groups). Canvas next.
 
 ## What works
 
-**Messaging**
+**Messaging core**
 - Create a workspace from a fresh browser, no signup
-- `#general` channel is created automatically; add more with the `+` button
-- Private channels (per-member ECDH key wrapping) and public channels
-- 1:1 DMs — click any member in the People sidebar; channel id is deterministically derived
-- Group DMs — "+ Start group DM" in the sidebar, pick 2+ members; per-sender keys so removing a member only retires their key
-- Edit + delete your own messages (hover to reveal ✎ / 🗑)
-- Per-channel drafts persist across page reloads
-- Emoji reactions (`👍 ❤️ 😂 😮 😢 🙏 👀 ✅`), @mentions with autocomplete, threaded replies
+- `#general` is auto-created; add more with the `+` button
+- Public and private channels (per-member ECDH key wrapping)
+- 1:1 DMs (deterministic channel id) and group DMs (per-sender keys)
+- Edit + delete your own messages (hover ✎ / 🗑)
+- Per-channel drafts persist across reloads
+- Threaded replies, @mentions with autocomplete, 8 emoji reactions (`👍 ❤️ 😂 😮 😢 🙏 👀 ✅`)
 - File attachments up to 25 MB (encrypted in OPFS, chunked over WebRTC, 500 MB per-workspace quota)
-- Unread state — sidebar badges + bold channel names, `@N` mention badge, "New" divider in the message list, scroll-to-divider on channel open
+- Message bodies rendered as plain text — all output escaped, no raw HTML, `@mentions` wrapped only when their user id is in the envelope's signed mentions list
+
+**Attention**
+- Unread state — sidebar badges + bold channel names, purple `@N` mention badge, "New" divider in the message list, scroll-to-divider on channel entry
 - Browser notifications (foreground tab only — no push server) with per-channel mute + workspace-wide Do Not Disturb; @mentions always break through
-- Pin any message to its channel (📌 hover action); pinned messages listed in a channel-header pill with jump-to
-- Slash commands with autocomplete — `/me`, `/shrug`, `/dm @name`, `/goto #name`, `/mute`, `/unmute`, `/dnd [on|off]`, `/pins`, `/invite`, `/call` (aka `/huddle`), `/search [q]`, `/topic <text>`, `/help`. Channel topics render next to the channel name.
-- ⌘K quick switcher — unified palette for channels, DMs, and members (type to filter, Enter to jump). Message search moved to ⌘⇧F.
-- Clickable message timestamps copy a `#msg/<ws>/<ch>/<msgId>` deep link; pasting one opens the workspace, switches channel, scrolls to the message, and flashes it.
-- Forward any message to another channel (📨 hover action) — the target channel's composer is prefilled as a blockquote attributed to the author; author reviews before sending.
-- Keyboard shortcuts: `⌘K` switcher · `⌘⇧F` search · `⌘⇧P` pins · `⌘⇧M` mute · `⌘⇧D` DND · `⌘,` settings · `↑` edit last · `?` or `⌘/` for the full list.
-- Custom status (emoji + text) with preset picker; broadcast on `presence.update`, displayed in the People sidebar.
-- Announcement channels — admins-only posting; sidebar `📢` icon; non-admins see a read-only banner; receive-side filter drops non-admin messages so forgery is cheap to defend.
-- User groups — named sets of members (Settings → Admin). `@groupname` in a message expands to notify every group member and renders as an accent pill.
+- Pin any message to its channel (📌 hover); channel-header pill opens the pins list with Jump-to + Unpin
+
+**Navigation**
+- ⌘K quick switcher — unified palette for channels, DMs, and members (type to filter, Enter to jump; members without an existing DM show as "Start a DM")
+- ⌘⇧F — message search across every workspace you've joined (MiniSearch, `from:name` / `in:#channel` filters)
+- Clickable message timestamps copy `#msg/<ws>/<ch>/<msgId>` deep links; pasting one opens the workspace, switches channel, scrolls to the message, and flashes it
+- Forward any message to another channel (📨 hover) — target composer is prefilled as an attributed blockquote, author reviews before sending
+- Keyboard shortcuts: `⌘K` switcher · `⌘⇧F` search · `⌘⇧P` pins · `⌘⇧M` mute · `⌘⇧D` DND · `⌘,` settings · `⌘T` back to workspace picker · `⌘1–9` switch workspace · `↑` edit last · `?` or `⌘/` for the full list
+
+**Slash commands**
+- `/me <action>`, `/shrug [text]`, `/dm @name`, `/goto #channel`, `/topic <text>`, `/mute`, `/unmute`, `/dnd [on|off]`, `/pins`, `/invite`, `/call` (aka `/huddle`), `/search [q]`, `/help`
+- Autocomplete picker with Tab-to-accept; unknown commands flash an inline error instead of sending
+
+**People + admin**
+- Custom status (emoji + text) with preset picker; broadcast on `presence.update`, visible in the People sidebar and on tooltip
+- Channel topics — `/topic <text>` or the create-channel form; renders next to the channel name, syncs to every member live via `workspace.patch`
+- Announcement channels (📢) — admins-only posting; non-admins see a read-only banner; receive-side filter drops non-admin messages so forgery is cheap to defend
+- User groups — named sets of members (Settings → Admin). `@groupname` expands to notify every group member and renders as an accent pill
+- Member removal with full workspace + channel rekey
+- Promote-by-consensus (2-of-N admin co-signature); role badges on the People sidebar; ★ Propose-as-admin on any member row
+- Export / import workspace as an encrypted `.workspace` file
 
 **Security**
-- Ed25519 signing + X25519 ECDH + AES-256-GCM, all via native Web Crypto
-- Every envelope is signed and padded to an exact 1 KB boundary
+- Ed25519 signing + X25519 ECDH + AES-256-GCM, all via native Web Crypto — no external crypto libs
+- Every envelope is signed and padded to an exact 1 KB boundary; metadata-minimizing by design
 - Unskippable fingerprint + trust-card verification on every invite
+- Bridge fingerprint pinned in the workspace doc; mismatches refuse to connect
 
 **Multi-device identity**
 - One Ed25519 identity, any number of devices
 - Pair a new device with a 6-word code — works in-room or remotely over the relay
 - Device list in Settings → Devices with last-seen timestamps
 - Any device (or any admin) can revoke a device; revoked device is shown a clear notice and its keys are wiped
+- Identity backup → passphrase → downloadable `.mehfil-key` file (PBKDF2-600k → AES-GCM); restore on the landing page
 
 **Huddles**
 - 🎙 button in sidebar starts a live audio call — WebRTC mesh, no server
@@ -51,18 +67,6 @@ Browser-native, local-first team chat. Single HTML file. No accounts. No central
 - **Cloudflare Workers relay** — store-and-forward over the internet; async delivery; hosts pairing codes
 - **LAN bridge** (`mehfil-bridge` Go binary) — 24h buffer on your local network, mDNS auto-discovery, fingerprint pinning
 - "Join by code" — 6-word pairing code, no URL needed, valid 5 minutes
-
-**Admin**
-- Member removal with full workspace + channel rekey
-- Promote-by-consensus (2-of-N admin co-signature); role badges on the People sidebar
-- ★ Propose-as-admin button on any member row (visible to admins and owners)
-- Workspace-wide search (MiniSearch, `from:name` / `in:#channel` filters)
-- Export / import workspace as an encrypted `.workspace` file
-- Relay config propagates to peers via `workspace.patch`
-
-**Identity**
-- Identity backup → passphrase → downloadable `.mehfil-key` file (PBKDF2-600k → AES-GCM)
-- Restore from backup — "I have a backup file" on the landing page
 
 ## Run it
 
@@ -143,10 +147,9 @@ http://localhost:8103/?as=bose#join=...
 
 Production paths (no `?as=`) are unaffected. Combine with `?debug=1` to expose every internal module on `window.__mehfil` for loopback tests — see `PROTOCOL.md §dev` for the convention.
 
-## What's new in v2
+## Multi-office federation
 
-- **Multi-office bridge federation** — run `BRIDGE_NAME="NYC" RELAY_URL=... mehfil-bridge` in each office; bridges sync through the relay. People sidebar groups members by office.
-- **Huddles** — 🎙 button in the sidebar footer starts a live audio call. Anyone online can join; audio is WebRTC peer-to-peer, encrypted under the workspace key. Speaking rings animate on active mics.
+Run `BRIDGE_NAME="NYC" RELAY_URL=... mehfil-bridge` in each office; bridges sync through the shared relay. The People sidebar groups members by office, and the corner badge distinguishes "🟢 Live via WebRTC" from "🟡 Via relay" from "🔴 Offline".
 
 ## Upcoming
 
@@ -154,7 +157,7 @@ Production paths (no `?as=`) are unaffected. Combine with `?debug=1` to expose e
 
 ## Architecture
 
-`index.html` is the entire app — markup, styles, and ~10,600 lines of vanilla JS, no framework, no build step. Web Crypto only. Custom canonical MessagePack codec (no external lib). IndexedDB per spec §9.1: `envelopes` is the source of truth, everything else is a projection rebuilt on replay. State is a single object; render is a pure function of state. Yjs (lazy-loaded from esm.sh) handles workspace metadata CRDT.
+`index.html` is the entire app — markup, styles, and ~12,800 lines of vanilla JS, no framework, no build step. Web Crypto only. Custom canonical MessagePack codec (no external lib — ~250 lines of hand-rolled encode/decode, verified with 18 self-test vectors on every boot). IndexedDB per spec §9.1: `envelopes` is the source of truth, everything else is a projection rebuilt on replay. State is a single object; render is a pure function of state. Yjs (lazy-loaded from esm.sh) handles workspace metadata CRDT — channel list, member roles, pinned messages, user groups, and channel topics all live in one Y.Doc that syncs via `workspace.patch` envelopes.
 
 Two companion services live in separate repos:
 
