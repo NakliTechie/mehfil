@@ -828,6 +828,22 @@
     line-height: 1.5;
   }
   .msg-code code { background: transparent; padding: 0; font: inherit; }
+  /* Minimal hljs theme — follows the sidebar palette so it stays
+     readable in both light and dark mode without pulling a CDN CSS. */
+  .hljs-keyword, .hljs-selector-tag, .hljs-built_in, .hljs-name, .hljs-tag { color: var(--accent); }
+  .hljs-string, .hljs-attr, .hljs-symbol, .hljs-bullet, .hljs-addition  { color: #22863a; }
+  .hljs-title, .hljs-section, .hljs-literal, .hljs-number  { color: #005cc5; }
+  .hljs-comment, .hljs-quote, .hljs-meta { color: var(--fg-dim); font-style: italic; }
+  .hljs-variable, .hljs-template-variable, .hljs-attribute { color: #e36209; }
+  .hljs-regexp, .hljs-link, .hljs-deletion { color: #d73a49; }
+  .hljs-type, .hljs-params, .hljs-class .hljs-title { color: #6f42c1; }
+  @media (prefers-color-scheme: dark) {
+    .hljs-string, .hljs-attr { color: #85e89d; }
+    .hljs-title, .hljs-section, .hljs-literal, .hljs-number { color: #79b8ff; }
+    .hljs-variable, .hljs-template-variable, .hljs-attribute { color: #ffab70; }
+    .hljs-regexp, .hljs-link, .hljs-deletion { color: #f97583; }
+    .hljs-type, .hljs-class .hljs-title { color: #b392f0; }
+  }
   .msg-text code:not(pre code) {
     background: var(--bg-sunken);
     padding: 1px 5px;
@@ -1208,6 +1224,33 @@
   .relay-row-url { font-family: var(--mono); font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
   /* ---- Huddle bar ---- */
+  .huddle-screens {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    padding: 8px 18px 0;
+    background: var(--bg-sunken);
+    border-top: 1px solid var(--line);
+  }
+  .huddle-screen-tile {
+    position: relative;
+    flex: 1 1 240px;
+    max-width: 480px;
+    background: #000;
+    border-radius: 6px;
+    overflow: hidden;
+    aspect-ratio: 16 / 9;
+  }
+  .huddle-screen-tile video { width: 100%; height: 100%; object-fit: contain; display: block; background: #000; }
+  .huddle-screen-label {
+    position: absolute; bottom: 6px; left: 8px;
+    font-size: 11px; color: #fff;
+    background: rgba(0,0,0,0.55);
+    padding: 2px 7px; border-radius: 4px;
+    pointer-events: none;
+  }
+  #btn-huddle-screen.active { color: var(--ok); }
+
   .huddle-bar {
     display: flex; align-items: center; gap: 8px;
     padding: 5px 16px; background: var(--bg-sunken);
@@ -2102,7 +2145,7 @@ async function openGlobalDB() {
 }
 
 async function openWorkspaceDB(workspaceId) {
-  return openDB(DB_PREFIX + "mehfil_" + workspaceId, 3, (db) => {
+  return openDB(DB_PREFIX + "mehfil_" + workspaceId, 4, (db) => {
     if (!db.objectStoreNames.contains("envelopes")) {
       const env = db.createObjectStore("envelopes", { keyPath: "id" });
       env.createIndex("ch", "ch");
@@ -2123,6 +2166,7 @@ async function openWorkspaceDB(workspaceId) {
     if (!db.objectStoreNames.contains("read_markers"))       db.createObjectStore("read_markers");
     if (!db.objectStoreNames.contains("bookmarks"))          db.createObjectStore("bookmarks");
     if (!db.objectStoreNames.contains("reminders"))          db.createObjectStore("reminders");
+    if (!db.objectStoreNames.contains("scheduled_sends"))    db.createObjectStore("scheduled_sends");
   });
 }
 
@@ -2645,7 +2689,14 @@ const Workspace = {
       for (const { key, value } of entries) reminders.set(key, value);
     } catch {}
 
-    return { wsDB, meta, channels, members, channelKeys, rootKey, messages, presence, hwm, causalBuffer, doc, gaps, relays, bridges, readMarkers, bookmarks, reminders };
+    // Pending scheduled sends (local only). Keyed by send id.
+    const scheduledSends = new Map();
+    try {
+      const entries = await idbGetAllEntries(wsDB, "scheduled_sends");
+      for (const { key, value } of entries) scheduledSends.set(key, value);
+    } catch {}
+
+    return { wsDB, meta, channels, members, channelKeys, rootKey, messages, presence, hwm, causalBuffer, doc, gaps, relays, bridges, readMarkers, bookmarks, reminders, scheduledSends };
   },
 
   async sendMessage({ wsDB, meta, identity, channelId, channelKey, body, vectorClock, mentions, threadId, poll, checklist }) {
@@ -3463,6 +3514,22 @@ function renderWorkspace() {
   if ($huddleMute) $huddleMute.onclick = () => HuddleMgr.toggleMute();
   const $huddleLeave = document.getElementById("btn-huddle-leave");
   if ($huddleLeave) $huddleLeave.onclick = () => HuddleMgr.leave();
+  const $huddleScreen = document.getElementById("btn-huddle-screen");
+  if ($huddleScreen) $huddleScreen.onclick = async () => {
+    if (HuddleMgr.sharingScreen) await HuddleMgr.stopScreenShare();
+    else                         await HuddleMgr.startScreenShare();
+  };
+  // Attach the live MediaStreams to video elements rendered by renderBar.
+  {
+    const myId = bytesToB64Url(State.identity.pubkey);
+    document.querySelectorAll(".huddle-screen-tile video[data-peer]").forEach(vid => {
+      const peerId = vid.getAttribute("data-peer");
+      const stream = peerId === myId
+        ? HuddleMgr.localScreenStream
+        : HuddleMgr.remoteScreens.get(peerId);
+      if (stream && vid.srcObject !== stream) vid.srcObject = stream;
+    });
+  }
 
   const $groupDm = document.getElementById("btn-group-dm");
   if ($groupDm) $groupDm.onclick = openGroupDmModal;
@@ -4047,6 +4114,7 @@ function renderWorkspace() {
   if (State.modal === "all-threads") renderAllThreadsModal();
   if (State.modal === "saved")       renderSavedModal();
   if (State.modal === "drafts")      renderDraftsModal();
+  if (State.modal === "scheduled")   renderScheduledModal();
 
   // Scroll to bottom — main channel messages, and the thread panel
   // scroller if it's open. Slice U1: if an unread divider is present
@@ -4065,6 +4133,10 @@ function renderWorkspace() {
   State._lastRenderedChannel = currentChannel;
   const $threadScroll = document.getElementById("thread-scroll");
   if ($threadScroll) $threadScroll.scrollTop = $threadScroll.scrollHeight;
+
+  // Lazy syntax highlighting for code blocks with a language tag.
+  // Safe to await off-thread; first hit triggers the import.
+  HighlightMgr.applyAll().catch(() => {});
 }
 
 function computeBadge(peerStatus, memberCount, relayStatus, bridgeStatus) {
@@ -5013,6 +5085,56 @@ function renderSavedModal() {
       await toggleBookmark(current, mid);
       wrap.remove();
       setState({ modal: "saved" });
+    };
+  });
+}
+
+function renderScheduledModal() {
+  if (document.querySelector('.modal-bg[data-scheduled]')) return;
+  const current = State.current;
+  const entries = [...(current.scheduledSends?.values() || [])].sort((a, b) => a.fireAt - b.fireAt);
+
+  const rowHtml = (s) => {
+    const ch = current.channels.find(c => c.id === s.channelId);
+    const chLabel = ch ? (ch.dm ? "DM" : (ch.private ? "🔒 " : "# ") + ch.name) : "(unknown)";
+    const when = new Date(s.fireAt).toLocaleString([], { weekday: "short", month: "short", day: "numeric", hour: "numeric", minute: "2-digit" });
+    return `
+      <div class="switcher-row">
+        <span class="switcher-icon plain">⏰</span>
+        <div class="switcher-body">
+          <div class="switcher-label">${escapeHTML(when)} · ${escapeHTML(chLabel)}</div>
+          <div class="switcher-sub" style="max-width: 440px;">${escapeHTML(s.body.slice(0, 180))}</div>
+        </div>
+        <button class="danger" data-cancel-send="${escapeHTML(s.id)}" style="font-size: 11px; padding: 3px 8px;">Cancel</button>
+      </div>
+    `;
+  };
+
+  const wrap = document.createElement("div");
+  wrap.className = "modal-bg";
+  wrap.dataset.scheduled = "1";
+  wrap.innerHTML = `
+    <div class="card" style="max-width: 600px; max-height: calc(100vh - 60px); overflow-y: auto;">
+      <div class="row" style="margin-bottom: 12px;">
+        <h1 style="margin: 0; font-size: 18px; flex: 1;">⏰ Scheduled sends</h1>
+        <button class="icon-btn" id="scheduled-close" style="font-size: 18px; padding: 2px 7px;">✕</button>
+      </div>
+      <div style="font-size: 12px; color: var(--fg-dim); margin-bottom: 10px;">
+        Tab must be open at fire time. Per-device queue, not synced.
+      </div>
+      ${entries.length === 0
+        ? `<div style="color: var(--fg-dim); font-size: 13px; padding: 20px 0; text-align: center;">Nothing scheduled. Use <code>/send in 15m &lt;message&gt;</code> to queue one.</div>`
+        : entries.map(rowHtml).join("")}
+    </div>
+  `;
+  document.body.appendChild(wrap);
+  wrap.querySelector("#scheduled-close").onclick = () => { wrap.remove(); closeModal(); };
+  wrap.onclick = (e) => { if (e.target === wrap) { wrap.remove(); closeModal(); } };
+  wrap.querySelectorAll("[data-cancel-send]").forEach(btn => {
+    btn.onclick = async () => {
+      await cancelScheduledSend(current, btn.dataset.cancelSend);
+      wrap.remove();
+      setState({ modal: "scheduled" });
     };
   });
 }
@@ -10350,6 +10472,29 @@ const ReminderMgr = {
         }
       }
     }
+    // Scheduled sends: actually post the queued message.
+    for (const [id, ss] of current.scheduledSends || []) {
+      if (ss.fireAt <= now && !ss.fired) {
+        ss.fired = true;
+        await idbDelete(current.wsDB, "scheduled_sends", id);
+        current.scheduledSends.delete(id);
+        // Switch to the target channel if needed so sendMessageNow posts there.
+        const prevChannel = State.currentChannel;
+        try {
+          if (!current.channels.find(c => c.id === ss.channelId)) {
+            flashReminderToast(`Scheduled send skipped: channel gone — "${ss.body.slice(0, 40)}"`, 0);
+            continue;
+          }
+          State.currentChannel = ss.channelId;
+          await sendMessageNow(ss.body);
+        } catch (e) {
+          console.warn("scheduled send failed:", e);
+          flashReminderToast(`Scheduled send failed: ${e.message}`, 0);
+        } finally {
+          if (prevChannel !== ss.channelId) State.currentChannel = prevChannel;
+        }
+      }
+    }
   },
 };
 
@@ -10359,6 +10504,89 @@ async function scheduleReminder(current, delayMs, text) {
   if (!current.reminders) current.reminders = new Map();
   current.reminders.set(id, rec);
   await idbPut(current.wsDB, "reminders", rec, id);
+}
+
+/* ------------------------------------------------------------
+ *  Scheduled send — queue a message to post at a future time.
+ *  Honest caveat: tab must be open when the time arrives. Same
+ *  ReminderMgr tick drives it; delivery calls sendMessageNow in
+ *  the channel the user was in when they scheduled.
+ * ------------------------------------------------------------ */
+async function scheduleSend(current, fireAt, body, channelId) {
+  const id = bytesToB64Url(Crypto.rand(8));
+  const rec = { id, fireAt, body, channelId, scheduledAt: Date.now() };
+  if (!current.scheduledSends) current.scheduledSends = new Map();
+  current.scheduledSends.set(id, rec);
+  await idbPut(current.wsDB, "scheduled_sends", rec, id);
+}
+
+async function cancelScheduledSend(current, id) {
+  if (!current.scheduledSends) return;
+  current.scheduledSends.delete(id);
+  await idbDelete(current.wsDB, "scheduled_sends", id);
+}
+
+/* Parse a relative time spec:
+ *   in 15m  / in 2h  / in 3d
+ *   at 9am  / at 2:30pm  (today; tomorrow if past)
+ *   tomorrow at 9am
+ *   monday at 9
+ * Returns { fireAt: number, rest: string } or throws on bad input.
+ */
+function parseTimeSpec(input) {
+  const s = (input || "").trim();
+  // in <N><unit> <text>
+  let m = s.match(/^in\s+(\d+)\s*(m|min|h|hr|d)\s+(.+)$/i);
+  if (m) {
+    const n = parseInt(m[1], 10);
+    const u = m[2].toLowerCase();
+    const ms = u.startsWith("h") ? 3600_000 : u === "d" ? 86400_000 : 60_000;
+    return { fireAt: Date.now() + n * ms, rest: m[3] };
+  }
+  // at <time> <text> — today; if past, tomorrow
+  m = s.match(/^at\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\s+(.+)$/i);
+  if (m) {
+    let h = parseInt(m[1], 10);
+    const min = parseInt(m[2] || "0", 10);
+    const ap = (m[3] || "").toLowerCase();
+    if (ap === "pm" && h < 12) h += 12;
+    if (ap === "am" && h === 12) h = 0;
+    const now = new Date();
+    const t = new Date(now);
+    t.setHours(h, min, 0, 0);
+    if (t.getTime() <= now.getTime()) t.setDate(t.getDate() + 1);
+    return { fireAt: t.getTime(), rest: m[4] };
+  }
+  // tomorrow at <time> <text>
+  m = s.match(/^tomorrow\s+at\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\s+(.+)$/i);
+  if (m) {
+    let h = parseInt(m[1], 10);
+    const min = parseInt(m[2] || "0", 10);
+    const ap = (m[3] || "").toLowerCase();
+    if (ap === "pm" && h < 12) h += 12;
+    if (ap === "am" && h === 12) h = 0;
+    const t = new Date();
+    t.setDate(t.getDate() + 1);
+    t.setHours(h, min, 0, 0);
+    return { fireAt: t.getTime(), rest: m[4] };
+  }
+  // <weekday> at <time> <text>
+  const weekdays = ["sunday","monday","tuesday","wednesday","thursday","friday","saturday"];
+  m = s.match(/^(sun|mon|tue|wed|thu|fri|sat)\w*\s+at\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\s+(.+)$/i);
+  if (m) {
+    const dayIdx = weekdays.findIndex(d => d.startsWith(m[1].toLowerCase()));
+    let h = parseInt(m[2], 10);
+    const min = parseInt(m[3] || "0", 10);
+    const ap = (m[4] || "").toLowerCase();
+    if (ap === "pm" && h < 12) h += 12;
+    if (ap === "am" && h === 12) h = 0;
+    const t = new Date();
+    const diff = (dayIdx - t.getDay() + 7) % 7 || 7;
+    t.setDate(t.getDate() + diff);
+    t.setHours(h, min, 0, 0);
+    return { fireAt: t.getTime(), rest: m[5] };
+  }
+  throw new Error('Usage: /send in 15m <msg>  ·  /send at 9am <msg>  ·  /send tomorrow at 9am <msg>  ·  /send monday at 9 <msg>');
 }
 
 function flashReminderToast(text, autoHideMs = 4000) {
@@ -10520,6 +10748,47 @@ function isPinned(current, channelId, msgId) {
  *  Private canvases would need a separate per-channel-key-encrypted
  *  doc; deferred to a later slice.
  * ------------------------------------------------------------ */
+/* ------------------------------------------------------------
+ *  Syntax highlighting for fenced code blocks.
+ *  Lazy-loaded from esm.sh on first use. We keep a single cached
+ *  import + apply after each render to any `<pre.msg-code code[class^=lang-]>`
+ *  that hasn't been highlighted yet (marked with a data-hl attr).
+ * ------------------------------------------------------------ */
+const HighlightMgr = {
+  _hljs: null,
+  _loading: null,
+  async load() {
+    if (this._hljs) return this._hljs;
+    if (!this._loading) {
+      this._loading = (async () => {
+        const mod = await import("https://esm.sh/highlight.js@11.10.0");
+        return mod.default || mod;
+      })();
+    }
+    this._hljs = await this._loading;
+    return this._hljs;
+  },
+  async applyAll(root = document) {
+    const blocks = root.querySelectorAll("pre.msg-code code[class^='lang-']:not([data-hl])");
+    if (blocks.length === 0) return;
+    let hljs;
+    try { hljs = await this.load(); }
+    catch (e) { console.warn("syntax highlight load failed:", e); return; }
+    for (const el of blocks) {
+      const cls = [...el.classList].find(c => c.startsWith("lang-")) || "";
+      const lang = cls.replace("lang-", "").toLowerCase();
+      try {
+        const src = el.textContent || "";
+        const res = hljs.getLanguage(lang)
+          ? hljs.highlight(src, { language: lang })
+          : hljs.highlightAuto(src);
+        el.innerHTML = res.value;
+        el.setAttribute("data-hl", "1");
+      } catch (e) { /* silent — bad lang name, etc. */ }
+    }
+  },
+};
+
 const CanvasMgr = {
   _binding: null,   // { channelId, textarea, observer, disposed }
   _md: null,        // lazy-loaded markdown-it
@@ -11033,6 +11302,22 @@ const SLASH = {
       const checklist = { title, items: items.map(text => ({ text, done: false })) };
       await sendMessageNow("", { checklist });
     }
+  },
+  send: {
+    summary: "Schedule a message for later (tab must be open at fire time)",
+    usage: "/send in 15m|at 9am|tomorrow at 9am <message>",
+    run: async ({ args, current }) => {
+      const { fireAt, rest } = parseTimeSpec(args || "");
+      if (!rest.trim()) throw new Error("Message body is required.");
+      await scheduleSend(current, fireAt, rest, State.currentChannel);
+      const when = new Date(fireAt).toLocaleString([], { weekday: "short", hour: "numeric", minute: "2-digit" });
+      flashReminderToast(`Scheduled for ${when}`);
+    }
+  },
+  scheduled: {
+    summary: "Show your pending scheduled sends",
+    usage: "/scheduled",
+    run: async () => { setState({ modal: "scheduled" }); }
   },
 };
 SLASH.huddle = SLASH.call;   // shared reference so /help dedupes as aliases
@@ -14206,6 +14491,11 @@ const HuddleMgr = (() => {
   let _audioCtx     = null;
   let _analysers    = new Map(); // peerId → {analyser, data, speaking}
   let _speakTimer   = null;
+  // Screen share state (v2 extension)
+  let _screenStream  = null;     // local captured stream
+  let _screenTrack   = null;     // local video track
+  let _screenSenders = new Map();// peerId → RTCRtpSender (so we can removeTrack)
+  let _remoteScreens = new Map();// peerId → MediaStream (their shared screen)
 
   // ── Helpers ────────────────────────────────────────────────
 
@@ -14239,17 +14529,33 @@ const HuddleMgr = (() => {
 
     // Add local audio
     if (_localStream) _localStream.getTracks().forEach(t => pc.addTrack(t, _localStream));
+    // Add local screen video if we're already sharing
+    if (_screenTrack && _screenStream) {
+      const sender = pc.addTrack(_screenTrack, _screenStream);
+      _screenSenders.set(peerId, sender);
+    }
 
     // Trickle ICE — send each candidate as a signal envelope
     pc.onicecandidate = ({ candidate }) => {
       if (candidate) _sendSignal(wsId, peerId, { ice: candidate.toJSON() }).catch(() => {});
     };
 
-    // Incoming remote audio track → play + hook up speaking analyser
-    pc.ontrack = ({ streams }) => {
+    // Incoming remote track — split by kind: audio goes to hidden <audio>
+    // with a speaking analyser; video goes to the shared _remoteScreens
+    // map and triggers a re-render to surface it.
+    pc.ontrack = ({ streams, track }) => {
       const stream = streams[0];
       if (!stream) return;
-      // Play audio
+      if (track.kind === "video") {
+        _remoteScreens.set(peerId, stream);
+        track.addEventListener("ended", () => {
+          _remoteScreens.delete(peerId);
+          render();
+        });
+        render();
+        return;
+      }
+      // Audio: play + hook speaking analyser
       let audio = document.getElementById("huddle-audio-" + peerId.slice(0, 8));
       if (!audio) {
         audio = document.createElement("audio");
@@ -14258,7 +14564,6 @@ const HuddleMgr = (() => {
         document.body.appendChild(audio);
       }
       audio.srcObject = stream;
-      // Speaking analyser
       if (_audioCtx) {
         const source   = _audioCtx.createMediaStreamSource(stream);
         const analyser = _audioCtx.createAnalyser();
@@ -14279,6 +14584,15 @@ const HuddleMgr = (() => {
     return pc;
   }
 
+  async function _renegotiate(wsId, peerId, pc) {
+    if (!pc) return;
+    try {
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+      await _sendSignal(wsId, peerId, { sdp_type: "offer", sdp: pc.localDescription.sdp });
+    } catch (e) { console.warn("huddle renegotiate failed:", e); }
+  }
+
   function _removePeer(peerId) {
     const pc = _pcs.get(peerId);
     if (pc) { pc.close(); _pcs.delete(peerId); }
@@ -14286,6 +14600,8 @@ const HuddleMgr = (() => {
     if (audio) { audio.remove(); _remoteAudios.delete(peerId); }
     const a = _analysers.get(peerId);
     if (a) { try { a.analyser.disconnect(); } catch (_) {} _analysers.delete(peerId); }
+    _screenSenders.delete(peerId);
+    _remoteScreens.delete(peerId);
     const idx = _participants.findIndex(p => p.id === peerId);
     if (idx !== -1) _participants.splice(idx, 1);
   }
@@ -14309,6 +14625,10 @@ const HuddleMgr = (() => {
     for (const peerId of [..._pcs.keys()]) _removePeer(peerId);
     _pcs.clear();
     if (_localStream) { _localStream.getTracks().forEach(t => t.stop()); _localStream = null; }
+    if (_screenStream) { _screenStream.getTracks().forEach(t => t.stop()); _screenStream = null; }
+    _screenTrack = null;
+    _screenSenders.clear();
+    _remoteScreens.clear();
     if (_audioCtx) { _audioCtx.close().catch(() => {}); _audioCtx = null; }
     if (_speakTimer) { clearInterval(_speakTimer); _speakTimer = null; }
     _participants = [];
@@ -14364,6 +14684,60 @@ const HuddleMgr = (() => {
     toggleMute() {
       _muted = !_muted;
       if (_localStream) _localStream.getAudioTracks().forEach(t => { t.enabled = !_muted; });
+      render();
+    },
+
+    get sharingScreen()    { return !!_screenTrack; },
+    get localScreenStream(){ return _screenStream; },
+    get remoteScreens()    { return _remoteScreens; },
+
+    /** Start sharing the local screen to every peer in the huddle. */
+    async startScreenShare() {
+      if (!_ws) return;
+      if (_screenTrack) return;
+      let stream;
+      try {
+        stream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: false });
+      } catch (e) {
+        if (e.name !== "NotAllowedError") console.warn("display media failed:", e);
+        return;
+      }
+      const track = stream.getVideoTracks()[0];
+      if (!track) return;
+      _screenStream = stream;
+      _screenTrack  = track;
+      // Browser "Stop sharing" control ends the track — propagate.
+      track.addEventListener("ended", () => {
+        if (_screenTrack === track) this.stopScreenShare().catch(() => {});
+      });
+      // Add to every existing peer + renegotiate so they get the new m-section.
+      for (const [peerId, pc] of _pcs) {
+        try {
+          const sender = pc.addTrack(track, stream);
+          _screenSenders.set(peerId, sender);
+          await _renegotiate(_ws, peerId, pc);
+        } catch (e) { console.warn("screen add to peer failed:", e); }
+      }
+      render();
+    },
+
+    /** Stop sharing and remove the track from every peer. */
+    async stopScreenShare() {
+      if (!_screenTrack) return;
+      const wsId = _ws;
+      const track = _screenTrack;
+      _screenTrack = null;
+      try { track.stop(); } catch {}
+      if (_screenStream) {
+        _screenStream.getTracks().forEach(t => { try { t.stop(); } catch {} });
+        _screenStream = null;
+      }
+      for (const [peerId, sender] of _screenSenders) {
+        const pc = _pcs.get(peerId);
+        if (pc && sender) { try { pc.removeTrack(sender); } catch {} }
+        if (pc) await _renegotiate(wsId, peerId, pc);
+      }
+      _screenSenders.clear();
       render();
     },
 
@@ -14429,7 +14803,27 @@ const HuddleMgr = (() => {
     renderBar(current) {
       if (_ws !== current.meta.id) return "";
       const myId = bytesToB64Url(State.identity.pubkey);
+      // Collect the active screen shares — local + any remote peers.
+      const screenStreams = [];
+      if (_screenTrack && _screenStream) {
+        screenStreams.push({ peerId: myId, name: "You", local: true });
+      }
+      for (const peerId of _remoteScreens.keys()) {
+        const p = _participants.find(pp => pp.id === peerId);
+        screenStreams.push({ peerId, name: p?.name || "?", local: false });
+      }
+      const sharePills = screenStreams.length > 0
+        ? `<div class="huddle-screens" id="huddle-screens">
+             ${screenStreams.map(s => `
+               <div class="huddle-screen-tile">
+                 <video id="huddle-vid-${escapeHTML(s.peerId.slice(0, 12))}" data-peer="${escapeHTML(s.peerId)}" autoplay playsinline${s.local ? " muted" : ""}></video>
+                 <div class="huddle-screen-label">${escapeHTML(s.name)}${s.local ? " · your screen" : "'s screen"}</div>
+               </div>
+             `).join("")}
+           </div>`
+        : "";
       return `
+        ${sharePills}
         <div class="huddle-bar" id="huddle-bar">
           <span class="huddle-label">🎙 Live</span>
           <div class="huddle-avatars">
@@ -14441,8 +14835,10 @@ const HuddleMgr = (() => {
             `).join("")}
           </div>
           <div class="huddle-actions">
-            <button class="icon-btn ${_muted ? "huddle-muted" : ""}" id="btn-huddle-mute"
+            <button class="icon-btn${_muted ? " huddle-muted" : ""}" id="btn-huddle-mute"
                     title="${_muted ? "Unmute" : "Mute"}">🎤</button>
+            <button class="icon-btn${_screenTrack ? " active" : ""}" id="btn-huddle-screen"
+                    title="${_screenTrack ? "Stop sharing" : "Share screen"}">🖥</button>
             <button id="btn-huddle-leave">Leave</button>
           </div>
         </div>
@@ -14530,6 +14926,8 @@ if (/[?&]debug=1/.test(location.search)) {
     // Small tools
     sendPollVote, toggleBookmark, isBookmarked, toggleChecklistItem,
     sendProfileUpdate, scheduleReminder, ReminderMgr, timestampTooltip,
+    // Scheduled send + syntax highlight
+    scheduleSend, cancelScheduledSend, parseTimeSpec, HighlightMgr,
   };
 }
 
