@@ -3174,10 +3174,12 @@ function renderWorkspace() {
         }
         ${(() => {
           // Typing indicator — "Alice and Bose are typing…" below the
-          // message list. Resolves ids against the member projection so
-          // unknown senders appear as their short fingerprint.
+          // message list. Filters out our own id defensively (the dispatch
+          // already skips self-marks, but defence in depth). Resolves ids
+          // against the member projection; unknown senders show as
+          // "someone".
           if (channel.canvas) return "";
-          const typers = TypingMgr.activeIn(currentChannel);
+          const typers = TypingMgr.activeIn(currentChannel).filter(uid => uid !== myUserId);
           if (typers.length === 0) return "";
           const names = typers.map(uid => current.members.find(m => m.id === uid)?.name || "someone");
           const label = names.length === 1
