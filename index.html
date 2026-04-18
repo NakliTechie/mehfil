@@ -754,6 +754,86 @@
     text-align: center;
     cursor: default;
   }
+  .checklist {
+    margin-top: 6px;
+    padding: 10px 12px;
+    background: var(--bg-elev);
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    max-width: 480px;
+  }
+  .checklist-head { font-size: 13px; font-weight: 600; margin-bottom: 8px; display: flex; align-items: center; gap: 8px; }
+  .checklist-count { font-weight: 400; color: var(--fg-dim); font-size: 11px; }
+  .checklist-item {
+    display: flex; align-items: center; gap: 8px;
+    padding: 3px 0; cursor: pointer; font-size: 13px;
+  }
+  .checklist-item input { cursor: pointer; }
+  .checklist-item.done span { text-decoration: line-through; color: var(--fg-dim); }
+
+  .reminder-toast {
+    position: fixed;
+    bottom: 22px; right: 22px;
+    background: var(--accent);
+    color: white;
+    padding: 10px 16px;
+    border-radius: 8px;
+    font-size: 13px;
+    box-shadow: 0 4px 16px rgba(0,0,0,0.22);
+    z-index: 400;
+    opacity: 0; transform: translateY(8px);
+    transition: opacity 0.2s, transform 0.2s;
+  }
+  .reminder-toast.show { opacity: 1; transform: translateY(0); }
+  .poll {
+    margin-top: 6px;
+    padding: 10px 12px;
+    background: var(--bg-elev);
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    max-width: 480px;
+  }
+  .poll-q { font-size: 13px; font-weight: 600; margin-bottom: 8px; }
+  .poll-opt {
+    position: relative;
+    padding: 6px 10px;
+    margin: 3px 0;
+    background: var(--bg-sunken);
+    border: 1px solid var(--line);
+    border-radius: 5px;
+    cursor: pointer;
+    overflow: hidden;
+    transition: border-color 0.1s;
+  }
+  .poll-opt:hover { border-color: var(--accent); }
+  .poll-opt.mine { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 8%, var(--bg-sunken)); }
+  .poll-bar {
+    position: absolute; left: 0; top: 0; bottom: 0;
+    background: color-mix(in srgb, var(--accent) 15%, transparent);
+    transition: width 0.25s;
+  }
+  .poll-opt-label { position: relative; font-size: 13px; }
+  .poll-opt-count { position: absolute; right: 10px; top: 6px; font-size: 11px; color: var(--fg-dim); }
+  .poll-total { font-size: 11px; color: var(--fg-dim); margin-top: 6px; }
+
+  .msg-code {
+    background: var(--bg-sunken);
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    padding: 10px 12px;
+    margin: 6px 0;
+    overflow-x: auto;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+    font-size: 12.5px;
+    line-height: 1.5;
+  }
+  .msg-code code { background: transparent; padding: 0; font: inherit; }
+  .msg-text code:not(pre code) {
+    background: var(--bg-sunken);
+    padding: 1px 5px;
+    border-radius: 3px;
+    font: 12px ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
   .typing-indicator {
     padding: 4px 20px 0;
     font-size: 11px;
@@ -2022,7 +2102,7 @@ async function openGlobalDB() {
 }
 
 async function openWorkspaceDB(workspaceId) {
-  return openDB(DB_PREFIX + "mehfil_" + workspaceId, 2, (db) => {
+  return openDB(DB_PREFIX + "mehfil_" + workspaceId, 3, (db) => {
     if (!db.objectStoreNames.contains("envelopes")) {
       const env = db.createObjectStore("envelopes", { keyPath: "id" });
       env.createIndex("ch", "ch");
@@ -2041,6 +2121,8 @@ async function openWorkspaceDB(workspaceId) {
     if (!db.objectStoreNames.contains("pending_promotions")) db.createObjectStore("pending_promotions");
     if (!db.objectStoreNames.contains("search_index"))       db.createObjectStore("search_index");
     if (!db.objectStoreNames.contains("read_markers"))       db.createObjectStore("read_markers");
+    if (!db.objectStoreNames.contains("bookmarks"))          db.createObjectStore("bookmarks");
+    if (!db.objectStoreNames.contains("reminders"))          db.createObjectStore("reminders");
   });
 }
 
@@ -2286,11 +2368,34 @@ const Workspace = {
               body: inner.body,
               mentions: replayMentions.length > 0 ? replayMentions : undefined,
               thread: inner.thread || undefined,
+              poll: inner.poll || undefined,
+              votes: inner.poll ? {} : undefined,
+              checklist: inner.checklist ? JSON.parse(JSON.stringify(inner.checklist)) : undefined,
               delivery: "stored",
               edited: false, deleted: false, lc: env.lc
             };
             messages.push(msg);
             msgById.set(env.id, msg);
+            break;
+          }
+          case "checklist.toggle": {
+            const tgt = msgById.get(inner.target);
+            if (!tgt || !tgt.checklist) break;
+            const idx = inner.itemIdx;
+            if (typeof idx === "number" && tgt.checklist.items[idx]) {
+              tgt.checklist.items[idx].done = !!inner.done;
+            }
+            break;
+          }
+          case "poll.vote": {
+            const target = msgById.get(inner.target);
+            if (!target || !target.poll) break;
+            if (!target.votes) target.votes = {};
+            if (typeof inner.optionIdx === "number" && inner.optionIdx >= 0 && inner.optionIdx < target.poll.options.length) {
+              target.votes[env.from] = inner.optionIdx;
+            } else if (inner.optionIdx === null || inner.optionIdx === -1) {
+              delete target.votes[env.from];
+            }
             break;
           }
           case "attachment.ref": {
@@ -2411,6 +2516,15 @@ const Workspace = {
             channelKeys[inner.id] = await Crypto.importAesRaw(rawKey);
             break;
           }
+          case "member.profile_update": {
+            const pm = members.find(m => m.id === env.from);
+            if (!pm) break;
+            if (inner.timezone !== undefined) pm.timezone = inner.timezone || null;
+            if (inner.pronouns !== undefined) pm.pronouns = inner.pronouns || null;
+            if (inner.title    !== undefined) pm.title    = inner.title    || null;
+            await idbPut(wsDB, "members", pm);
+            break;
+          }
           case "group_dm.sender_key": {
             // Store the per-sender key so future messages in this group DM
             // can be decrypted with the right key.
@@ -2517,10 +2631,24 @@ const Workspace = {
       for (const { key, value } of entries) readMarkers.set(key, value);
     }
 
-    return { wsDB, meta, channels, members, channelKeys, rootKey, messages, presence, hwm, causalBuffer, doc, gaps, relays, bridges, readMarkers };
+    // Saved-for-later bookmarks (per-user, local-only). Keyed by msgId.
+    const bookmarks = new Map();
+    try {
+      const entries = await idbGetAllEntries(wsDB, "bookmarks");
+      for (const { key, value } of entries) bookmarks.set(key, value);
+    } catch {}
+
+    // Pending reminders (local only). Keyed by reminder id.
+    const reminders = new Map();
+    try {
+      const entries = await idbGetAllEntries(wsDB, "reminders");
+      for (const { key, value } of entries) reminders.set(key, value);
+    } catch {}
+
+    return { wsDB, meta, channels, members, channelKeys, rootKey, messages, presence, hwm, causalBuffer, doc, gaps, relays, bridges, readMarkers, bookmarks, reminders };
   },
 
-  async sendMessage({ wsDB, meta, identity, channelId, channelKey, body, vectorClock, mentions, threadId }) {
+  async sendMessage({ wsDB, meta, identity, channelId, channelKey, body, vectorClock, mentions, threadId, poll, checklist }) {
     const signKey = await Crypto.importSignKey(identity.privkey_pkcs8);
     // mentions is an optional array of user_ids extracted from @name tokens
     // in the body; we only include the field if non-empty to keep the wire
@@ -2532,6 +2660,8 @@ const Workspace = {
     const inner = { body, fmt: "text" };
     if (mentions && mentions.length > 0) inner.mentions = mentions;
     if (threadId) inner.thread = threadId;
+    if (poll)      inner.poll = poll;
+    if (checklist) inner.checklist = checklist;
     const env = await Envelope.build({
       workspaceId: meta.id,
       channelId,
@@ -2921,6 +3051,7 @@ async function openWorkspaceById(wsId) {
   // (e.g. from a previous workspace in the same session) and starts a
   // fresh one bound to this bundle.
   PresenceDriver.start(bundle);
+  ReminderMgr.start();
   // §35: start relay transport if the workspace has a relay configured.
   RelayMgr.startForWorkspace(bundle);
   // §37: start bridge transport if one is configured.
@@ -2982,6 +3113,8 @@ function renderWorkspace() {
         </div>
         <div class="sidebar-section">
           <div class="ch-item" id="btn-all-threads" style="color: var(--fg-dim);">💬 All threads</div>
+          <div class="ch-item" id="btn-saved" style="color: var(--fg-dim);">🔖 Saved</div>
+          <div class="ch-item" id="btn-drafts" style="color: var(--fg-dim);">📝 Drafts</div>
         </div>
         <div class="sidebar-section">
           <h3>Channels <button class="icon-btn" id="btn-new-channel" title="Create channel" style="float: right; padding: 0 6px; font-size: 14px; line-height: 1;">+</button></h3>
@@ -3246,6 +3379,10 @@ function renderWorkspace() {
   // v2: All threads entry
   const $allThreads = document.getElementById("btn-all-threads");
   if ($allThreads) $allThreads.onclick = () => setState({ modal: "all-threads" });
+  const $saved = document.getElementById("btn-saved");
+  if ($saved) $saved.onclick = () => setState({ modal: "saved" });
+  const $drafts = document.getElementById("btn-drafts");
+  if ($drafts) $drafts.onclick = () => setState({ modal: "drafts" });
   // Slice F1-A: click the me-row to open the custom status picker.
   const $setStatus = document.getElementById("btn-set-status");
   if ($setStatus) $setStatus.onclick = () => setState({ modal: "status" });
@@ -3752,6 +3889,9 @@ function renderWorkspace() {
       } else if (act === "forward") {
         State._forwardMsgId = id;
         setState({ modal: "forward" });
+      } else if (act === "bookmark") {
+        try { await toggleBookmark(State.current, id); render(); }
+        catch (err) { alert("Couldn't bookmark: " + err.message); }
       }
     };
   });
@@ -3824,6 +3964,27 @@ function renderWorkspace() {
     $threadComposer.focus();
   }
 
+  // Checklist item toggles.
+  document.querySelectorAll("[data-checklist]").forEach(cb => {
+    cb.onchange = async () => {
+      const mid = cb.getAttribute("data-checklist");
+      const idx = parseInt(cb.getAttribute("data-item-idx"), 10);
+      try { await toggleChecklistItem(State.current, mid, idx); render(); }
+      catch (err) { alert("Couldn't toggle: " + err.message); }
+    };
+  });
+
+  // Poll option clicks — vote / re-vote / clear.
+  document.querySelectorAll("[data-poll-vote]").forEach(opt => {
+    opt.onclick = async (e) => {
+      e.stopPropagation();
+      const mid = opt.getAttribute("data-poll-vote");
+      const idx = parseInt(opt.getAttribute("data-poll-idx"), 10);
+      try { await sendPollVote(State.current, mid, idx); render(); }
+      catch (err) { alert("Couldn't vote: " + err.message); }
+    };
+  });
+
   // Reaction pills — click to toggle your own reaction.
   document.querySelectorAll("[data-react-toggle]").forEach(pill => {
     pill.onclick = async (e) => {
@@ -3884,6 +4045,8 @@ function renderWorkspace() {
   if (State.modal === "forward")   renderForwardModal();
   if (State.modal === "status")    renderStatusModal();
   if (State.modal === "all-threads") renderAllThreadsModal();
+  if (State.modal === "saved")       renderSavedModal();
+  if (State.modal === "drafts")      renderDraftsModal();
 
   // Scroll to bottom — main channel messages, and the thread panel
   // scroller if it's open. Slice U1: if an unread divider is present
@@ -4074,6 +4237,8 @@ function renderMessage(m, members, myUserId, opts = {}) {
   const canEdit = !m.attachment && isMine;
   const canDelete = isMine;
   const attachmentHtml = m.attachment ? renderAttachment(m) : "";
+  const pollHtml = m.poll ? renderPoll(m, myUserId) : "";
+  const checklistHtml = m.checklist ? renderChecklist(m) : "";
   // Slice S1: /me rendering — body is stored with `/me ` prefix on the
   // wire so every peer renders the same action layout. The author's name
   // is already shown in msg-meta above, so we just render the action
@@ -4116,6 +4281,7 @@ function renderMessage(m, members, myUserId, opts = {}) {
       <button class="icon-btn msg-action" data-act="react" data-msg="${escapeHTML(m.id)}" title="Add reaction">😊</button>
       ${canReply ? `<button class="icon-btn msg-action" data-act="thread" data-msg="${escapeHTML(m.id)}" title="Reply in thread">💬</button>` : ""}
       ${canPin ? `<button class="icon-btn msg-action${pinned ? " active-pin" : ""}" data-act="pin" data-msg="${escapeHTML(m.id)}" title="${pinned ? "Unpin" : "Pin to channel"}">📌</button>` : ""}
+      <button class="icon-btn msg-action${isBookmarked(State.current, m.id) ? " active-pin" : ""}" data-act="bookmark" data-msg="${escapeHTML(m.id)}" title="${isBookmarked(State.current, m.id) ? "Remove bookmark" : "Save for later"}">🔖</button>
       <button class="icon-btn msg-action" data-act="forward" data-msg="${escapeHTML(m.id)}" title="Forward to another channel">📨</button>
       ${canEdit ? `<button class="icon-btn msg-action" data-act="edit" data-msg="${escapeHTML(m.id)}" title="Edit">✎</button>` : ""}
       ${canDelete ? `<button class="icon-btn msg-action" data-act="delete" data-msg="${escapeHTML(m.id)}" title="Delete">🗑</button>` : ""}
@@ -4128,13 +4294,15 @@ function renderMessage(m, members, myUserId, opts = {}) {
       <div class="msg-body">
         <div class="msg-meta">
           <span class="msg-author">${escapeHTML(member.name)}</span>
-          <span class="msg-time" data-copy-permalink="${escapeHTML(m.id)}" title="Copy link to this message">${formatTime(m.ts)}</span>
+          <span class="msg-time" data-copy-permalink="${escapeHTML(m.id)}" title="${escapeHTML(timestampTooltip(m.ts, member))} — click to copy link">${formatTime(m.ts)}</span>
           ${pinMark}
           ${editedMark}
           ${check}
         </div>
         ${bodyHtml}
         ${attachmentHtml}
+        ${pollHtml}
+        ${checklistHtml}
         ${reactionsHtml}
         ${replyPill}
       </div>
@@ -4225,7 +4393,65 @@ function renderReactionPills(m, members, myUserId) {
  * output — XSS-safe (spec §15.2 "XSS via message rendering").
  */
 function renderMessageBody(body, mentions, members, groups = []) {
-  // Group names we should render as pills — present when groups exist.
+  // Split the body into plain-text and fenced-code segments. `\`\`\``
+  // starts a code fence; an optional language tag follows on the same
+  // line; `\`\`\`` on its own ends the fence. Fenced content is NOT
+  // processed for mentions or inline formatting — it's literal.
+  const codeOut = [];
+  const parts = [];
+  {
+    const lines = body.split("\n");
+    let inFence = false;
+    let buf = [];
+    let lang = "";
+    const flushText = (s) => { if (s.length) parts.push({ kind: "text", s }); };
+    let plain = "";
+    for (const line of lines) {
+      const fence = line.match(/^```(\w*)\s*$/);
+      if (fence && !inFence) {
+        if (plain.length) { flushText(plain); plain = ""; }
+        inFence = true;
+        lang = fence[1] || "";
+        buf = [];
+        continue;
+      }
+      if (fence && inFence) {
+        parts.push({ kind: "code", s: buf.join("\n"), lang });
+        inFence = false;
+        lang = "";
+        continue;
+      }
+      if (inFence) { buf.push(line); continue; }
+      plain += (plain ? "\n" : "") + line;
+    }
+    if (inFence) {
+      // unterminated fence — treat the rest as code so the user doesn't lose content
+      parts.push({ kind: "code", s: buf.join("\n"), lang });
+    }
+    if (plain.length) flushText(plain);
+  }
+  // If the whole body was a single plain segment with no mentions/groups,
+  // short-circuit to the original fast path.
+  const groupByName = new Map();
+  for (const g of groups) groupByName.set(g.name, g);
+  const noHighlights = (!mentions || mentions.length === 0) && groupByName.size === 0;
+  if (parts.length === 1 && parts[0].kind === "text" && noHighlights) {
+    return escapeHTML(body);
+  }
+  // Helper: render a text segment with mention + group highlighting.
+  const renderTextSeg = (seg) => renderInlineHighlights(seg, mentions, members, groups);
+  return parts.map(p => {
+    if (p.kind === "code") {
+      const langCls = p.lang ? ` class="lang-${escapeHTML(p.lang)}"` : "";
+      return `<pre class="msg-code"><code${langCls}>${escapeHTML(p.s)}</code></pre>`;
+    }
+    return renderTextSeg(p.s);
+  }).join("");
+}
+
+// Split out the mention + group highlighting logic so it's reusable for
+// each plain-text segment between code fences.
+function renderInlineHighlights(body, mentions, members, groups = []) {
   const groupByName = new Map();
   for (const g of groups) groupByName.set(g.name, g);
   if ((!mentions || mentions.length === 0) && groupByName.size === 0) {
@@ -4519,7 +4745,9 @@ async function sendMessageNow(body, opts = {}) {
     body,
     vectorClock,
     mentions,
-    threadId
+    threadId,
+    poll: opts.poll,
+    checklist: opts.checklist
   });
 
   // Update in-memory projection without re-replaying everything.
@@ -4529,6 +4757,9 @@ async function sendMessageNow(body, opts = {}) {
     id: env.id, ch: env.ch, from: env.from, ts: env.ts, body,
     mentions: mentions.length > 0 ? mentions : undefined,
     thread: threadId || undefined,
+    poll: opts.poll || undefined,
+    votes: opts.poll ? {} : undefined,
+    checklist: opts.checklist ? JSON.parse(JSON.stringify(opts.checklist)) : undefined,
     delivery: peerAttached ? "sent" : "stored"
   });
 
@@ -4712,6 +4943,127 @@ const STATUS_PRESETS = [
  * user participates in (authored the root, replied in, or was mentioned).
  * Click an entry to jump into the thread panel of its channel.
  */
+function renderSavedModal() {
+  if (document.querySelector('.modal-bg[data-saved]')) return;
+  const current = State.current;
+  const entries = [...(current.bookmarks?.values() || [])].sort((a, b) => b.savedAt - a.savedAt);
+
+  const rowHtml = (b) => {
+    const msg = current.messages.find(m => m.id === b.msgId);
+    const ch = current.channels.find(c => c.id === b.ch);
+    const chLabel = ch ? (ch.dm ? "DM" : (ch.private ? "🔒 " : "# ") + ch.name) : "?";
+    const author = msg && current.members.find(m => m.id === msg.from);
+    const body = !msg ? `<em style="color: var(--fg-dim);">(message not available)</em>`
+      : msg.deleted ? `<em style="color: var(--fg-dim);">(deleted)</em>`
+      : escapeHTML((msg.body || (msg.attachment ? `📎 ${msg.attachment.name || "attachment"}` : "")).slice(0, 200));
+    return `
+      <div class="switcher-row" data-open-saved="${escapeHTML(b.msgId)}" data-open-saved-ch="${escapeHTML(b.ch)}">
+        <span class="switcher-icon plain">🔖</span>
+        <div class="switcher-body">
+          <div class="switcher-label"><strong>${escapeHTML(author?.name || "?")}</strong> in ${escapeHTML(chLabel)}</div>
+          <div class="switcher-sub" style="max-width: 420px;">${body}</div>
+          <div style="font-size: 10px; color: var(--fg-dim); margin-top: 2px;">saved ${formatRelative(b.savedAt)}</div>
+        </div>
+        <button class="icon-btn" data-unsave="${escapeHTML(b.msgId)}" title="Remove bookmark" style="font-size: 14px; padding: 2px 6px; opacity: 0.6;">🗑</button>
+      </div>
+    `;
+  };
+
+  const wrap = document.createElement("div");
+  wrap.className = "modal-bg";
+  wrap.dataset.saved = "1";
+  wrap.innerHTML = `
+    <div class="card" style="max-width: 600px; max-height: calc(100vh - 60px); overflow-y: auto;">
+      <div class="row" style="margin-bottom: 12px;">
+        <h1 style="margin: 0; font-size: 18px; flex: 1;">🔖 Saved for later</h1>
+        <button class="icon-btn" id="saved-close" style="font-size: 18px; padding: 2px 7px;">✕</button>
+      </div>
+      <div style="font-size: 12px; color: var(--fg-dim); margin-bottom: 10px;">
+        Stored on this device only — not synced across devices.
+      </div>
+      ${entries.length === 0
+        ? `<div style="color: var(--fg-dim); font-size: 13px; padding: 20px 0; text-align: center;">Nothing saved yet. Hover any message and click 🔖 to save it.</div>`
+        : entries.map(rowHtml).join("")}
+    </div>
+  `;
+  document.body.appendChild(wrap);
+  wrap.querySelector("#saved-close").onclick = () => { wrap.remove(); closeModal(); };
+  wrap.onclick = (e) => { if (e.target === wrap) { wrap.remove(); closeModal(); } };
+  wrap.querySelectorAll("[data-open-saved]").forEach(el => {
+    el.onclick = (e) => {
+      if (e.target.hasAttribute("data-unsave")) return;
+      const msgId = el.getAttribute("data-open-saved");
+      const chId  = el.getAttribute("data-open-saved-ch");
+      wrap.remove();
+      setState({ currentChannel: chId, modal: null });
+      setTimeout(() => {
+        const row = document.querySelector(`[data-msg-row="${CSS.escape(msgId)}"]`);
+        if (row) {
+          row.scrollIntoView({ block: "center", behavior: "smooth" });
+          row.classList.add("msg-flash");
+          setTimeout(() => row.classList.remove("msg-flash"), 1800);
+        }
+      }, 60);
+    };
+  });
+  wrap.querySelectorAll("[data-unsave]").forEach(btn => {
+    btn.onclick = async (e) => {
+      e.stopPropagation();
+      const mid = btn.getAttribute("data-unsave");
+      await toggleBookmark(current, mid);
+      wrap.remove();
+      setState({ modal: "saved" });
+    };
+  });
+}
+
+function renderDraftsModal() {
+  if (document.querySelector('.modal-bg[data-drafts]')) return;
+  const current = State.current;
+  // Load every non-empty draft from the drafts store.
+  (async () => {
+    const entries = await idbGetAllEntries(current.wsDB, "drafts");
+    const withText = entries.filter(e => typeof e.value === "string" && e.value.trim().length > 0);
+    const wrap = document.createElement("div");
+    wrap.className = "modal-bg";
+    wrap.dataset.drafts = "1";
+    const rowHtml = (e) => {
+      const ch = current.channels.find(c => c.id === e.key);
+      const chLabel = ch ? (ch.dm ? (ch.dm_with ? "DM" : "Group DM") : (ch.private ? "🔒 " : "# ") + ch.name) : "(unknown channel)";
+      return `
+        <div class="switcher-row" data-open-draft="${escapeHTML(e.key)}">
+          <span class="switcher-icon plain">📝</span>
+          <div class="switcher-body">
+            <div class="switcher-label">${escapeHTML(chLabel)}</div>
+            <div class="switcher-sub" style="max-width: 440px;">${escapeHTML(e.value.slice(0, 180))}</div>
+          </div>
+        </div>
+      `;
+    };
+    wrap.innerHTML = `
+      <div class="card" style="max-width: 600px; max-height: calc(100vh - 60px); overflow-y: auto;">
+        <div class="row" style="margin-bottom: 12px;">
+          <h1 style="margin: 0; font-size: 18px; flex: 1;">📝 Drafts</h1>
+          <button class="icon-btn" id="drafts-close" style="font-size: 18px; padding: 2px 7px;">✕</button>
+        </div>
+        ${withText.length === 0
+          ? `<div style="color: var(--fg-dim); font-size: 13px; padding: 20px 0; text-align: center;">No unsent drafts right now.</div>`
+          : withText.map(rowHtml).join("")}
+      </div>
+    `;
+    document.body.appendChild(wrap);
+    wrap.querySelector("#drafts-close").onclick = () => { wrap.remove(); closeModal(); };
+    wrap.onclick = (e) => { if (e.target === wrap) { wrap.remove(); closeModal(); } };
+    wrap.querySelectorAll("[data-open-draft]").forEach(el => {
+      el.onclick = () => {
+        const chId = el.getAttribute("data-open-draft");
+        wrap.remove();
+        setState({ currentChannel: chId, modal: null });
+      };
+    });
+  })();
+}
+
 function renderAllThreadsModal() {
   if (document.querySelector('.modal-bg[data-all-threads]')) return;
   const current = State.current;
@@ -5402,10 +5754,30 @@ function renderSettingsDevicesTab(current, me) {
 }
 
 function renderSettingsIdentityTab(me) {
+  const localTz = Intl.DateTimeFormat().resolvedOptions().timeZone;
   return `
     <div class="field">
       <label>Your fingerprint</label>
       <div class="mono" style="background: var(--bg-sunken); padding: 10px; border-radius: 6px; font-size: 12px;">${escapeHTML(me.fp)}</div>
+    </div>
+    <div class="field">
+      <label>Profile</label>
+      <div class="row" style="gap: 8px; margin-bottom: 8px;">
+        <input type="text" id="profile-pronouns" placeholder="Pronouns (e.g. she/her)" maxlength="40" value="${escapeHTML(me.pronouns || "")}" style="flex: 1;">
+        <input type="text" id="profile-title" placeholder="Title (e.g. Engineering)" maxlength="60" value="${escapeHTML(me.title || "")}" style="flex: 2;">
+      </div>
+      <div class="row" style="gap: 8px;">
+        <input type="text" id="profile-tz" placeholder="Time zone (e.g. ${escapeHTML(localTz)})" list="tz-list" value="${escapeHTML(me.timezone || "")}" style="flex: 1;">
+        <button id="profile-tz-auto" style="font-size: 12px;">Detect (${escapeHTML(localTz)})</button>
+      </div>
+      <datalist id="tz-list">
+        ${["America/Los_Angeles","America/Denver","America/Chicago","America/New_York","America/Sao_Paulo","Europe/London","Europe/Berlin","Europe/Athens","Africa/Johannesburg","Asia/Dubai","Asia/Kolkata","Asia/Singapore","Asia/Tokyo","Australia/Sydney","Pacific/Auckland"].map(z => `<option value="${z}">`).join("")}
+      </datalist>
+      <div class="row" style="margin-top: 8px;">
+        <div class="grow"></div>
+        <button class="primary" id="profile-save">Save profile</button>
+      </div>
+      <div class="err" id="profile-err"></div>
     </div>
     <div class="field">
       <label>Backup status</label>
@@ -5720,6 +6092,30 @@ function wireSettingsTab(tab, wrap, current, me, wsName) {
   if (tab === "identity") {
     const btn = wrap.querySelector("#s-backup-btn");
     if (btn) btn.onclick = () => { wrap.remove(); openBackupModal(); };
+    // Profile auto-detect + save
+    const $auto = wrap.querySelector("#profile-tz-auto");
+    if ($auto) $auto.onclick = () => {
+      wrap.querySelector("#profile-tz").value = Intl.DateTimeFormat().resolvedOptions().timeZone;
+    };
+    const $save = wrap.querySelector("#profile-save");
+    if ($save) $save.onclick = async () => {
+      const $err = wrap.querySelector("#profile-err");
+      $err.textContent = "";
+      const patch = {
+        pronouns: wrap.querySelector("#profile-pronouns").value.trim(),
+        title:    wrap.querySelector("#profile-title").value.trim(),
+        timezone: wrap.querySelector("#profile-tz").value.trim(),
+      };
+      $save.disabled = true;
+      try {
+        await sendProfileUpdate(current, patch);
+        wrap.remove();
+        setState({ modal: null });
+      } catch (e) {
+        $err.textContent = e.message;
+        $save.disabled = false;
+      }
+    };
 
   } else if (tab === "devices") {
     const $addBtn = wrap.querySelector("#btn-add-device-pair");
@@ -8580,6 +8976,28 @@ const EnvelopeDispatch = {
 
   async handle(current, env, inner) {
     switch (env.type) {
+      case "poll.vote": {
+        const pollMsg = current.messages.find(m => m.id === inner.target);
+        if (!pollMsg || !pollMsg.poll) break;
+        if (!pollMsg.votes) pollMsg.votes = {};
+        if (typeof inner.optionIdx === "number" && inner.optionIdx >= 0 && inner.optionIdx < pollMsg.poll.options.length) {
+          pollMsg.votes[env.from] = inner.optionIdx;
+        } else if (inner.optionIdx === null || inner.optionIdx === -1) {
+          delete pollMsg.votes[env.from];
+        }
+        break;
+      }
+
+      case "checklist.toggle": {
+        const tgt = current.messages.find(m => m.id === inner.target);
+        if (!tgt || !tgt.checklist) break;
+        const idx = inner.itemIdx;
+        if (typeof idx === "number" && tgt.checklist.items[idx]) {
+          tgt.checklist.items[idx].done = !!inner.done;
+        }
+        break;
+      }
+
       case "message.create":
         // Slice F1-B: on announcement channels, drop any message whose
         // sender isn't currently an owner or admin. The sender-side gate
@@ -8616,6 +9034,9 @@ const EnvelopeDispatch = {
             id: env.id, ch: env.ch, from: env.from, ts: env.ts, body: inner.body,
             mentions: trustedMentions.length > 0 ? trustedMentions : undefined,
             thread: inner.thread || undefined,
+            poll: inner.poll || undefined,
+            votes: inner.poll ? {} : undefined,
+            checklist: inner.checklist ? JSON.parse(JSON.stringify(inner.checklist)) : undefined,
             delivery: "delivered",
             edited: false,
             deleted: false,
@@ -9240,6 +9661,18 @@ const EnvelopeDispatch = {
         break;
       }
 
+      case "member.profile_update": {
+        // v1.1: member-self-updated profile fields (tz, pronouns, title).
+        // Sender can only update their own record.
+        const pm = current.members.find(m => m.id === env.from);
+        if (!pm) break;
+        if (inner.timezone !== undefined) pm.timezone = inner.timezone || null;
+        if (inner.pronouns !== undefined) pm.pronouns = inner.pronouns || null;
+        if (inner.title    !== undefined) pm.title    = inner.title    || null;
+        await idbPut(current.wsDB, "members", pm);
+        break;
+      }
+
       case "member.transfer_admin": {
         // v1.1: unilateral hand-off of admin rights. Sender must currently
         // be an owner or admin; target must be a known member who isn't
@@ -9821,6 +10254,243 @@ async function toggleReaction(current, targetId, emoji) {
  *  any visible message in channels they belong to. No new envelope
  *  types needed — this rides the existing CRDT patch path.
  * ------------------------------------------------------------ */
+/* ------------------------------------------------------------
+ *  Poll voting (inline polls via /poll)
+ *  One vote per user per poll; voting again for a different option
+ *  replaces the prior vote; voting for the same option clears it.
+ * ------------------------------------------------------------ */
+async function sendPollVote(current, targetMsgId, optionIdx) {
+  const msg = current.messages.find(m => m.id === targetMsgId);
+  if (!msg || !msg.poll) throw new Error("Not a poll message");
+  const myUserId = bytesToB64Url(State.identity.pubkey);
+  const ch = current.channels.find(c => c.id === msg.ch);
+  const channelKey = current.channelKeys[ch.id];
+  // Toggle off if the user is voting again for the same option.
+  const current_vote = msg.votes?.[myUserId];
+  const final = current_vote === optionIdx ? -1 : optionIdx;
+  const signKey = await Crypto.importSignKey(State.identity.privkey_pkcs8);
+  const meta = current.meta;
+  meta.lc_counter = (meta.lc_counter || 0) + 1;
+  await idbPut(current.wsDB, "keys", meta, "workspace_meta");
+  const env = await Envelope.build({
+    workspaceId: meta.id,
+    channelId: ch.id,
+    channelKey,
+    signKey,
+    signerPubkey: State.identity.pubkey,
+    deviceId: meta.device_id,
+    type: "poll.vote",
+    inner: { target: targetMsgId, optionIdx: final },
+    vectorClock: [[myUserId, meta.lc_counter]]
+  });
+  await idbPut(current.wsDB, "envelopes", env);
+  // Apply locally.
+  if (!msg.votes) msg.votes = {};
+  if (final === -1) delete msg.votes[myUserId]; else msg.votes[myUserId] = final;
+  PeerMgr.sendEnvelope(meta.id, env).catch(e => console.warn(e));
+}
+
+function renderPoll(m, myUserId) {
+  if (!m.poll) return "";
+  const votes = m.votes || {};
+  const totals = m.poll.options.map((_, i) =>
+    Object.values(votes).filter(v => v === i).length
+  );
+  const maxVotes = Math.max(1, ...totals);
+  const myVote = votes[myUserId];
+  return `
+    <div class="poll">
+      <div class="poll-q">📊 ${escapeHTML(m.poll.question)}</div>
+      ${m.poll.options.map((opt, i) => {
+        const count = totals[i];
+        const pct = Math.round((count / Math.max(1, Object.keys(votes).length)) * 100);
+        const mine = myVote === i;
+        const width = Math.round((count / maxVotes) * 100);
+        return `
+          <div class="poll-opt ${mine ? "mine" : ""}" data-poll-vote="${escapeHTML(m.id)}" data-poll-idx="${i}">
+            <div class="poll-bar" style="width: ${width}%"></div>
+            <div class="poll-opt-label">${mine ? "✓ " : ""}${escapeHTML(opt)}</div>
+            <div class="poll-opt-count">${count}${count > 0 ? ` · ${pct}%` : ""}</div>
+          </div>
+        `;
+      }).join("")}
+      <div class="poll-total">${Object.keys(votes).length} vote${Object.keys(votes).length === 1 ? "" : "s"}</div>
+    </div>
+  `;
+}
+
+/* Bookmarks — save messages for later (per-user, local-only). */
+/* Profile updates — tz / pronouns / title. Persistent envelope (not
+ * ephemeral). Receiver updates the member record for env.from. */
+/* Reminders — per-device, local-only. Persisted in IDB so they survive
+ * a reload, fired by a single interval. Honest caveat: the tab must be
+ * open when the reminder is due (no push, no service-worker scheduler).
+ * Missed reminders that became due while offline fire on next app open. */
+const ReminderMgr = {
+  _interval: null,
+  start() {
+    if (this._interval) return;
+    // Check every 20s — reminders are minute-granular so this is fine.
+    this._interval = setInterval(() => this.tick().catch(console.warn), 20_000);
+    // Also fire once on boot to catch anything that came due while the app was closed.
+    setTimeout(() => this.tick().catch(console.warn), 500);
+  },
+  async tick() {
+    const current = State.current;
+    if (!current) return;
+    const now = Date.now();
+    for (const [id, rem] of current.reminders || []) {
+      if (rem.fireAt <= now && !rem.fired) {
+        rem.fired = true;
+        await idbDelete(current.wsDB, "reminders", id);
+        current.reminders.delete(id);
+        flashReminderToast(`⏰ Reminder: ${rem.text}`, 0);
+        if (Notifier?.supported() && Notification.permission === "granted") {
+          try { new Notification("Reminder", { body: rem.text }); } catch {}
+        }
+      }
+    }
+  },
+};
+
+async function scheduleReminder(current, delayMs, text) {
+  const id = bytesToB64Url(Crypto.rand(8));
+  const rec = { id, fireAt: Date.now() + delayMs, text, setAt: Date.now() };
+  if (!current.reminders) current.reminders = new Map();
+  current.reminders.set(id, rec);
+  await idbPut(current.wsDB, "reminders", rec, id);
+}
+
+function flashReminderToast(text, autoHideMs = 4000) {
+  const existing = document.querySelector(".reminder-toast");
+  if (existing) existing.remove();
+  const el = document.createElement("div");
+  el.className = "reminder-toast";
+  el.textContent = text;
+  document.body.appendChild(el);
+  requestAnimationFrame(() => el.classList.add("show"));
+  if (autoHideMs > 0) {
+    setTimeout(() => {
+      el.classList.remove("show");
+      setTimeout(() => el.remove(), 250);
+    }, autoHideMs);
+  } else {
+    // Click-to-dismiss for persistent reminder-fire toasts.
+    el.style.cursor = "pointer";
+    el.onclick = () => { el.classList.remove("show"); setTimeout(() => el.remove(), 250); };
+  }
+}
+
+async function sendProfileUpdate(current, patch) {
+  const myUserId = bytesToB64Url(State.identity.pubkey);
+  const me = current.members.find(m => m.id === myUserId);
+  if (!me) throw new Error("Member record missing.");
+  const signKey = await Crypto.importSignKey(State.identity.privkey_pkcs8);
+  const meta = current.meta;
+  meta.lc_counter = (meta.lc_counter || 0) + 1;
+  await idbPut(current.wsDB, "keys", meta, "workspace_meta");
+  const env = await Envelope.build({
+    workspaceId: meta.id,
+    channelId: null,
+    channelKey: current.rootKey,
+    signKey,
+    signerPubkey: State.identity.pubkey,
+    deviceId: meta.device_id,
+    type: "member.profile_update",
+    inner: {
+      timezone: patch.timezone || null,
+      pronouns: patch.pronouns || null,
+      title:    patch.title    || null,
+    },
+    vectorClock: [[myUserId, meta.lc_counter]]
+  });
+  await idbPut(current.wsDB, "envelopes", env);
+  // Apply locally
+  if (patch.timezone !== undefined) me.timezone = patch.timezone || null;
+  if (patch.pronouns !== undefined) me.pronouns = patch.pronouns || null;
+  if (patch.title    !== undefined) me.title    = patch.title    || null;
+  await idbPut(current.wsDB, "members", me);
+  PeerMgr.sendEnvelope(meta.id, env).catch(e => console.warn(e));
+}
+
+/* Format a timestamp as "3:42 PM · 9:12 AM for Alice" when we know
+ * the author's timezone and it differs from ours. */
+function timestampTooltip(ts, author) {
+  const mine = new Date(ts).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+  if (!author?.timezone) return mine;
+  try {
+    const theirs = new Date(ts).toLocaleTimeString([], {
+      hour: "numeric", minute: "2-digit", timeZone: author.timezone
+    });
+    if (theirs === mine) return mine;
+    return `${mine} · ${theirs} for ${author.name}`;
+  } catch { return mine; }
+}
+
+async function toggleBookmark(current, msgId) {
+  if (!current.bookmarks) current.bookmarks = new Map();
+  if (current.bookmarks.has(msgId)) {
+    current.bookmarks.delete(msgId);
+    await idbDelete(current.wsDB, "bookmarks", msgId);
+  } else {
+    const msg = current.messages.find(m => m.id === msgId);
+    if (!msg) return;
+    const rec = { msgId, ch: msg.ch, ts: msg.ts, savedAt: Date.now() };
+    current.bookmarks.set(msgId, rec);
+    await idbPut(current.wsDB, "bookmarks", rec, msgId);
+  }
+}
+
+function isBookmarked(current, msgId) {
+  return current.bookmarks?.has(msgId) || false;
+}
+
+async function toggleChecklistItem(current, targetMsgId, itemIdx) {
+  const msg = current.messages.find(m => m.id === targetMsgId);
+  if (!msg || !msg.checklist) return;
+  const item = msg.checklist.items[itemIdx];
+  if (!item) return;
+  const newDone = !item.done;
+  const ch = current.channels.find(c => c.id === msg.ch);
+  const channelKey = current.channelKeys[ch.id];
+  const signKey = await Crypto.importSignKey(State.identity.privkey_pkcs8);
+  const meta = current.meta;
+  meta.lc_counter = (meta.lc_counter || 0) + 1;
+  await idbPut(current.wsDB, "keys", meta, "workspace_meta");
+  const myUserId = bytesToB64Url(State.identity.pubkey);
+  const env = await Envelope.build({
+    workspaceId: meta.id,
+    channelId: ch.id,
+    channelKey,
+    signKey,
+    signerPubkey: State.identity.pubkey,
+    deviceId: meta.device_id,
+    type: "checklist.toggle",
+    inner: { target: targetMsgId, itemIdx, done: newDone },
+    vectorClock: [[myUserId, meta.lc_counter]]
+  });
+  await idbPut(current.wsDB, "envelopes", env);
+  item.done = newDone;
+  PeerMgr.sendEnvelope(meta.id, env).catch(e => console.warn(e));
+}
+
+function renderChecklist(m) {
+  if (!m.checklist) return "";
+  const done = m.checklist.items.filter(i => i.done).length;
+  const total = m.checklist.items.length;
+  return `
+    <div class="checklist">
+      <div class="checklist-head">☑ ${escapeHTML(m.checklist.title)} <span class="checklist-count">${done}/${total}</span></div>
+      ${m.checklist.items.map((it, i) => `
+        <label class="checklist-item${it.done ? " done" : ""}">
+          <input type="checkbox" ${it.done ? "checked" : ""} data-checklist="${escapeHTML(m.id)}" data-item-idx="${i}">
+          <span>${escapeHTML(it.text)}</span>
+        </label>
+      `).join("")}
+    </div>
+  `;
+}
+
 async function togglePin(current, channelId, msgId) {
   if (!current.doc) throw new Error("workspace doc not loaded");
   const existing = WorkspaceDoc.getPins(current.doc, channelId);
@@ -10204,6 +10874,165 @@ const SLASH = {
     summary: "List all slash commands",
     usage: "/help",
     run: async () => { setState({ modal: "slash-help" }); }
+  },
+
+  // ---- Quick utilities: each resolves to a message the user sends ----
+  roll: {
+    summary: "Roll dice (e.g. 2d6)",
+    usage: "/roll [NdM]",
+    run: async ({ args }) => {
+      const spec = (args || "1d6").trim();
+      const m = spec.match(/^(\d*)d(\d+)$/i);
+      if (!m) throw new Error("Usage: /roll NdM  (e.g. 3d6)");
+      const n = Math.min(Math.max(parseInt(m[1] || "1", 10), 1), 100);
+      const sides = Math.min(Math.max(parseInt(m[2], 10), 2), 1000);
+      const rolls = Array.from({ length: n }, () => Math.floor(Math.random() * sides) + 1);
+      const sum = rolls.reduce((a, b) => a + b, 0);
+      const body = `/me rolled ${spec}: ${rolls.join(", ")}${n > 1 ? ` = ${sum}` : ""}`;
+      await sendMessageNow(body);
+    }
+  },
+  flip: {
+    summary: "Flip a coin",
+    usage: "/flip",
+    run: async () => {
+      const r = Math.random() < 0.5 ? "heads" : "tails";
+      await sendMessageNow("/me flipped a coin: **" + r + "**");
+    }
+  },
+  "8ball": {
+    summary: "Ask the Magic 8-ball",
+    usage: "/8ball <question>",
+    run: async ({ args }) => {
+      const q = (args || "").trim();
+      if (!q) throw new Error("Usage: /8ball <question>");
+      const answers = [
+        "It is certain", "Without a doubt", "Yes definitely", "You may rely on it",
+        "As I see it, yes", "Most likely", "Outlook good", "Yes",
+        "Reply hazy, try again", "Ask again later", "Better not tell you now",
+        "Cannot predict now", "Concentrate and ask again",
+        "Don't count on it", "My reply is no", "My sources say no",
+        "Outlook not so good", "Very doubtful",
+      ];
+      const a = answers[Math.floor(Math.random() * answers.length)];
+      await sendMessageNow(`🎱 **${q}**\n${a}.`);
+    }
+  },
+  hash: {
+    summary: "SHA-256 hash a string",
+    usage: "/hash <text>",
+    run: async ({ args }) => {
+      const text = (args || "").trim();
+      if (!text) throw new Error("Usage: /hash <text>");
+      const bytes = new TextEncoder().encode(text);
+      const h = await crypto.subtle.digest("SHA-256", bytes);
+      const hex = [...new Uint8Array(h)].map(b => b.toString(16).padStart(2, "0")).join("");
+      await sendMessageNow("```\nsha256(" + text + ") =\n" + hex + "\n```");
+    }
+  },
+  uuid: {
+    summary: "Generate a random UUID v4",
+    usage: "/uuid",
+    run: async () => {
+      const id = (crypto.randomUUID && crypto.randomUUID()) || (() => {
+        const b = Crypto.rand(16);
+        b[6] = (b[6] & 0x0f) | 0x40;
+        b[8] = (b[8] & 0x3f) | 0x80;
+        const h = [...b].map(x => x.toString(16).padStart(2, "0")).join("");
+        return `${h.slice(0,8)}-${h.slice(8,12)}-${h.slice(12,16)}-${h.slice(16,20)}-${h.slice(20)}`;
+      })();
+      await sendMessageNow("`" + id + "`");
+    }
+  },
+  base64: {
+    summary: "Base64-encode text",
+    usage: "/base64 <text>",
+    run: async ({ args }) => {
+      const text = (args || "");
+      if (!text) throw new Error("Usage: /base64 <text>");
+      const enc = btoa(unescape(encodeURIComponent(text)));
+      await sendMessageNow("`" + enc + "`");
+    }
+  },
+  base64d: {
+    summary: "Base64-decode text",
+    usage: "/base64d <text>",
+    run: async ({ args }) => {
+      const text = (args || "").trim();
+      if (!text) throw new Error("Usage: /base64d <text>");
+      try {
+        const dec = decodeURIComponent(escape(atob(text)));
+        await sendMessageNow("`" + dec + "`");
+      } catch { throw new Error("Invalid base64 input."); }
+    }
+  },
+  away: {
+    summary: "Set a temporary away status",
+    usage: "/away [minutes]",
+    run: async ({ args }) => {
+      const mins = Math.max(1, Math.min(240, parseInt((args || "").trim() || "30", 10) || 30));
+      await setCustomStatus({ emoji: "🌴", text: `Away · back in ${mins}m` });
+      // Auto-clear when the timer elapses (best-effort: tab must stay open).
+      setTimeout(() => {
+        const cs = State.identity.custom_status;
+        if (cs && cs.text?.startsWith("Away ·")) setCustomStatus(null);
+      }, mins * 60_000);
+    }
+  },
+  poll: {
+    summary: "Create a poll (question | opt A | opt B | …)",
+    usage: "/poll question | opt A | opt B | …",
+    run: async ({ args, current }) => {
+      const parts = (args || "").split("|").map(s => s.trim()).filter(Boolean);
+      if (parts.length < 3) throw new Error("Usage: /poll question | opt A | opt B [| opt C …]");
+      const [question, ...options] = parts;
+      if (options.length > 12) throw new Error("Polls support up to 12 options.");
+      await sendMessageNow("", { poll: { question, options } });
+    }
+  },
+  tz: {
+    summary: "Show a member's current time zone",
+    usage: "/tz @name",
+    run: async ({ args, current }) => {
+      const name = (args || "").trim().replace(/^@/, "");
+      if (!name) throw new Error("Usage: /tz @name");
+      const member = current.members.find(m => m.name.toLowerCase() === name.toLowerCase());
+      if (!member) throw new Error(`No member named "${name}"`);
+      if (!member.timezone) {
+        await sendMessageNow(`${name} hasn't set a time zone.`);
+        return;
+      }
+      const now = new Date().toLocaleTimeString([], { hour: "numeric", minute: "2-digit", timeZone: member.timezone });
+      await sendMessageNow(`🕑 ${name} · ${member.timezone} · currently ${now}`);
+    }
+  },
+  remind: {
+    summary: "Remind yourself in N minutes (tab must be open)",
+    usage: "/remind me in 5m|2h <text>",
+    run: async ({ args, current }) => {
+      const m = (args || "").match(/^me\s+in\s+(\d+)\s*(m|min|h|hr)\s+(.+)$/i);
+      if (!m) throw new Error("Usage: /remind me in 15m finish the PR");
+      const n = parseInt(m[1], 10);
+      const unit = m[2].toLowerCase().startsWith("h") ? 3600_000 : 60_000;
+      const delay = n * unit;
+      const text = m[3];
+      await scheduleReminder(current, delay, text);
+      const when = new Date(Date.now() + delay).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+      // Local confirmation — doesn't broadcast.
+      flashReminderToast(`Reminder set for ${when}`);
+    }
+  },
+  checklist: {
+    summary: "Create a shared checklist",
+    usage: "/checklist Title | item 1 | item 2 | …",
+    run: async ({ args, current }) => {
+      const parts = (args || "").split("|").map(s => s.trim()).filter(Boolean);
+      if (parts.length < 2) throw new Error("Usage: /checklist Title | item 1 | item 2");
+      const [title, ...items] = parts;
+      if (items.length > 30) throw new Error("Checklists support up to 30 items.");
+      const checklist = { title, items: items.map(text => ({ text, done: false })) };
+      await sendMessageNow("", { checklist });
+    }
   },
 };
 SLASH.huddle = SLASH.call;   // shared reference so /help dedupes as aliases
@@ -13698,6 +14527,9 @@ if (/[?&]debug=1/.test(location.search)) {
     // Post-roadmap (getters so the literal evaluates before these are declared below)
     get TypingMgr()  { return TypingMgr;  },
     get TestRunner() { return TestRunner; },
+    // Small tools
+    sendPollVote, toggleBookmark, isBookmarked, toggleChecklistItem,
+    sendProfileUpdate, scheduleReminder, ReminderMgr, timestampTooltip,
   };
 }
 
