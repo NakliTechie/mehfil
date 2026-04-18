@@ -731,6 +731,50 @@
     text-align: center;
     cursor: default;
   }
+  .icon-btn.recording { color: var(--danger); animation: rec-pulse 1s ease-in-out infinite; }
+  @keyframes rec-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.55; } }
+  .record-status {
+    font-size: 11px; color: var(--danger); padding: 6px 14px;
+    background: color-mix(in srgb, var(--danger) 8%, transparent);
+    border-top: 1px solid var(--line);
+  }
+  .canvas-pane {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+    padding: 16px 24px;
+    overflow-y: auto;
+  }
+  .canvas-editor {
+    flex: 1;
+    min-height: 200px;
+    width: 100%;
+    background: transparent;
+    border: none;
+    outline: none;
+    resize: none;
+    font: 14px/1.6 var(--mono, ui-monospace, monospace);
+    color: var(--fg);
+    padding: 0;
+  }
+  .canvas-preview {
+    font-size: 14px;
+    line-height: 1.65;
+    color: var(--fg);
+  }
+  .canvas-preview h1, .canvas-preview h2, .canvas-preview h3 { margin: 18px 0 8px; font-weight: 600; }
+  .canvas-preview h1 { font-size: 22px; }
+  .canvas-preview h2 { font-size: 18px; }
+  .canvas-preview h3 { font-size: 15px; }
+  .canvas-preview p { margin: 8px 0; }
+  .canvas-preview ul, .canvas-preview ol { margin: 8px 0 8px 20px; }
+  .canvas-preview li { margin: 2px 0; }
+  .canvas-preview code { background: var(--bg-sunken); padding: 1px 5px; border-radius: 3px; font-size: 12px; }
+  .canvas-preview pre { background: var(--bg-sunken); padding: 12px; border-radius: 6px; overflow-x: auto; margin: 10px 0; }
+  .canvas-preview pre code { background: transparent; padding: 0; }
+  .canvas-preview blockquote { border-left: 3px solid var(--accent); padding-left: 12px; color: var(--fg-dim); margin: 10px 0; }
+  .canvas-preview a { color: var(--accent); }
   .custom-status {
     font-size: 11px;
     color: var(--fg-dim);
@@ -2327,6 +2371,7 @@ const Workspace = {
               id: inner.id, name: inner.name, topic: inner.topic || "",
               private: !!inner.private, dm: !!inner.dm, dm_with: null,
               announce: announceReplay,
+              canvas: !!inner.canvas && !inner.private,
               members: inner.members || [],
               created_at: env.ts
             };
@@ -2906,6 +2951,9 @@ function renderWorkspace() {
           <p class="ws-mem">${current.members.length} member${current.members.length === 1 ? "" : "s"}</p>
         </div>
         <div class="sidebar-section">
+          <div class="ch-item" id="btn-all-threads" style="color: var(--fg-dim);">💬 All threads</div>
+        </div>
+        <div class="sidebar-section">
           <h3>Channels <button class="icon-btn" id="btn-new-channel" title="Create channel" style="float: right; padding: 0 6px; font-size: 14px; line-height: 1;">+</button></h3>
           ${current.channels.filter(c => !c.dm).map(c => {
             const u = computeUnread(current, myUserId, c.id);
@@ -2913,8 +2961,8 @@ function renderWorkspace() {
             const showBadge = u.count > 0 && !isActive;
             const isMention = u.mentions > 0 && !isActive;
             const isMuted = (current.meta.muted_channels || []).includes(c.id);
-            const chHash = c.announce ? "📢" : (c.private ? "🔒" : "#");
-            const chTitleSuffix = c.announce ? " (announcement channel)" : "";
+            const chHash = c.canvas ? "📝" : (c.announce ? "📢" : (c.private ? "🔒" : "#"));
+            const chTitleSuffix = c.canvas ? " (canvas)" : (c.announce ? " (announcement channel)" : "");
             return `
             <div class="ch-item ${isActive ? "active" : ""} ${showBadge ? "unread" : ""} ${isMuted ? "muted" : ""}" data-ch="${escapeHTML(c.id)}" title="${escapeHTML(c.name + chTitleSuffix)}">
               ${showBadge ? `<span class="unread-badge${isMention ? " mention" : ""}" title="${u.count} unread${u.mentions > 0 ? `, ${u.mentions} mention${u.mentions === 1 ? "" : "s"}` : ""}">${isMention ? `@${u.mentions}` : u.count}</span>` : ""}
@@ -3054,38 +3102,51 @@ function renderWorkspace() {
       </aside>
       <main class="main">
         <div class="main-head">
-          <div class="ch-title"><span style="color: var(--fg-dim)">#</span> ${escapeHTML(channel.name)}</div>
+          <div class="ch-title"><span style="color: var(--fg-dim)">${channel.canvas ? "📝" : "#"}</span> ${escapeHTML(channel.name)}</div>
           ${channel.topic ? `<div class="ch-topic" title="${escapeHTML(channel.topic)}">${escapeHTML(channel.topic)}</div>` : ""}
-          ${(() => {
+          ${channel.canvas ? `<button class="pins-pill" id="btn-canvas-toggle" title="Toggle edit / preview">${State._canvasPreview ? "✎ Edit" : "👁 Preview"}</button>` : ""}
+          ${!channel.canvas ? (() => {
             const pinCount = current.doc ? WorkspaceDoc.getPins(current.doc, currentChannel).length : 0;
             return pinCount > 0
               ? `<button class="pins-pill" id="btn-open-pins" title="See pinned messages">📌 ${pinCount} pinned</button>`
               : "";
-          })()}
+          })() : ""}
           <div class="badge ${badge.cls}" title="${escapeHTML(badge.title)}">
             <span class="dot" style="${badge.dotStyle}"></span>${escapeHTML(badge.label)}
           </div>
         </div>
         ${renderGapBanner(current)}
         ${renderTierEscalationBanner(current)}
-        <div class="messages" id="messages-list">
-          ${channelMessages.length === 0 && isOnlyMember ? renderEmptyState() : ""}
-          ${(() => {
-            const u = computeUnread(current, myUserId, currentChannel);
-            let out = "";
-            let dividerDone = false;
-            for (const m of channelMessages) {
-              if (!dividerDone && u.firstUnreadId && m.id === u.firstUnreadId) {
-                out += `<div class="unread-divider" id="unread-divider">New</div>`;
-                dividerDone = true;
-              }
-              out += renderMessage(m, current.members, myUserId, { replyCount: replyCounts.get(m.id) || 0 });
-            }
-            return out;
-          })()}
-        </div>
+        ${renderRekeyBanner(current, me)}
+        ${channel.canvas
+          ? `<div class="canvas-pane" id="canvas-pane">
+               ${State._canvasPreview
+                 ? `<div class="canvas-preview" id="canvas-preview">Loading…</div>`
+                 : `<textarea class="canvas-editor" id="canvas-editor" placeholder="Start typing — anyone in the workspace can edit. Markdown supported in Preview."></textarea>`
+               }
+             </div>`
+          : `<div class="messages" id="messages-list">
+               ${channelMessages.length === 0 && isOnlyMember ? renderEmptyState() : ""}
+               ${(() => {
+                 const u = computeUnread(current, myUserId, currentChannel);
+                 let out = "";
+                 let dividerDone = false;
+                 for (const m of channelMessages) {
+                   if (!dividerDone && u.firstUnreadId && m.id === u.firstUnreadId) {
+                     out += `<div class="unread-divider" id="unread-divider">New</div>`;
+                     dividerDone = true;
+                   }
+                   out += renderMessage(m, current.members, myUserId, { replyCount: replyCounts.get(m.id) || 0 });
+                 }
+                 return out;
+               })()}
+             </div>`
+        }
         ${HuddleMgr.renderBar(current)}
         ${(() => {
+          // Slice CV1: canvas channels have no composer — editing happens
+          // in the canvas pane itself.
+          if (channel.canvas) return "";
           // Slice F1-B: announcement channels — if you're not an admin,
           // render a read-only banner in place of the composer.
           if (channel.announce) {
@@ -3101,9 +3162,12 @@ function renderWorkspace() {
                 <div class="composer-actions">
                   <input type="file" id="attach-input" style="display:none">
                   <button class="icon-btn" id="btn-attach" title="Attach a file">📎</button>
+                  <button class="icon-btn" id="btn-record-audio" title="Record a voice message">🎙</button>
+                  <button class="icon-btn" id="btn-record-video" title="Record a screen clip">🎬</button>
                 </div>
               </div>
               <div id="drop-hint" class="drop-hint" style="display:none">Drop the file to attach</div>
+              <div id="record-status" style="display:none;"></div>
             </div>`;
         })()}
       </main>
@@ -3123,6 +3187,8 @@ function renderWorkspace() {
       if (State.currentChannel) {
         markChannelRead(current, State.currentChannel).catch(e => console.warn("markRead:", e));
       }
+      // Slice CV1: reset the canvas preview flag so a new channel opens in edit mode.
+      State._canvasPreview = false;
       setState({ currentChannel: newChId, threadOpen: null });
     };
   });
@@ -3130,6 +3196,9 @@ function renderWorkspace() {
   document.getElementById("btn-settings").onclick = () => openSettings();
   document.getElementById("btn-invite").onclick = openInviteModal;
   document.getElementById("btn-new-channel").onclick = openCreateChannelModal;
+  // v2: All threads entry
+  const $allThreads = document.getElementById("btn-all-threads");
+  if ($allThreads) $allThreads.onclick = () => setState({ modal: "all-threads" });
   // Slice F1-A: click the me-row to open the custom status picker.
   const $setStatus = document.getElementById("btn-set-status");
   if ($setStatus) $setStatus.onclick = () => setState({ modal: "status" });
@@ -3171,6 +3240,27 @@ function renderWorkspace() {
   const $dismissTier = document.getElementById("btn-dismiss-tier-banner");
   if ($dismissTier) $dismissTier.onclick = async () => {
     current.meta.tier_banner_dismissed = Date.now();
+    await idbPut(current.wsDB, "keys", current.meta, "workspace_meta");
+    setState({});
+  };
+  // v2: rekey banner wiring.
+  const $rekeyNow = document.getElementById("btn-rekey-now");
+  if ($rekeyNow) $rekeyNow.onclick = async () => {
+    if (!confirm("Rotate all workspace and channel keys now?\n\nHistory stays decryptable to current members. New traffic uses fresh keys.")) return;
+    $rekeyNow.disabled = true;
+    $rekeyNow.textContent = "Rotating keys…";
+    try {
+      await sendScheduledRekey(current);
+      setState({});
+    } catch (e) {
+      alert("Rekey failed: " + e.message);
+      $rekeyNow.disabled = false;
+      $rekeyNow.textContent = "Rekey now";
+    }
+  };
+  const $dismissRekey = document.getElementById("btn-dismiss-rekey");
+  if ($dismissRekey) $dismissRekey.onclick = async () => {
+    current.meta.rekey_banner_dismissed = Date.now();
     await idbPut(current.wsDB, "keys", current.meta, "workspace_meta");
     setState({});
   };
@@ -3476,6 +3566,46 @@ function renderWorkspace() {
     $attachInput.value = "";   // allow re-selecting the same file
   };
 
+  // v1.1: voice + video capture buttons. Click toggles between start and stop.
+  const wireMediaBtn = (btnId, kind) => {
+    const $btn = document.getElementById(btnId);
+    if (!$btn) return;
+    const $status = document.getElementById("record-status");
+    $btn.onclick = async () => {
+      if (MediaCapture.isActive() && MediaCapture.kind() === kind) {
+        $btn.classList.remove("recording");
+        $btn.title = kind === "audio" ? "Record a voice message" : "Record a screen clip";
+        if ($status) $status.style.display = "none";
+        try {
+          const file = await MediaCapture.stop();
+          if (file) await sendAttachment(State.current, currentChannel, file);
+          render();
+        } catch (e) { alert("Couldn't send clip: " + e.message); }
+      } else if (MediaCapture.isActive()) {
+        alert("Another recording is in progress. Stop that one first.");
+      } else {
+        try {
+          if (kind === "audio") await MediaCapture.startAudio();
+          else                  await MediaCapture.startVideo();
+          $btn.classList.add("recording");
+          $btn.title = "Click to stop + send";
+          if ($status) {
+            $status.style.display = "";
+            $status.className = "record-status";
+            $status.textContent = kind === "audio" ? "🔴 Recording audio… click 🎙 to stop + send" : "🔴 Recording screen… click 🎬 to stop + send";
+          }
+        } catch (e) {
+          // Permission denied or no device
+          if (e.name === "NotAllowedError") alert("Permission denied — allow " + kind + " access.");
+          else if (e.name === "NotFoundError") alert("No " + kind + " device found.");
+          else alert("Couldn't start: " + e.message);
+        }
+      }
+    };
+  };
+  wireMediaBtn("btn-record-audio", "audio");
+  wireMediaBtn("btn-record-video", "video");
+
   // Drag-and-drop onto the main pane.
   const $main = document.querySelector(".main");
   $main.ondragover = (e) => { e.preventDefault(); $main.classList.add("drop-active"); };
@@ -3530,6 +3660,9 @@ function renderWorkspace() {
       // noopener,noreferrer severs window.opener so an SVG (or any image)
       // opened in a new tab can't reach back into this page.
       el.onclick = () => window.open(url, "_blank", "noopener,noreferrer");
+    } else if (el.tagName === "AUDIO" || el.tagName === "VIDEO") {
+      // v1.1: inline media players (voice messages + video clips).
+      el.src = url;
     } else {
       el.onclick = () => {
         const link = document.createElement("a");
@@ -3574,6 +3707,25 @@ function renderWorkspace() {
   // Slice P1: channel-header "📌 N pinned" pill wiring.
   const $pinsPill = document.getElementById("btn-open-pins");
   if ($pinsPill) $pinsPill.onclick = () => setState({ modal: "pins" });
+
+  // Slice CV1: canvas editor binding + preview toggle.
+  if (channel.canvas) {
+    const $editor  = document.getElementById("canvas-editor");
+    const $preview = document.getElementById("canvas-preview");
+    const $toggle  = document.getElementById("btn-canvas-toggle");
+    if ($editor) {
+      CanvasMgr.bind(State.current, currentChannel, $editor);
+    } else {
+      CanvasMgr.dispose();
+    }
+    if ($preview) CanvasMgr.renderPreview(State.current, currentChannel, $preview);
+    if ($toggle) $toggle.onclick = () => {
+      State._canvasPreview = !State._canvasPreview;
+      render();
+    };
+  } else {
+    CanvasMgr.dispose();
+  }
 
   // Slice Q1: clickable timestamps → copy permalink.
   document.querySelectorAll("[data-copy-permalink]").forEach(el => {
@@ -3679,6 +3831,7 @@ function renderWorkspace() {
   if (State.modal === "shortcuts") renderShortcutsModal();
   if (State.modal === "forward")   renderForwardModal();
   if (State.modal === "status")    renderStatusModal();
+  if (State.modal === "all-threads") renderAllThreadsModal();
 
   // Scroll to bottom — main channel messages, and the thread panel
   // scroller if it's open. Slice U1: if an unread divider is present
@@ -3687,10 +3840,12 @@ function renderWorkspace() {
   // first unread message.
   const $list = document.getElementById("messages-list");
   const $divider = document.getElementById("unread-divider");
-  if ($divider && State._lastRenderedChannel !== currentChannel) {
-    $divider.scrollIntoView({ block: "start" });
-  } else {
-    $list.scrollTop = $list.scrollHeight;
+  if ($list) {
+    if ($divider && State._lastRenderedChannel !== currentChannel) {
+      $divider.scrollIntoView({ block: "start" });
+    } else {
+      $list.scrollTop = $list.scrollHeight;
+    }
   }
   State._lastRenderedChannel = currentChannel;
   const $threadScroll = document.getElementById("thread-scroll");
@@ -3752,6 +3907,39 @@ function composePlaceholder(channel, current) {
  * configured. Dismissible for 7 days. Clicking "Set up" opens the relay
  * tab of Settings.
  */
+/**
+ * v2: rekey-due banner. Shown when the configured rekey schedule has
+ * elapsed since `meta.last_rekey_at`. Admin-only; dismissable for 7
+ * days. `meta.rekey_schedule` values:
+ *   off       — no banner (default)
+ *   quarterly — 90 days
+ *   yearly    — 365 days
+ */
+const REKEY_SCHEDULE_DAYS = { off: 0, quarterly: 90, yearly: 365 };
+function renderRekeyBanner(current, me) {
+  const isAdm = me && (me.role === "owner" || me.role === "admin");
+  if (!isAdm) return "";
+  const schedule = current.meta.rekey_schedule || "off";
+  const days = REKEY_SCHEDULE_DAYS[schedule] || 0;
+  if (!days) return "";
+  const last = current.meta.last_rekey_at || current.meta.created_at || Date.now();
+  const age = Date.now() - last;
+  if (age < days * 86400_000) return "";
+  const dismissed = current.meta.rekey_banner_dismissed || 0;
+  if (dismissed && (Date.now() - dismissed) < 7 * 86400_000) return "";
+  return `
+    <div class="tier-banner">
+      <div class="tier-banner-text">
+        <strong>Time for a key rotation.</strong> Your workspace's ${schedule} rekey schedule is due. Rotating refreshes every channel and workspace key — past history stays decryptable to current members, future traffic uses new keys.
+      </div>
+      <div class="tier-banner-actions">
+        <button class="primary" id="btn-rekey-now" style="font-size: 12px; padding: 5px 12px;">Rekey now</button>
+        <button id="btn-dismiss-rekey" style="font-size: 12px; padding: 5px 10px;">Dismiss</button>
+      </div>
+    </div>
+  `;
+}
+
 function renderTierEscalationBanner(current) {
   const n = current.members.length;
   if (n < 6) return "";
@@ -4106,6 +4294,25 @@ function renderAttachment(m) {
       </div>
     `;
   }
+  // v1.1: inline audio + video clips.
+  const isAudio = (a.mime || "").startsWith("audio/");
+  const isVideo = (a.mime || "").startsWith("video/");
+  if (isAudio) {
+    return `
+      <div class="msg-attachment">
+        <audio data-attach="${escapeHTML(m.id)}" controls preload="metadata" style="max-width: 320px; display: block;"></audio>
+        <div style="font-size: 11px; color: var(--fg-dim); margin-top: 4px;">🎙 ${escapeHTML(a.name)} · ${escapeHTML(size)}</div>
+      </div>
+    `;
+  }
+  if (isVideo) {
+    return `
+      <div class="msg-attachment">
+        <video data-attach="${escapeHTML(m.id)}" controls preload="metadata" style="max-width: 420px; max-height: 280px; display: block; border-radius: 6px; background: #000;"></video>
+        <div style="font-size: 11px; color: var(--fg-dim); margin-top: 4px;">🎬 ${escapeHTML(a.name)} · ${escapeHTML(size)}</div>
+      </div>
+    `;
+  }
   return `
     <div class="msg-attachment">
       <div class="file-card" data-attach="${escapeHTML(m.id)}" style="cursor: pointer;">
@@ -4446,6 +4653,93 @@ const STATUS_PRESETS = [
   { emoji: "🤒", text: "Out sick" },
   { emoji: "🧑‍💻", text: "Working remotely" },
 ];
+
+/**
+ * v2: threads first-class — list every thread in the workspace you
+ * can see, sorted by most-recent reply. Filters to threads the current
+ * user participates in (authored the root, replied in, or was mentioned).
+ * Click an entry to jump into the thread panel of its channel.
+ */
+function renderAllThreadsModal() {
+  if (document.querySelector('.modal-bg[data-all-threads]')) return;
+  const current = State.current;
+  const myUserId = bytesToB64Url(State.identity.pubkey);
+
+  // Collect thread roots: any message that has replies pointing at it.
+  const replyCount = new Map();
+  const latestReply = new Map();
+  const myInvolvement = new Set();
+  for (const m of current.messages) {
+    if (m.thread) {
+      replyCount.set(m.thread, (replyCount.get(m.thread) || 0) + 1);
+      const prev = latestReply.get(m.thread) || 0;
+      if (m.ts > prev) latestReply.set(m.thread, m.ts);
+      if (m.from === myUserId) myInvolvement.add(m.thread);
+      if (m.mentions && m.mentions.includes(myUserId)) myInvolvement.add(m.thread);
+    }
+  }
+  // Root message ids that have at least one reply.
+  const rootIds = [...replyCount.keys()];
+  // Also include roots authored by me or mentioning me, even with zero replies? Skip — zero-reply isn't a thread yet.
+  // Include roots I authored — "my own threads to follow".
+  for (const rootId of rootIds) {
+    const root = current.messages.find(m => m.id === rootId);
+    if (root && root.from === myUserId) myInvolvement.add(rootId);
+    if (root && root.mentions && root.mentions.includes(myUserId)) myInvolvement.add(rootId);
+  }
+  const involved = rootIds.filter(id => myInvolvement.has(id));
+  involved.sort((a, b) => (latestReply.get(b) || 0) - (latestReply.get(a) || 0));
+
+  const rowHtml = (rootId) => {
+    const root = current.messages.find(m => m.id === rootId);
+    if (!root) return "";
+    const ch = current.channels.find(c => c.id === root.ch);
+    const author = current.members.find(m => m.id === root.from);
+    const authorName = author?.name || "?";
+    const chLabel = ch ? (ch.dm ? "DM" : (ch.private ? "🔒 " : "# ") + ch.name) : "?";
+    const body = root.deleted
+      ? `<em style="color: var(--fg-dim);">(deleted)</em>`
+      : escapeHTML((root.body || (root.attachment ? `📎 ${root.attachment.name || "attachment"}` : "")).slice(0, 180));
+    const count = replyCount.get(rootId) || 0;
+    const last = latestReply.get(rootId) || root.ts;
+    return `
+      <div class="switcher-row" data-open-thread-in="${escapeHTML(root.ch)}" data-thread-parent="${escapeHTML(rootId)}">
+        <span class="switcher-icon plain">💬</span>
+        <div class="switcher-body">
+          <div class="switcher-label"><strong>${escapeHTML(authorName)}</strong> in ${escapeHTML(chLabel)}</div>
+          <div class="switcher-sub" style="max-width: 420px;">${body}</div>
+          <div style="font-size: 10px; color: var(--fg-dim); margin-top: 2px;">${count} ${count === 1 ? "reply" : "replies"} · last ${formatRelative(last)}</div>
+        </div>
+      </div>
+    `;
+  };
+
+  const wrap = document.createElement("div");
+  wrap.className = "modal-bg";
+  wrap.dataset.allThreads = "1";
+  wrap.innerHTML = `
+    <div class="card" style="max-width: 600px; max-height: calc(100vh - 60px); overflow-y: auto;">
+      <div class="row" style="margin-bottom: 12px;">
+        <h1 style="margin: 0; font-size: 18px; flex: 1;">💬 Threads you're in</h1>
+        <button class="icon-btn" id="all-threads-close" style="font-size: 18px; padding: 2px 7px;">✕</button>
+      </div>
+      ${involved.length === 0
+        ? `<div style="color: var(--fg-dim); font-size: 13px; padding: 20px 0; text-align: center;">No active threads yet. Start one by replying in any channel.</div>`
+        : involved.map(rowHtml).join("")}
+    </div>
+  `;
+  document.body.appendChild(wrap);
+  wrap.querySelector("#all-threads-close").onclick = () => { wrap.remove(); closeModal(); };
+  wrap.onclick = (e) => { if (e.target === wrap) { wrap.remove(); closeModal(); } };
+  wrap.querySelectorAll("[data-open-thread-in]").forEach(el => {
+    el.onclick = () => {
+      const chId = el.getAttribute("data-open-thread-in");
+      const parent = el.getAttribute("data-thread-parent");
+      wrap.remove();
+      setState({ currentChannel: chId, threadOpen: parent, modal: null });
+    };
+  });
+}
 
 function renderStatusModal() {
   if (document.querySelector('.modal-bg[data-status]')) return;
@@ -5221,6 +5515,20 @@ function renderSettingsWorkspaceTab(wsName, current) {
       </div>
     </div>
     <div class="field">
+      <label>Scheduled rekey</label>
+      <div style="font-size: 12px; color: var(--fg-mute); margin-bottom: 8px;">
+        Periodically rotate the workspace and channel keys. History stays readable to current members; new traffic uses fresh keys. A banner reminds you when the schedule is due.
+      </div>
+      <select id="rekey-schedule" style="font: inherit; background: var(--bg-elev); border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px; color: var(--fg);">
+        <option value="off" ${(current.meta.rekey_schedule || "off") === "off" ? "selected" : ""}>Off</option>
+        <option value="quarterly" ${current.meta.rekey_schedule === "quarterly" ? "selected" : ""}>Every 90 days</option>
+        <option value="yearly" ${current.meta.rekey_schedule === "yearly" ? "selected" : ""}>Yearly</option>
+      </select>
+      ${current.meta.last_rekey_at
+        ? `<div style="font-size: 11px; color: var(--fg-dim); margin-top: 6px;">Last rekeyed ${formatDate(current.meta.last_rekey_at)}</div>`
+        : ""}
+    </div>
+    <div class="field">
       <label>Export workspace</label>
       <div style="font-size: 12px; color: var(--fg-mute); margin-bottom: 8px;">Download an encrypted backup of all messages, channels, and keys.</div>
       <button id="btn-export-ws">Export workspace…</button>
@@ -5243,6 +5551,14 @@ function renderSettingsAdminTab(current, me) {
     const badgeClass = m.role === "owner" ? "owner" : m.role === "admin" ? "admin" : "";
     const canRemove = (me.role === "owner" || me.role === "admin") && m.id !== myUserId && m.role !== "owner";
     const canPromote = (me.role === "owner" || me.role === "admin") && m.id !== myUserId && m.role === "member";
+    // v1.1: voluntary admin transfer — unilateral grant, no consensus needed.
+    const canTransfer = (me.role === "owner" || me.role === "admin") && m.id !== myUserId && m.role === "member";
+    // v1.1: step down — on your own row, only if you're admin (not owner)
+    // and at least one other admin remains.
+    const otherAdminsExist = current.members.some(x =>
+      x.id !== myUserId && (x.role === "owner" || x.role === "admin")
+    );
+    const canStepDown = m.id === myUserId && m.role === "admin" && otherAdminsExist;
     return `
       <div class="member-row">
         <div class="avatar" style="background: ${avatarColorFor(m.id)}; width: 28px; height: 28px; font-size: 11px;">${escapeHTML(initials(m.name))}</div>
@@ -5251,7 +5567,9 @@ function renderSettingsAdminTab(current, me) {
           <div class="member-row-fp">${escapeHTML(m.fp || "")}</div>
         </div>
         <span class="role-badge ${badgeClass}">${escapeHTML(m.role)}</span>
-        ${canPromote ? `<button class="icon-btn" data-draft-promo="${escapeHTML(m.id)}" title="Propose promotion to admin" style="font-size: 12px; padding: 3px 8px;">Promote…</button>` : ""}
+        ${canPromote ? `<button class="icon-btn" data-draft-promo="${escapeHTML(m.id)}" title="Propose promotion to admin (needs 2 co-signers)" style="font-size: 12px; padding: 3px 8px;">Promote…</button>` : ""}
+        ${canTransfer ? `<button class="icon-btn" data-transfer-admin="${escapeHTML(m.id)}" title="Grant admin to this member (unilateral)" style="font-size: 12px; padding: 3px 8px;">Make admin</button>` : ""}
+        ${canStepDown ? `<button class="icon-btn" data-step-down="1" title="Step down from admin (unilateral; another admin remains)" style="font-size: 12px; padding: 3px 8px;">Step down</button>` : ""}
         ${canRemove ? `<button class="danger icon-btn" data-remove-member="${escapeHTML(m.id)}" title="Remove from workspace" style="font-size: 12px; padding: 3px 8px;">Remove</button>` : ""}
       </div>
     `;
@@ -5522,6 +5840,13 @@ function wireSettingsTab(tab, wrap, current, me, wsName) {
       };
     });
 
+    // v2: rekey schedule dropdown.
+    const $rekeyScheduleSel = wrap.querySelector("#rekey-schedule");
+    if ($rekeyScheduleSel) $rekeyScheduleSel.onchange = async () => {
+      current.meta.rekey_schedule = $rekeyScheduleSel.value;
+      await idbPut(current.wsDB, "keys", current.meta, "workspace_meta");
+    };
+
     // Export / import
     // §36: Invite by code (only wired when relay configured → button exists)
     const $invByCode = wrap.querySelector("#btn-invite-by-code");
@@ -5600,6 +5925,40 @@ function wireSettingsTab(tab, wrap, current, me, wsName) {
         }
       };
     });
+    // v1.1: voluntary admin transfer.
+    wrap.querySelectorAll("[data-transfer-admin]").forEach(btn => {
+      btn.onclick = async () => {
+        const targetId = btn.dataset.transferAdmin;
+        const target = current.members.find(m => m.id === targetId);
+        if (!target) return;
+        if (!confirm(`Make ${target.name} an admin?\n\nThis is a unilateral grant — no co-signature needed. You will still be an admin.`)) return;
+        btn.disabled = true;
+        try {
+          await sendTransferAdmin(current, targetId);
+          wrap.remove();
+          openSettings("admin");
+        } catch (e) {
+          $err.textContent = e.message;
+          btn.disabled = false;
+        }
+      };
+    });
+    // v1.1: step-down (self-demote).
+    const $stepDown = wrap.querySelector("[data-step-down]");
+    if ($stepDown) {
+      $stepDown.onclick = async () => {
+        if (!confirm("Step down from admin?\n\nYou'll become a regular member and lose admin controls. Another admin remains so the workspace keeps an admin presence.")) return;
+        $stepDown.disabled = true;
+        try {
+          await sendStepDown(current);
+          wrap.remove();
+          setState({ modal: null });
+        } catch (e) {
+          $err.textContent = e.message;
+          $stepDown.disabled = false;
+        }
+      };
+    }
 
     // Co-sign promotion
     wrap.querySelectorAll("[data-cosign]").forEach(btn => {
@@ -6074,6 +6433,15 @@ function openCreateChannelModal() {
           Only admins can post. Everyone else reads.
         </div>
       </div>` : ""}
+      <div class="field">
+        <label style="display: flex; align-items: center; gap: 8px; cursor: pointer;">
+          <input type="checkbox" id="ch-canvas">
+          <span>Canvas channel</span>
+        </label>
+        <div style="font-size: 11px; color: var(--fg-dim); margin-left: 24px; margin-top: 2px;">
+          Collaborative document instead of a message stream. Public only (v1).
+        </div>
+      </div>
       <div class="field" id="ch-members-field" style="display: none;">
         <label>Who's in it?</label>
         ${others.length === 0 ? `<div class="sub">No other members yet — invite someone first.</div>` : others.map(m => `
@@ -6097,9 +6465,17 @@ function openCreateChannelModal() {
 
   // Toggle the members field when private is checked.
   const $private = wrap.querySelector("#ch-private");
+  const $canvas  = wrap.querySelector("#ch-canvas");
   const $membersField = wrap.querySelector("#ch-members-field");
   $private.onchange = () => {
     $membersField.style.display = $private.checked ? "" : "none";
+    // Private + canvas are mutually exclusive in v1
+    if ($private.checked) $canvas.checked = false;
+    $canvas.disabled = $private.checked;
+  };
+  $canvas.onchange = () => {
+    if ($canvas.checked) { $private.checked = false; $private.disabled = true; }
+    else { $private.disabled = false; }
   };
 
   const submit = async () => {
@@ -6109,6 +6485,7 @@ function openCreateChannelModal() {
     const topic = wrap.querySelector("#ch-topic").value.trim();
     const isPrivate = $private.checked;
     const isAnnounce = !!wrap.querySelector("#ch-announce")?.checked;
+    const isCanvas   = !!$canvas.checked;
     if (!name) { $err.textContent = "Name is required."; return; }
     if (!/^[a-z0-9][a-z0-9-]{0,39}$/i.test(name)) {
       $err.textContent = "Letters, digits, and hyphens only.";
@@ -6131,7 +6508,7 @@ function openCreateChannelModal() {
 
     wrap.querySelector("#ch-create").disabled = true;
     try {
-      const ch = await sendChannelCreate(State.current, name, topic, { isPrivate, isAnnounce, memberIds });
+      const ch = await sendChannelCreate(State.current, name, topic, { isPrivate, isAnnounce, isCanvas, memberIds });
       close();
       setState({ currentChannel: ch.id });
     } catch (e) {
@@ -8410,6 +8787,7 @@ const EnvelopeDispatch = {
           dm: !!inner.dm,   // group DMs carry dm:true in the envelope
           dm_with: null,    // null for group DMs; 1:1 DMs don't use this path
           announce: announceVerified,
+          canvas: !!inner.canvas && !inner.private,  // Slice CV1 — public-only
           members: inner.members || [],
           created_at: env.ts
         };
@@ -8774,6 +9152,45 @@ const EnvelopeDispatch = {
         break;
       }
 
+      case "member.step_down": {
+        // v1.1: sender unilaterally steps down from admin → member. Verify
+        // they were admin, another admin remains, and owners can't step
+        // down via this path (would orphan the workspace).
+        const sdSender = current.members.find(m => m.id === env.from);
+        if (!sdSender || sdSender.role !== "admin") {
+          console.warn("member.step_down from non-admin or owner, ignoring", env.from);
+          break;
+        }
+        const othersStillAdmin = current.members.some(m =>
+          m.id !== env.from && (m.role === "owner" || m.role === "admin")
+        );
+        if (!othersStillAdmin) {
+          console.warn("member.step_down: no other admin remains, ignoring", env.from);
+          break;
+        }
+        sdSender.role = "member";
+        await idbPut(current.wsDB, "members", sdSender);
+        break;
+      }
+
+      case "member.transfer_admin": {
+        // v1.1: unilateral hand-off of admin rights. Sender must currently
+        // be an owner or admin; target must be a known member who isn't
+        // already admin/owner. The sender's role is unchanged — this is
+        // "grant to target", not "swap".
+        const taSender = current.members.find(m => m.id === env.from);
+        if (!(taSender?.role === "owner" || taSender?.role === "admin")) {
+          console.warn("member.transfer_admin from non-admin, ignoring");
+          break;
+        }
+        const taTarget = current.members.find(m => m.id === inner.target);
+        if (!taTarget) { console.warn("member.transfer_admin: unknown target"); break; }
+        if (taTarget.role === "owner" || taTarget.role === "admin") break;
+        taTarget.role = "admin";
+        await idbPut(current.wsDB, "members", taTarget);
+        break;
+      }
+
       case "member.promote": {
         // Promote a member to admin via consensus (2+ distinct valid sigs).
         // `inner.signers` carries [{user_id, sig}] from the proposal — each
@@ -8994,7 +9411,7 @@ async function replayHistory(current, targetUserId) {
  * The envelope is still encrypted under the workspace root key so
  * non-member workspace users can't even see the channel name or topic.
  */
-async function sendChannelCreate(current, name, topic, { isPrivate = false, isDm = false, isAnnounce = false, memberIds = null } = {}) {
+async function sendChannelCreate(current, name, topic, { isPrivate = false, isDm = false, isAnnounce = false, isCanvas = false, memberIds = null } = {}) {
   const myUserId = bytesToB64Url(State.identity.pubkey);
   // Slice F1-B / security: only owners/admins can create announcement
   // channels. Sender-side guard so the honest-client UI hides the option;
@@ -9004,6 +9421,12 @@ async function sendChannelCreate(current, name, topic, { isPrivate = false, isDm
     if (!(me?.role === "owner" || me?.role === "admin")) {
       throw new Error("Only admins can create announcement channels.");
     }
+  }
+  // Slice CV1: canvas channels can't be private in v1 (the Yjs workspace
+  // doc is encrypted under the root key, which every member has — private
+  // canvas would be UI-only private, not cryptographically private).
+  if (isCanvas && isPrivate) {
+    throw new Error("Canvas channels can't be private in v1. Use a public canvas.");
   }
   const aesKey = await Crypto.genAesKey();
   const rawKey = await Crypto.exportAesRaw(aesKey);
@@ -9038,6 +9461,7 @@ async function sendChannelCreate(current, name, topic, { isPrivate = false, isDm
       private: true,
       dm: isDm,
       announce: !!isAnnounce,
+      canvas: false,   // canvas disallowed for private in v1
       members: chosenMembers,
       wrapped_keys,
       wrapper: myUserId   // needed on the receive side to pick the right
@@ -9051,6 +9475,7 @@ async function sendChannelCreate(current, name, topic, { isPrivate = false, isDm
       private: false,
       dm: false,
       announce: !!isAnnounce,
+      canvas: !!isCanvas,
       members: chosenMembers,
       key: rawKey
     };
@@ -9074,6 +9499,7 @@ async function sendChannelCreate(current, name, topic, { isPrivate = false, isDm
     id: chId, name, topic: topic || "",
     private: isPrivate, dm: isDm, dm_with: null,
     announce: !!isAnnounce,
+    canvas: !!isCanvas,   // Slice CV1
     members: chosenMembers, created_at: env.ts
   };
   current.channels.push(chRec);
@@ -9342,6 +9768,116 @@ function isPinned(current, channelId, msgId) {
   if (!current?.doc) return false;
   return WorkspaceDoc.getPins(current.doc, channelId).some(p => p.msgId === msgId);
 }
+
+/* ------------------------------------------------------------
+ *  Slice CV1  Canvas — collaborative markdown doc per channel
+ *  Each canvas channel owns a Y.Text inside the workspace's Yjs
+ *  doc under the key `canvas:<channelId>`. We bind a textarea to
+ *  that Y.Text via a diff-based observer (no external y-textarea
+ *  dep). Remote updates arrive through the normal `workspace.patch`
+ *  pipeline; local edits debounce a 500ms broadcast so rapid
+ *  typing doesn't spam the network.
+ *
+ *  Access is "public only" in v1 — the Y.Text is stored inside the
+ *  workspace-root-key-encrypted Yjs doc, which every member has.
+ *  Private canvases would need a separate per-channel-key-encrypted
+ *  doc; deferred to a later slice.
+ * ------------------------------------------------------------ */
+const CanvasMgr = {
+  _binding: null,   // { channelId, textarea, observer, disposed }
+  _md: null,        // lazy-loaded markdown-it
+
+  getYText(current, channelId) {
+    if (!current?.doc) return null;
+    return current.doc.getText("canvas:" + channelId);
+  },
+
+  dispose() {
+    if (!this._binding) return;
+    this._binding.disposed = true;
+    try { this._binding.ytext.unobserve(this._binding.observer); } catch {}
+    this._binding = null;
+  },
+
+  bind(current, channelId, textarea) {
+    this.dispose();
+    const ytext = this.getYText(current, channelId);
+    if (!ytext) return;
+
+    let lastText = ytext.toString();
+    textarea.value = lastText;
+    let broadcastTimer = null;
+    let applyingRemote = false;
+
+    const observer = (_event, tx) => {
+      if (tx?.origin === "local") return;   // our own mutation, skip
+      applyingRemote = true;
+      try {
+        const newText = ytext.toString();
+        if (newText === lastText) return;
+        const s = textarea.selectionStart;
+        const e = textarea.selectionEnd;
+        textarea.value = newText;
+        lastText = newText;
+        textarea.setSelectionRange(Math.min(s, newText.length), Math.min(e, newText.length));
+      } finally {
+        applyingRemote = false;
+      }
+    };
+    ytext.observe(observer);
+
+    const debouncedBroadcast = () => {
+      clearTimeout(broadcastTimer);
+      broadcastTimer = setTimeout(() => {
+        if (this._binding?.channelId !== channelId) return;   // switched channels
+        const update = Y.encodeStateAsUpdate(current.doc);
+        sendWorkspacePatch(current, update).catch(e => console.warn("canvas broadcast:", e));
+      }, 500);
+    };
+
+    textarea.addEventListener("input", () => {
+      if (applyingRemote) return;
+      const newText = textarea.value;
+      const oldText = lastText;
+      if (newText === oldText) return;
+      // Diff: find shared prefix + shared suffix, replace the middle.
+      let prefix = 0;
+      const maxPre = Math.min(newText.length, oldText.length);
+      while (prefix < maxPre && newText[prefix] === oldText[prefix]) prefix++;
+      let suffix = 0;
+      const maxSuf = Math.min(newText.length - prefix, oldText.length - prefix);
+      while (suffix < maxSuf &&
+             newText[newText.length - 1 - suffix] === oldText[oldText.length - 1 - suffix]) suffix++;
+      const delStart = prefix;
+      const delLen   = oldText.length - prefix - suffix;
+      const insText  = newText.substring(prefix, newText.length - suffix);
+      current.doc.transact(() => {
+        if (delLen > 0) ytext.delete(delStart, delLen);
+        if (insText)    ytext.insert(delStart, insText);
+      }, "local");
+      lastText = newText;
+      debouncedBroadcast();
+    });
+
+    this._binding = { channelId, textarea, observer, ytext, disposed: false };
+  },
+
+  async renderPreview(current, channelId, container) {
+    const ytext = this.getYText(current, channelId);
+    if (!ytext) { container.textContent = ""; return; }
+    if (!this._md) {
+      try {
+        const mod = await import("https://esm.sh/markdown-it@14.1.0");
+        this._md = (mod.default || mod)({ breaks: true, linkify: true, html: false });
+      } catch (e) {
+        container.textContent = ytext.toString();
+        console.warn("markdown-it load failed:", e);
+        return;
+      }
+    }
+    container.innerHTML = this._md.render(ytext.toString());
+  },
+};
 
 /* ------------------------------------------------------------
  *  Slice Q1  Message permalinks
@@ -9629,6 +10165,76 @@ SLASH.huddle = SLASH.call;   // shared reference so /help dedupes as aliases
  *  blob transfer over the data channel is a Slice 3c follow-up
  *  tracked in PENDING.md.
  * ------------------------------------------------------------ */
+/* ------------------------------------------------------------
+ *  v1.1  Voice messages + video clips via MediaRecorder
+ *  Capture audio or screen-video into a Blob, wrap as a File, and
+ *  feed it to the existing sendAttachment pipeline. Inline <audio>
+ *  and <video> players in the message list do the rest.
+ * ------------------------------------------------------------ */
+const MediaCapture = {
+  _active: null,   // { stream, recorder, chunks, kind }
+
+  async startAudio() {
+    if (this._active) return;
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    const mime = MediaRecorder.isTypeSupported("audio/webm;codecs=opus")
+      ? "audio/webm;codecs=opus"
+      : (MediaRecorder.isTypeSupported("audio/webm") ? "audio/webm" : "audio/mp4");
+    const recorder = new MediaRecorder(stream, { mimeType: mime });
+    const chunks = [];
+    recorder.ondataavailable = (e) => { if (e.data.size) chunks.push(e.data); };
+    this._active = { stream, recorder, chunks, kind: "audio", mime };
+    recorder.start();
+  },
+
+  async startVideo() {
+    if (this._active) return;
+    // getDisplayMedia: screen capture. User is prompted by the browser for
+    // which surface to share. Audio option included for desktop screencasts.
+    const stream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: true });
+    const mime = MediaRecorder.isTypeSupported("video/webm;codecs=vp9,opus")
+      ? "video/webm;codecs=vp9,opus"
+      : (MediaRecorder.isTypeSupported("video/webm") ? "video/webm" : "video/mp4");
+    const recorder = new MediaRecorder(stream, { mimeType: mime });
+    const chunks = [];
+    recorder.ondataavailable = (e) => { if (e.data.size) chunks.push(e.data); };
+    this._active = { stream, recorder, chunks, kind: "video", mime };
+    // Stop if the user ends the capture via the browser's "Stop sharing" bar.
+    stream.getVideoTracks()[0].addEventListener("ended", () => {
+      if (this._active) this.stop().catch(() => {});
+    });
+    recorder.start();
+  },
+
+  isActive() { return !!this._active; },
+  kind()     { return this._active?.kind; },
+
+  async stop() {
+    if (!this._active) return null;
+    const { recorder, stream, chunks, kind, mime } = this._active;
+    this._active = null;
+    return new Promise((resolve) => {
+      recorder.onstop = () => {
+        stream.getTracks().forEach(t => t.stop());
+        const blob = new Blob(chunks, { type: mime });
+        const ext = mime.includes("mp4") ? "mp4" : "webm";
+        const stamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+        const name = (kind === "audio" ? "voice-" : "screen-") + stamp + "." + ext;
+        resolve(new File([blob], name, { type: mime }));
+      };
+      recorder.stop();
+    });
+  },
+
+  async cancel() {
+    if (!this._active) return;
+    const { recorder, stream } = this._active;
+    this._active = null;
+    try { recorder.stop(); } catch {}
+    stream.getTracks().forEach(t => t.stop());
+  },
+};
+
 async function sendAttachment(current, channelId, file) {
   if (!file) throw new Error("No file");
   if (file.size > MAX_ATTACHMENT_SIZE) {
@@ -10571,6 +11177,76 @@ function isAdmin(current) {
  *     new key, wrap per remaining channel members, send `channel.rekey`
  *  6. Update local projections
  */
+/**
+ * v2: scheduled workspace rekey — admin-initiated rotation that doesn't
+ * remove a member. Same shape as sendMemberRemove's rekey steps, but with
+ * the full current membership as the "remaining" set. Resets the
+ * `last_rekey_at` marker on meta so the scheduled-rekey banner clears.
+ */
+async function sendScheduledRekey(current) {
+  if (!isAdmin(current)) throw new Error("Only admins can trigger a rekey.");
+  const myUserId = bytesToB64Url(State.identity.pubkey);
+  const signKey  = await Crypto.importSignKey(State.identity.privkey_pkcs8);
+  const meta     = current.meta;
+  const wsEnvelope = async (type, inner) => {
+    meta.lc_counter = (meta.lc_counter || 0) + 1;
+    const env = await Envelope.build({
+      workspaceId: meta.id, channelId: null,
+      channelKey: current.rootKey, signKey,
+      signerPubkey: State.identity.pubkey,
+      deviceId: meta.device_id,
+      type, inner,
+      vectorClock: [[myUserId, meta.lc_counter]]
+    });
+    await idbPut(current.wsDB, "envelopes", env);
+    PeerMgr.sendEnvelope(meta.id, env).catch(e => console.warn(e));
+    return env;
+  };
+
+  const newRootKey = await Crypto.genAesKey();
+  const newRootRaw = await Crypto.exportAesRaw(newRootKey);
+  const myPriv = await Crypto.importX25519Priv(State.identity.x25519_priv_pkcs8);
+
+  const wrapped_keys = {};
+  for (const m of current.members) {
+    if (!m.x25519_pub) continue;
+    const theirPub = await Crypto.importX25519Pub(m.x25519_pub);
+    const kek = await Crypto.deriveX25519AesKey(myPriv, theirPub);
+    const iv = Crypto.rand(12);
+    const ct = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv }, kek, newRootRaw));
+    wrapped_keys[m.id] = { iv, ct };
+  }
+  await wsEnvelope("workspace.rekey", { wrapped_keys });
+  await idbPut(current.wsDB, "keys", newRootRaw, "root");
+  current.rootKey = newRootKey;
+
+  for (const ch of current.channels) {
+    if (ch.dm) continue;
+    const newChKey = await Crypto.genAesKey();
+    const newChRaw = await Crypto.exportAesRaw(newChKey);
+    if (!ch.private) {
+      await wsEnvelope("channel.rekey", { channel_id: ch.id, key: newChRaw });
+    } else {
+      const channelMembers = current.members.filter(m => (ch.members || []).includes(m.id));
+      const chWrapped = {};
+      for (const m of channelMembers) {
+        if (!m.x25519_pub) continue;
+        const theirPub = await Crypto.importX25519Pub(m.x25519_pub);
+        const kek = await Crypto.deriveX25519AesKey(myPriv, theirPub);
+        const iv = Crypto.rand(12);
+        const ct = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv }, kek, newChRaw));
+        chWrapped[m.id] = { iv, ct };
+      }
+      await wsEnvelope("channel.rekey", { channel_id: ch.id, wrapped_keys: chWrapped });
+    }
+    await idbPut(current.wsDB, "keys", newChRaw, "ch:" + ch.id);
+    current.channelKeys[ch.id] = await Crypto.importAesRaw(newChRaw);
+  }
+
+  meta.last_rekey_at = Date.now();
+  await idbPut(current.wsDB, "keys", meta, "workspace_meta");
+}
+
 async function sendMemberRemove(current, removedUserId) {
   if (!isAdmin(current)) throw new Error("Only admins can remove members.");
   const myUserId = bytesToB64Url(State.identity.pubkey);
@@ -10783,6 +11459,88 @@ async function sendDeviceRevoke(current, targetDeviceId) {
  * stores the proposal in the WorkspaceDoc (shared with peers via
  * workspace.patch).
  */
+/**
+ * v1.1: voluntary admin transfer. An existing owner/admin unilaterally
+ * hands off admin rights to another member — the envelope is signed only
+ * by the sender (no consensus needed, since you're only giving up your
+ * own authority). On receive, the sender keeps their admin status too —
+ * transfer means "grant to target", not "demote self". Use `/demote`
+ * (v1.1 cluster) for consensus-based demote.
+ */
+/**
+ * v1.1: voluntary step-down from admin. Unilateral — any admin can
+ * demote themselves to member, provided at least one other admin
+ * remains (otherwise the workspace is left without admin authority).
+ * Owners can't step down via this path — they'd orphan the workspace;
+ * they must first transfer admin to another member and let a new owner
+ * emerge via promote-by-consensus.
+ */
+async function sendStepDown(current) {
+  const myUserId = bytesToB64Url(State.identity.pubkey);
+  const me = current.members.find(m => m.id === myUserId);
+  if (!me) throw new Error("Member record missing.");
+  if (me.role === "owner") throw new Error("Owners can't step down — transfer admin first.");
+  if (me.role !== "admin") throw new Error("You're not an admin.");
+  const otherAdmins = current.members.filter(m =>
+    m.id !== myUserId && (m.role === "owner" || m.role === "admin")
+  );
+  if (otherAdmins.length === 0) {
+    throw new Error("You're the only admin — promote someone else first, or you'll lock yourself out.");
+  }
+  const signKey = await Crypto.importSignKey(State.identity.privkey_pkcs8);
+  const meta = current.meta;
+  meta.lc_counter = (meta.lc_counter || 0) + 1;
+  await idbPut(current.wsDB, "keys", meta, "workspace_meta");
+  const env = await Envelope.build({
+    workspaceId: meta.id,
+    channelId: null,
+    channelKey: current.rootKey,
+    signKey,
+    signerPubkey: State.identity.pubkey,
+    deviceId: meta.device_id,
+    type: "member.step_down",
+    inner: { ts: Date.now() },
+    vectorClock: [[myUserId, meta.lc_counter]]
+  });
+  await idbPut(current.wsDB, "envelopes", env);
+  me.role = "member";
+  await idbPut(current.wsDB, "members", me);
+  PeerMgr.sendEnvelope(meta.id, env).catch(e => console.warn(e));
+}
+
+async function sendTransferAdmin(current, targetUserId) {
+  const myUserId = bytesToB64Url(State.identity.pubkey);
+  const me = current.members.find(m => m.id === myUserId);
+  if (!(me?.role === "owner" || me?.role === "admin")) {
+    throw new Error("Only admins can transfer admin status.");
+  }
+  const target = current.members.find(m => m.id === targetUserId);
+  if (!target) throw new Error("Target is not a workspace member.");
+  if (target.role === "owner" || target.role === "admin") {
+    throw new Error(target.name + " is already an admin.");
+  }
+  const signKey = await Crypto.importSignKey(State.identity.privkey_pkcs8);
+  const meta = current.meta;
+  meta.lc_counter = (meta.lc_counter || 0) + 1;
+  await idbPut(current.wsDB, "keys", meta, "workspace_meta");
+  const env = await Envelope.build({
+    workspaceId: meta.id,
+    channelId: null,
+    channelKey: current.rootKey,
+    signKey,
+    signerPubkey: State.identity.pubkey,
+    deviceId: meta.device_id,
+    type: "member.transfer_admin",
+    inner: { target: targetUserId, ts: Date.now() },
+    vectorClock: [[myUserId, meta.lc_counter]]
+  });
+  await idbPut(current.wsDB, "envelopes", env);
+  // Apply locally immediately.
+  target.role = "admin";
+  await idbPut(current.wsDB, "members", target);
+  PeerMgr.sendEnvelope(meta.id, env).catch(e => console.warn(e));
+}
+
 async function draftPromotion(current, targetUserId) {
   const myUserId = bytesToB64Url(State.identity.pubkey);
   const signKey  = await Crypto.importSignKey(State.identity.privkey_pkcs8);
@@ -12791,7 +13549,12 @@ if (/[?&]debug=1/.test(location.search)) {
     // Slice K1
     SHORTCUTS,
     // Slice F1
-    setCustomStatus, STATUS_PRESETS
+    setCustomStatus, STATUS_PRESETS,
+    // Slice CV1
+    CanvasMgr,
+    // v1.1 / v2
+    sendTransferAdmin, sendStepDown, sendScheduledRekey, MediaCapture,
+    renderRekeyBanner
   };
 }
 
