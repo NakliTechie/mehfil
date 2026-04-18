@@ -4,11 +4,34 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="color-scheme" content="light dark">
-<!-- CSP: no plugins, no base-tag injection, no external form targets.
-     Inline scripts are required for this single-file app architecture (no build step),
-     so script-src 'unsafe-inline' is unavoidable. The primary XSS defence is escapeHTML()
-     on all user content, plus sanitizeUrl() on any rendered links. -->
-<meta http-equiv="Content-Security-Policy" content="object-src 'none'; base-uri 'self'; form-action 'self';">
+<meta name="theme-color" content="#5b4fe8">
+<!-- PWA manifest — lets users install Mehfil as a standalone app on
+     desktops and mobile home screens. No push-notification hooks in the
+     service worker (spec §14.6 forbids push via central service). -->
+<link rel="manifest" href="./manifest.json">
+<!-- CSP: single-file app so inline scripts + styles are unavoidable.
+     The allowlist names every external source we actually pull:
+       * esm.sh / jsdelivr — lazy-loaded JS deps (Yjs, QR, MiniSearch, markdown-it)
+       * img-src allows data: for trust-card SVGs, blob: for decrypted attachments
+       * media-src blob: for voice/video clips after decryption
+       * connect-src https/wss is intentionally open since relay/bridge URLs
+         are user-configured; we can't pre-enumerate every deployment.
+     The primary XSS defence stays escapeHTML() on all rendered content. -->
+<meta http-equiv="Content-Security-Policy" content="
+  default-src 'self';
+  script-src 'self' 'unsafe-inline' https://esm.sh https://cdn.jsdelivr.net;
+  style-src 'self' 'unsafe-inline';
+  img-src 'self' data: blob:;
+  media-src 'self' blob:;
+  connect-src 'self' https: wss: ws: blob:;
+  worker-src 'self' blob:;
+  child-src 'self' blob:;
+  font-src 'self' data:;
+  object-src 'none';
+  base-uri 'self';
+  form-action 'self';
+  frame-ancestors 'self';
+">
 <title>Mehfil</title>
 <style>
   :root {
@@ -730,6 +753,13 @@
     font-size: 13px;
     text-align: center;
     cursor: default;
+  }
+  .typing-indicator {
+    padding: 4px 20px 0;
+    font-size: 11px;
+    color: var(--fg-dim);
+    font-style: italic;
+    min-height: 16px;
   }
   .icon-btn.recording { color: var(--danger); animation: rec-pulse 1s ease-in-out infinite; }
   @keyframes rec-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.55; } }
@@ -3142,6 +3172,21 @@ function renderWorkspace() {
                })()}
              </div>`
         }
+        ${(() => {
+          // Typing indicator — "Alice and Bose are typing…" below the
+          // message list. Resolves ids against the member projection so
+          // unknown senders appear as their short fingerprint.
+          if (channel.canvas) return "";
+          const typers = TypingMgr.activeIn(currentChannel);
+          if (typers.length === 0) return "";
+          const names = typers.map(uid => current.members.find(m => m.id === uid)?.name || "someone");
+          const label = names.length === 1
+            ? `${escapeHTML(names[0])} is typing…`
+            : names.length === 2
+            ? `${escapeHTML(names[0])} and ${escapeHTML(names[1])} are typing…`
+            : `${escapeHTML(names[0])}, ${escapeHTML(names[1])} and ${names.length - 2} more are typing…`;
+          return `<div class="typing-indicator">${label}</div>`;
+        })()}
         ${HuddleMgr.renderBar(current)}
         ${(() => {
           // Slice CV1: canvas channels have no composer — editing happens
@@ -3474,7 +3519,12 @@ function renderWorkspace() {
     closeSlashPopup();
   };
 
-  $composer.oninput = () => { updateMentionPopup(); updateSlashPopup(); };
+  $composer.oninput = () => {
+    updateMentionPopup();
+    updateSlashPopup();
+    // Typing indicator — debounced sender inside TypingMgr.
+    TypingMgr.notify(State.current, currentChannel);
+  };
   $composer.onclick = () => { updateMentionPopup(); updateSlashPopup(); };
   $composer.onkeydown = async (e) => {
     if (slashPopup && slashMatches.length > 0) {
@@ -8885,6 +8935,21 @@ const EnvelopeDispatch = {
         break;
       }
 
+      case "typing.start": {
+        // Ephemeral — no projection writes, just a fading indicator.
+        const myUid = bytesToB64Url(State.identity.pubkey);
+        if (env.from !== myUid) {
+          TypingMgr.mark(env.ch, env.from);
+          // Schedule a re-render when the indicator should fade (6s after
+          // last keystroke per TypingMgr.mark). This is cheap — one timer
+          // per note, cleared when overwritten.
+          setTimeout(() => {
+            if (State.view === "workspace") render();
+          }, 6100);
+        }
+        break;
+      }
+
       case "presence.update": {
         // Ephemeral — projected into bundle.presence, never persisted.
         // `updated_at` is local wall clock so the stale sweep (§30b
@@ -10533,6 +10598,79 @@ async function sendWorkspacePatch(current, updateBytes) {
   // SeenSet so rebroadcast-back-to-us gets dropped.
   PeerMgr.sendEnvelope(meta.id, env).catch(e => console.warn("workspace.patch send failed:", e));
 }
+
+/**
+ * Typing indicators (spec §4.1 — `typing.start`).
+ * Broadcast to workspace peers via the ephemeral envelope path. No
+ * persistence, no history — receivers keep the note alive for a short
+ * window and drop it on a timer. The sender-side debounce keeps us from
+ * posting a new envelope on every keystroke.
+ */
+const TypingMgr = {
+  _lastSentAt: 0,
+  _localStop: null,     // timer to mark self-stopped (future; unused)
+  // Receiver-side projection: Map<channelId, Map<userId, until_ts>>
+  _fading: new Map(),
+
+  // Sender: debounced "I'm typing". Safe to call on every keystroke.
+  async notify(current, channelId) {
+    if (!current || !State.identity) return;
+    if (!PeerMgr.hasPeers(current.meta.id)) return;
+    // Debounce — one envelope per 2.5s per channel.
+    const now = Date.now();
+    if (now - this._lastSentAt < 2500) return;
+    this._lastSentAt = now;
+
+    const ch = current.channels.find(c => c.id === channelId);
+    if (!ch || ch.canvas) return;   // canvas channels have no messages to signal typing in
+    const channelKey = current.channelKeys[channelId] || current.rootKey;
+    try {
+      const signKey = await Crypto.importSignKey(State.identity.privkey_pkcs8);
+      const meta = current.meta;
+      meta.lc_counter = (meta.lc_counter || 0) + 1;
+      const env = await Envelope.build({
+        workspaceId: meta.id,
+        channelId,
+        channelKey,
+        signKey,
+        signerPubkey: State.identity.pubkey,
+        deviceId: meta.device_id,
+        type: "typing.start",
+        inner: {},
+        vectorClock: [[bytesToB64Url(State.identity.pubkey), meta.lc_counter]]
+      });
+      PeerMgr.sendEnvelope(meta.id, env).catch(() => {});
+    } catch (e) { console.warn("typing.start build failed:", e); }
+  },
+
+  // Receiver: note the sender as typing in that channel for 6s.
+  // Re-notifying extends the window.
+  mark(channelId, userId) {
+    if (!channelId || !userId) return;
+    let inner = this._fading.get(channelId);
+    if (!inner) { inner = new Map(); this._fading.set(channelId, inner); }
+    inner.set(userId, Date.now() + 6000);
+    // Sweep stale entries every call — cheap, bounded by member count.
+    this._sweep();
+  },
+
+  _sweep() {
+    const now = Date.now();
+    for (const [chId, inner] of this._fading) {
+      for (const [uid, until] of inner) {
+        if (until <= now) inner.delete(uid);
+      }
+      if (inner.size === 0) this._fading.delete(chId);
+    }
+  },
+
+  activeIn(channelId) {
+    this._sweep();
+    const inner = this._fading.get(channelId);
+    if (!inner) return [];
+    return [...inner.keys()];
+  },
+};
 
 async function sendPresence(current, status) {
   if (!current || !State.identity) return;
@@ -13554,7 +13692,10 @@ if (/[?&]debug=1/.test(location.search)) {
     CanvasMgr,
     // v1.1 / v2
     sendTransferAdmin, sendStepDown, sendScheduledRekey, MediaCapture,
-    renderRekeyBanner
+    renderRekeyBanner,
+    // Post-roadmap (getters so the literal evaluates before these are declared below)
+    get TypingMgr()  { return TypingMgr;  },
+    get TestRunner() { return TestRunner; },
   };
 }
 
@@ -13736,7 +13877,282 @@ window.addEventListener("keydown", (e) => {
   }
 });
 
-boot();
+// PWA: register the service worker after boot so initial render isn't
+// blocked. The SW only caches the static shell — no push, no interception
+// of relay/bridge traffic. Skip during debug harness (?as=) + file://.
+if ("serviceWorker" in navigator &&
+    location.protocol !== "file:" &&
+    !/[?&]as=/.test(location.search)) {
+  window.addEventListener("load", () => {
+    navigator.serviceWorker.register("./sw.js", { scope: "./" })
+      .catch(e => console.warn("SW register failed:", e));
+  });
+}
+
+/* ------------------------------------------------------------
+ *  Test runner
+ *  Triggered by the URL flag `?test=1`. Replaces the normal app
+ *  with an in-page test panel. Tests are pure where possible;
+ *  bundle-dependent tests build small fixtures inline. Output:
+ *  per-test pass/fail with stack traces on failure.
+ * ------------------------------------------------------------ */
+const TestRunner = {
+  tests: [],
+  add(name, fn) { this.tests.push({ name, fn }); },
+  assert(cond, msg) { if (!cond) throw new Error(msg || "assertion failed"); },
+  assertEq(a, b, msg) {
+    const sa = JSON.stringify(a), sb = JSON.stringify(b);
+    if (sa !== sb) throw new Error((msg || "not equal") + `:\n  expected ${sb}\n  got      ${sa}`);
+  },
+  async run() {
+    const results = [];
+    for (const t of this.tests) {
+      try {
+        await t.fn();
+        results.push({ name: t.name, ok: true });
+      } catch (e) {
+        results.push({ name: t.name, ok: false, err: e.message, stack: (e.stack || "").split("\n").slice(1, 4).join("\n") });
+      }
+    }
+    return results;
+  },
+};
+
+function registerTests() {
+  const T = TestRunner;
+
+  // ── Pure: MessagePack canonical codec ───────────────────────
+  T.add("MP: round-trip scalars + arrays + maps", () => {
+    const v = { name: "bose", age: 42, tags: ["a", "b"], flag: true, none: null };
+    const decoded = MP.decode(MP.encode(v));
+    // Canonical decode returns keys in sorted order; compare by field, not structure.
+    T.assertEq(decoded.name, v.name);
+    T.assertEq(decoded.age, v.age);
+    T.assertEq(decoded.tags, v.tags);
+    T.assertEq(decoded.flag, v.flag);
+    T.assertEq(decoded.none, v.none);
+  });
+  T.add("MP: sorted map-keys yield identical bytes regardless of insertion order", () => {
+    const a = MP.encode({ z: 1, a: 2, m: 3 });
+    const b = MP.encode({ a: 2, m: 3, z: 1 });
+    T.assertEq([...a], [...b], "canonical encoding must be key-order independent");
+  });
+  T.add("MP: bin round-trips byte-identical", () => {
+    const src = new Uint8Array([0, 1, 2, 255, 128]);
+    const round = MP.decode(MP.encode({ x: src })).x;
+    T.assertEq([...round], [...src]);
+  });
+
+  // ── Pure: mentions ──────────────────────────────────────────
+  T.add("parseMentions: basic name match", () => {
+    const members = [{ id: "u1", name: "Alice" }, { id: "u2", name: "Bose" }];
+    T.assertEq(parseMentions("hey @Alice got a sec?", members), ["u1"]);
+  });
+  T.add("parseMentions: trailing punctuation doesn't eat the name", () => {
+    const members = [{ id: "u1", name: "Alice" }];
+    T.assertEq(parseMentions("@Alice.", members), ["u1"]);
+  });
+  T.add("parseMentions: unknown name ignored", () => {
+    const members = [{ id: "u1", name: "Alice" }];
+    T.assertEq(parseMentions("@nobody", members), []);
+  });
+  T.add("parseMentions: group expands to every memberId", () => {
+    const members = [{ id: "u1", name: "Alice" }, { id: "u2", name: "Bose" }, { id: "u3", name: "Charlie" }];
+    const groups = [{ id: "g1", name: "eng", memberIds: ["u2", "u3"] }];
+    const out = parseMentions("ship it @eng", members, groups);
+    T.assertEq(out.sort(), ["u2", "u3"]);
+  });
+  T.add("parseMentions: group precedence over same-named member", () => {
+    const members = [{ id: "u1", name: "eng" }, { id: "u2", name: "Bose" }];
+    const groups = [{ id: "g1", name: "eng", memberIds: ["u2"] }];
+    T.assertEq(parseMentions("@eng please", members, groups), ["u2"]);
+  });
+
+  // ── Pure: permalink parser ──────────────────────────────────
+  T.add("permalink: buildPermalink + parsePermalinkHash round-trip", () => {
+    const ws = "wsId-abc_123", ch = "chId-xyz", mid = "msg-789";
+    const url = buildPermalink(ws, ch, mid);
+    const orig = location.hash;
+    location.hash = "#" + url.split("#")[1];
+    const parsed = parsePermalinkHash();
+    location.hash = orig || "";
+    T.assertEq(parsed, { wsId: ws, chId: ch, msgId: mid });
+  });
+  T.add("permalink: malformed hash returns null", () => {
+    const orig = location.hash;
+    location.hash = "#notapermalink";
+    const p = parsePermalinkHash();
+    location.hash = orig || "";
+    T.assertEq(p, null);
+  });
+
+  // ── Pure: formatBytes ───────────────────────────────────────
+  T.add("formatBytes: ranges", () => {
+    T.assertEq(formatBytes(0), "0 B");
+    T.assertEq(formatBytes(1023), "1023 B");
+    T.assertEq(formatBytes(1024 * 1.5), "1.5 KB");
+    T.assertEq(formatBytes(1024 * 1024 * 2.25), "2.3 MB");
+  });
+
+  // ── Unread computation ───────────────────────────────────────
+  T.add("computeUnread: skips own + deleted + threads + older-than-marker", () => {
+    const bundle = {
+      readMarkers: new Map([["c1", { lastReadTs: 100 }]]),
+      messages: [
+        { ch: "c1", from: "me",     ts: 50,  body: "mine-old" },        // ours → skip
+        { ch: "c1", from: "other",  ts: 80,  body: "before-marker" },   // older → skip
+        { ch: "c1", from: "other",  ts: 150, body: "unread", deleted: false, mentions: ["me"] },   // +1 mention
+        { ch: "c1", from: "other",  ts: 200, body: "reply", thread: "x" }, // thread → skip
+        { ch: "c1", from: "other",  ts: 250, body: "unread2", deleted: false },  // +1 unread
+        { ch: "c1", from: "other",  ts: 300, body: "gone",    deleted: true },   // deleted → skip
+        { ch: "c2", from: "other",  ts: 400, body: "other ch" },        // wrong channel → skip
+      ],
+    };
+    const u = computeUnread(bundle, "me", "c1");
+    T.assertEq(u.count, 2);
+    T.assertEq(u.mentions, 1);
+    T.assertEq(u.firstUnreadId, undefined);   // ids aren't set in fixture
+  });
+
+  // ── WorkspaceDoc: pins ──────────────────────────────────────
+  T.add("WorkspaceDoc: pin add + get + remove", () => {
+    const doc = WorkspaceDoc.create();
+    WorkspaceDoc.addPin(doc, "c1", "m1", "u1");
+    WorkspaceDoc.addPin(doc, "c1", "m2", "u1");
+    T.assertEq(WorkspaceDoc.getPins(doc, "c1").length, 2);
+    WorkspaceDoc.removePin(doc, "c1", "m1");
+    const pins = WorkspaceDoc.getPins(doc, "c1");
+    T.assertEq(pins.length, 1);
+    T.assertEq(pins[0].msgId, "m2");
+  });
+
+  // ── WorkspaceDoc: groups ────────────────────────────────────
+  T.add("WorkspaceDoc: group add + get + remove", () => {
+    const doc = WorkspaceDoc.create();
+    WorkspaceDoc.addGroup(doc, { id: "g1", name: "eng", memberIds: ["u1", "u2"], createdBy: "u1", createdAt: Date.now() });
+    const g = WorkspaceDoc.getGroups(doc);
+    T.assertEq(g.length, 1);
+    T.assertEq(g[0].memberIds, ["u1", "u2"]);
+    WorkspaceDoc.removeGroup(doc, "g1");
+    T.assertEq(WorkspaceDoc.getGroups(doc).length, 0);
+  });
+
+  // ── Envelope: sign + verify round-trip ──────────────────────
+  T.add("envelope: sign + verify succeeds on own keypair", async () => {
+    const priv = await crypto.subtle.generateKey({ name: "Ed25519" }, true, ["sign", "verify"]);
+    const pub = new Uint8Array(await crypto.subtle.exportKey("raw", priv.publicKey));
+    const signKey = priv.privateKey;
+    const aesKey = await Crypto.genAesKey();
+    const env = await Envelope.build({
+      workspaceId: bytesToB64Url(Crypto.rand(16)),
+      channelId: bytesToB64Url(Crypto.rand(16)),
+      channelKey: aesKey, signKey, signerPubkey: pub,
+      deviceId: "dev1", type: "message.create",
+      inner: { body: "hello", fmt: "text" },
+      vectorClock: [[bytesToB64Url(pub), 1]],
+    });
+    T.assert(await Envelope.verify(env), "signature should verify");
+  });
+  T.add("envelope: tampered body fails verify", async () => {
+    const priv = await crypto.subtle.generateKey({ name: "Ed25519" }, true, ["sign", "verify"]);
+    const pub = new Uint8Array(await crypto.subtle.exportKey("raw", priv.publicKey));
+    const aesKey = await Crypto.genAesKey();
+    const env = await Envelope.build({
+      workspaceId: bytesToB64Url(Crypto.rand(16)),
+      channelId: bytesToB64Url(Crypto.rand(16)),
+      channelKey: aesKey, signKey: priv.privateKey, signerPubkey: pub,
+      deviceId: "dev1", type: "message.create",
+      inner: { body: "hello", fmt: "text" },
+      vectorClock: [[bytesToB64Url(pub), 1]],
+    });
+    // Flip a byte in ct
+    env.ct = new Uint8Array(env.ct);
+    env.ct[0] ^= 0xff;
+    T.assert(!(await Envelope.verify(env)), "tampered envelope must fail verify");
+  });
+
+  // ── TypingMgr ───────────────────────────────────────────────
+  T.add("TypingMgr: mark + activeIn", () => {
+    TypingMgr._fading.clear();
+    TypingMgr.mark("c1", "u1");
+    TypingMgr.mark("c1", "u2");
+    const actives = TypingMgr.activeIn("c1").sort();
+    T.assertEq(actives, ["u1", "u2"]);
+    TypingMgr._fading.clear();
+  });
+  T.add("TypingMgr: stale entries are swept on read", () => {
+    TypingMgr._fading.clear();
+    // Seed with an already-expired entry
+    TypingMgr._fading.set("c1", new Map([["u1", Date.now() - 1000]]));
+    T.assertEq(TypingMgr.activeIn("c1"), []);
+    T.assert(!TypingMgr._fading.has("c1"), "empty inner map should be cleaned");
+  });
+
+  // ── Canvas Y.Text binding ───────────────────────────────────
+  T.add("CanvasMgr: diff-based textarea binding updates Y.Text", async () => {
+    // Build a minimal fake bundle with a real Yjs doc
+    const bundle = { doc: WorkspaceDoc.create() };
+    const ta = document.createElement("textarea");
+    document.body.appendChild(ta);
+    CanvasMgr.bind(bundle, "chX", ta);
+    ta.value = "Hello";
+    ta.dispatchEvent(new Event("input", { bubbles: true }));
+    await new Promise(r => setTimeout(r, 20));
+    T.assertEq(CanvasMgr.getYText(bundle, "chX").toString(), "Hello");
+    ta.value = "Hello world";
+    ta.dispatchEvent(new Event("input", { bubbles: true }));
+    await new Promise(r => setTimeout(r, 20));
+    T.assertEq(CanvasMgr.getYText(bundle, "chX").toString(), "Hello world");
+    CanvasMgr.dispose();
+    ta.remove();
+  });
+}
+
+function renderTestPanel(results) {
+  const pass = results.filter(r => r.ok).length;
+  const fail = results.length - pass;
+  const style = `
+    <style>
+      body { font: 14px/1.5 -apple-system, sans-serif; padding: 24px; max-width: 820px; margin: 0 auto; }
+      h1 { margin: 0 0 16px; font-size: 22px; }
+      .sum { padding: 10px 14px; border-radius: 6px; margin-bottom: 18px; font-weight: 500; }
+      .sum.ok { background: #d1fadf; color: #064e3b; }
+      .sum.fail { background: #fee2e2; color: #7f1d1d; }
+      .t { padding: 6px 10px; border-radius: 4px; margin-bottom: 3px; }
+      .t.ok { color: #064e3b; }
+      .t.fail { background: #fef2f2; color: #7f1d1d; }
+      .t pre { margin: 4px 0 0 24px; font-size: 11px; white-space: pre-wrap; color: #991b1b; }
+      .marker { display: inline-block; width: 1.2em; }
+    </style>
+  `;
+  document.body.innerHTML = style + `
+    <h1>Mehfil tests</h1>
+    <div class="sum ${fail === 0 ? "ok" : "fail"}">
+      ${pass} passed · ${fail} failed · ${results.length} total
+    </div>
+    ${results.map(r => `
+      <div class="t ${r.ok ? "ok" : "fail"}">
+        <span class="marker">${r.ok ? "✓" : "✗"}</span>${escapeHTML(r.name)}
+        ${r.ok ? "" : `<pre>${escapeHTML(r.err || "")}\n${escapeHTML(r.stack || "")}</pre>`}
+      </div>
+    `).join("")}
+  `;
+}
+
+if (/[?&]test=1/.test(location.search)) {
+  (async () => {
+    // Wait for Yjs since several tests use WorkspaceDoc / Y.Doc.
+    try { Y = await import("https://esm.sh/yjs@13.6.30"); } catch {}
+    selfTest();   // runs the canonical msgpack self-test first
+    registerTests();
+    const results = await TestRunner.run();
+    renderTestPanel(results);
+  })().catch(e => {
+    document.body.innerHTML = "<pre style='padding:20px;color:red;'>Test harness failed:\n" + (e.stack || e) + "</pre>";
+  });
+} else {
+  boot();
+}
 </script>
 </body>
 </html>

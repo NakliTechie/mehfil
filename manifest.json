@@ -1,0 +1,25 @@
+{
+  "name": "Mehfil",
+  "short_name": "Mehfil",
+  "description": "Browser-native, local-first team chat. No accounts, no servers — your messages stay on your devices.",
+  "start_url": "./index.html",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "any",
+  "background_color": "#faf9f6",
+  "theme_color": "#5b4fe8",
+  "icons": [
+    {
+      "src": "data:image/svg+xml,%3Csvg xmlns='http%3A//www.w3.org/2000/svg' viewBox='0 0 192 192'%3E%3Crect width='192' height='192' rx='32' fill='%235b4fe8'/%3E%3Ctext x='96' y='125' font-family='-apple-system,BlinkMacSystemFont,sans-serif' font-size='100' font-weight='700' fill='white' text-anchor='middle'%3EM%3C/text%3E%3C/svg%3E",
+      "sizes": "192x192",
+      "type": "image/svg+xml",
+      "purpose": "any"
+    },
+    {
+      "src": "data:image/svg+xml,%3Csvg xmlns='http%3A//www.w3.org/2000/svg' viewBox='0 0 512 512'%3E%3Crect width='512' height='512' rx='88' fill='%235b4fe8'/%3E%3Ctext x='256' y='330' font-family='-apple-system,BlinkMacSystemFont,sans-serif' font-size='260' font-weight='700' fill='white' text-anchor='middle'%3EM%3C/text%3E%3C/svg%3E",
+      "sizes": "512x512",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}
