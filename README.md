@@ -2,7 +2,9 @@
 
 Browser-native, local-first team chat. Single HTML file. No accounts. No central server. Messages are end-to-end encrypted, signed by the sender, and stored on the devices of workspace members — never in the cloud.
 
-> **Status:** v2 shipped — Canvas (collaborative Yjs docs as channel type), voice messages + screen clips, voluntary admin transfer + step-down, workspace rekey scheduling, first-class threads, typing indicators, plus the full Slack-benchmark cluster (unread, notifications, pins, slash commands, ⌘K switcher, permalinks, shortcuts, custom status, announcement channels, user groups). PWA-installable with an offline shell.
+**[👉 Try it now — naklitechie.github.io/mehfil](https://naklitechie.github.io/mehfil/)** · no signup, no download
+
+> **Status:** v2 + a fleet of daily-driver polish — Canvas collab docs, voice + screen messages, live screen share in huddles, polls, checklists, scheduled send, rich profiles, typing indicators, saved-for-later, reminders, syntax-highlighted code, plus the full Slack-benchmark cluster (unread state, notifications, pins, slash commands, ⌘K switcher, permalinks, shortcuts, custom status, announcement channels, user groups). PWA-installable with an offline shell. 19-test in-browser suite at `?test=1`.
 
 ## What works
 
@@ -16,6 +18,9 @@ Browser-native, local-first team chat. Single HTML file. No accounts. No central
 - Threaded replies, @mentions with autocomplete, 8 emoji reactions (`👍 ❤️ 😂 😮 😢 🙏 👀 ✅`)
 - File attachments up to 25 MB (encrypted in OPFS, chunked over WebRTC, 500 MB per-workspace quota)
 - **Voice messages** 🎙 and **screen clips** 🎬 recorded via `MediaRecorder`, encrypted as attachments, inline `<audio>`/`<video>` players in the message list
+- **Code blocks** with triple-backtick fences — `\`\`\`js` renders a syntax-highlighted block via lazy-loaded highlight.js
+- **Polls** via `/poll question | opt A | opt B | …` — vote bars update live, one vote per user, click to change
+- **Checklists** via `/checklist Title | item 1 | item 2 | …` — toggles sync to every member via `checklist.toggle` envelopes
 - Message bodies rendered as plain text — all output escaped, no raw HTML, `@mentions` wrapped only when their user id is in the envelope's signed mentions list
 
 **Canvas** 📝
@@ -34,16 +39,25 @@ Browser-native, local-first team chat. Single HTML file. No accounts. No central
 - ⌘K quick switcher — unified palette for channels, DMs, and members (type to filter, Enter to jump; members without an existing DM show as "Start a DM")
 - ⌘⇧F — message search across every workspace you've joined (MiniSearch, `from:name` / `in:#channel` filters)
 - **💬 All threads** sidebar entry — every thread you authored, replied in, or were mentioned in, newest-reply first
+- **🔖 Saved** sidebar entry — per-device bookmarks via the 🔖 hover action on any message
+- **📝 Drafts** sidebar entry — every non-empty composer draft across channels, click to jump
 - Clickable message timestamps copy `#msg/<ws>/<ch>/<msgId>` deep links; pasting one opens the workspace, switches channel, scrolls to the message, and flashes it
+- **Timezone-aware timestamps** — tooltip shows `3:42 PM · 9:12 AM for Alice` when the author's time zone differs from yours
 - Forward any message to another channel (📨 hover) — target composer is prefilled as an attributed blockquote, author reviews before sending
 - Keyboard shortcuts: `⌘K` switcher · `⌘⇧F` search · `⌘⇧P` pins · `⌘⇧M` mute · `⌘⇧D` DND · `⌘,` settings · `⌘T` back to workspace picker · `⌘1–9` switch workspace · `↑` edit last · `?` or `⌘/` for the full list
 
 **Slash commands**
-- `/me <action>`, `/shrug [text]`, `/dm @name`, `/goto #channel`, `/topic <text>`, `/mute`, `/unmute`, `/dnd [on|off]`, `/pins`, `/invite`, `/call` (aka `/huddle`), `/search [q]`, `/help`
+- **Core**: `/me`, `/shrug`, `/dm @name`, `/goto #channel`, `/topic <text>`, `/mute`, `/unmute`, `/dnd [on|off]`, `/pins`, `/invite`, `/call` (aka `/huddle`), `/search [q]`, `/help`
+- **Collaboration**: `/poll question | opt A | opt B | …`, `/checklist Title | item 1 | item 2 | …`, `/send <time> <msg>` (scheduled), `/scheduled` (list queued), `/remind me in 15m|2h <text>`
+- **People**: `/tz @name` (their local time), `/away [min]` (temporary status, auto-clears)
+- **Utilities**: `/roll NdM`, `/flip`, `/8ball <q>`, `/hash <text>`, `/uuid`, `/base64 <text>`, `/base64d <text>`
 - Autocomplete picker with Tab-to-accept; unknown commands flash an inline error instead of sending
 
 **People + admin**
 - Custom status (emoji + text) with preset picker; broadcast on `presence.update`, visible in the People sidebar and on tooltip
+- **Rich profile** — optional pronouns, title, timezone (Settings → Identity). Other members see them in the sidebar tooltip; timezone drives the tz-aware timestamp tooltip
+- **Personal reminders** via `/remind me in 15m <text>` — stored locally, fire as a toast + Notification when due (tab-open caveat, documented honestly)
+- **Scheduled send** via `/send in 15m <text>` or `/send tomorrow at 9am <text>` — queued locally, post through the normal send path when the time hits
 - Channel topics — `/topic <text>` or the create-channel form; renders next to the channel name, syncs to every member live via `workspace.patch`
 - Announcement channels (📢) — admins-only posting; non-admins see a read-only banner; receive-side filter drops non-admin messages so forgery is cheap to defend
 - User groups — named sets of members (Settings → Admin). `@groupname` expands to notify every group member and renders as an accent pill
@@ -74,6 +88,7 @@ Browser-native, local-first team chat. Single HTML file. No accounts. No central
 - 🎙 button in sidebar starts a live audio call — WebRTC mesh, no server
 - Anyone online can join; audio is encrypted under the workspace key
 - Speaking rings animate on active microphones; mute toggle; leave at any time
+- **🖥 Live screen share** — click the screen button to share a tab, window, or the whole display. Video tracks are added to each peer connection and renegotiated; remote peers' screens render inline above the huddle bar
 
 **Networking**
 - WebRTC peer-to-peer via Cloudflare STUN (no signaling server for 1:1)
@@ -84,6 +99,10 @@ Browser-native, local-first team chat. Single HTML file. No accounts. No central
 - "Join by code" — 6-word pairing code, no URL needed, valid 5 minutes
 
 ## Run it
+
+**Fastest path** — open the hosted version at **[naklitechie.github.io/mehfil](https://naklitechie.github.io/mehfil/)**. It's the same single HTML file served from GitHub Pages; your keys and messages still live only in your browser.
+
+**Or serve locally** if you'd rather trust nothing but your own machine:
 
 ```sh
 cd Mehfil
@@ -176,7 +195,7 @@ Open `http://localhost:8103/?test=1` to run the in-browser test suite. Covers ca
 
 ## Architecture
 
-`index.html` is the entire app — markup, styles, and ~14,100 lines of vanilla JS, no framework, no build step. Web Crypto only. Custom canonical MessagePack codec (no external lib — ~250 lines of hand-rolled encode/decode, verified with 18 self-test vectors on every boot). IndexedDB per spec §9.1: `envelopes` is the source of truth, everything else is a projection rebuilt on replay. State is a single object; render is a pure function of state. Yjs (lazy-loaded from esm.sh) handles workspace metadata CRDT — channel list, member roles, pinned messages, user groups, channel topics, and canvas content all live in one Y.Doc that syncs via `workspace.patch` envelopes.
+`index.html` is the entire app — markup, styles, and ~15,400 lines of vanilla JS, no framework, no build step. Web Crypto only. Custom canonical MessagePack codec (no external lib — ~250 lines of hand-rolled encode/decode, verified with 18 self-test vectors on every boot). IndexedDB per spec §9.1: `envelopes` is the source of truth, everything else is a projection rebuilt on replay. State is a single object; render is a pure function of state. Yjs (lazy-loaded from esm.sh) handles workspace metadata CRDT — channel list, member roles, pinned messages, user groups, channel topics, and canvas content all live in one Y.Doc that syncs via `workspace.patch` envelopes.
 
 Two companion services live in separate repos:
 
