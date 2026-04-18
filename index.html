@@ -2200,10 +2200,17 @@ const Workspace = {
         const inner = await Envelope.decrypt(env, key);
         switch (env.type) {
           case "message.create": {
+            // Security: re-parse mentions at replay time (same reason as
+            // live dispatch — don't trust sender-asserted mentions). Groups
+            // come from the persisted Yjs doc if available, otherwise an
+            // empty list — the Yjs doc is loaded after the replay loop, so
+            // replay-time mentions of a group will resolve on the next
+            // workspace open once the doc has groups populated.
+            const replayMentions = parseMentions(inner.body || "", members, []);
             const msg = {
               id: env.id, ch: env.ch, from: env.from, ts: env.ts,
               body: inner.body,
-              mentions: inner.mentions && inner.mentions.length > 0 ? inner.mentions : undefined,
+              mentions: replayMentions.length > 0 ? replayMentions : undefined,
               thread: inner.thread || undefined,
               delivery: "stored",
               edited: false, deleted: false, lc: env.lc
@@ -2307,10 +2314,19 @@ const Workspace = {
             } else {
               rawKey = inner.key;
             }
+            // Slice F1-B / security: strip announce flag at replay time
+            // if the channel creator isn't currently an admin/owner.
+            let announceReplay = !!inner.announce;
+            if (announceReplay) {
+              const rcSender = members.find(m => m.id === env.from);
+              if (!(rcSender?.role === "owner" || rcSender?.role === "admin")) {
+                announceReplay = false;
+              }
+            }
             const chRec = {
               id: inner.id, name: inner.name, topic: inner.topic || "",
               private: !!inner.private, dm: !!inner.dm, dm_with: null,
-              announce: !!inner.announce,   // Slice F1-B
+              announce: announceReplay,
               members: inner.members || [],
               created_at: env.ts
             };
@@ -8153,12 +8169,23 @@ const EnvelopeDispatch = {
             }
           }
         }
+        // Security: re-parse the mentions list against our own members +
+        // groups projection. A malicious sender can put arbitrary user ids
+        // in inner.mentions to force notifications on everyone even when
+        // their body has no @name tokens — mute/DND is supposed to allow
+        // @mentions through. Trust the signature for authorship; trust our
+        // own parse for who was mentioned.
+        const trustedMentions = parseMentions(
+          inner.body || "",
+          current.members,
+          current.doc ? WorkspaceDoc.getGroups(current.doc) : []
+        );
         // Skip if already projected (can happen when replaying history to a
         // joiner who races their own send).
         if (!current.messages.find(m => m.id === env.id)) {
           current.messages.push({
             id: env.id, ch: env.ch, from: env.from, ts: env.ts, body: inner.body,
-            mentions: inner.mentions && inner.mentions.length > 0 ? inner.mentions : undefined,
+            mentions: trustedMentions.length > 0 ? trustedMentions : undefined,
             thread: inner.thread || undefined,
             delivery: "delivered",
             edited: false,
@@ -8173,10 +8200,13 @@ const EnvelopeDispatch = {
           // stale backlog (relay catch-up on reconnect) via a 60s horizon —
           // historical replay already bypasses this path (it goes through
           // Workspace.open). Mentions override mute/DND; see Notifier.
+          // Pass the verified mentions so a forged-mentions envelope can't
+          // trigger a breakthrough on muted channels.
           const myUid = bytesToB64Url(State.identity.pubkey);
           const isRecent = (Date.now() - env.ts) < 60_000;
-          if (isRecent && Notifier.shouldNotify(current, env, inner, myUid)) {
-            Notifier.fire(env, inner, current, current.members);
+          const innerForNotif = { ...inner, mentions: trustedMentions };
+          if (isRecent && Notifier.shouldNotify(current, env, innerForNotif, myUid)) {
+            Notifier.fire(env, innerForNotif, current, current.members);
           }
         }
         break;
@@ -8361,6 +8391,17 @@ const EnvelopeDispatch = {
         } else {
           rawKey = inner.key;
         }
+        // Slice F1-B / security: strip the announce flag if the sender
+        // isn't currently an admin/owner. Prevents a malicious client
+        // from forging admins-only-post channels.
+        let announceVerified = !!inner.announce;
+        if (announceVerified) {
+          const ccSender = current.members.find(m => m.id === env.from);
+          if (!(ccSender?.role === "owner" || ccSender?.role === "admin")) {
+            console.warn("channel.create: non-admin set announce flag, stripping", env.id);
+            announceVerified = false;
+          }
+        }
         const chRec = {
           id: inner.id,
           name: inner.name,
@@ -8368,7 +8409,7 @@ const EnvelopeDispatch = {
           private: !!inner.private,
           dm: !!inner.dm,   // group DMs carry dm:true in the envelope
           dm_with: null,    // null for group DMs; 1:1 DMs don't use this path
-          announce: !!inner.announce,   // Slice F1-B
+          announce: announceVerified,
           members: inner.members || [],
           created_at: env.ts
         };
@@ -8514,11 +8555,81 @@ const EnvelopeDispatch = {
         // causal check before calling us, but Yjs would tolerate
         // arbitrary order anyway.)
         if (!current.doc || !inner.update) break;
+
+        // Security: the Yjs doc holds fields that should only change
+        // under admin authority (workspace name, relay config, channel
+        // topics, user groups). The envelope signature authenticates
+        // the sender, but nothing else gates which fields they can
+        // mutate. Snapshot admin-only fields BEFORE applying, then if
+        // the sender isn't an admin, revert any admin-only change with
+        // a local mutation. The CRDT converges because any admin peer
+        // that also receives the malicious update will revert the same
+        // way — no explicit re-broadcast needed.
+        const wpSender  = current.members.find(m => m.id === env.from);
+        const wpIsAdmin = wpSender && (wpSender.role === "owner" || wpSender.role === "admin");
+
+        const preName    = WorkspaceDoc.getName(current.doc);
+        const preRelays  = WorkspaceDoc.getRelays(current.doc);
+        const preTopics  = new Map(
+          WorkspaceDoc.getChannels(current.doc).map(c => [c.id, c.topic || ""])
+        );
+        const preGroups  = WorkspaceDoc.getGroups(current.doc);
+
         WorkspaceDoc.applyUpdate(current.doc, inner.update);
-        // Persist the updated state as the new snapshot. This is
-        // the simplest possible persistence strategy — every apply
-        // writes the full state. For tiny workspaces this is fine;
-        // Slice 5+ may switch to incremental persistence.
+
+        if (!wpIsAdmin) {
+          // Workspace name
+          const postName = WorkspaceDoc.getName(current.doc);
+          if (postName !== preName && typeof preName === "string") {
+            console.warn("workspace.patch: non-admin rename attempt, reverting", env.from);
+            WorkspaceDoc.setName(current.doc, preName);
+          }
+          // Relay config — the most sensitive field (metadata attack vector)
+          const postRelays = WorkspaceDoc.getRelays(current.doc);
+          if (JSON.stringify(postRelays) !== JSON.stringify(preRelays || [])) {
+            console.warn("workspace.patch: non-admin relay change attempt, reverting", env.from);
+            WorkspaceDoc.setRelays(current.doc, preRelays || []);
+          }
+          // Channel topics — revert any that changed. Applied via addChannel
+          // (which overwrites the whole record), so we rebuild with the
+          // prior topic and the post-apply rest.
+          for (const dc of WorkspaceDoc.getChannels(current.doc)) {
+            const priorTopic = preTopics.get(dc.id);
+            if (priorTopic !== undefined && (dc.topic || "") !== priorTopic) {
+              console.warn("workspace.patch: non-admin topic change on", dc.id, "by", env.from, "— reverting");
+              const fixed = { ...dc, topic: priorTopic };
+              WorkspaceDoc.addChannel(current.doc, fixed);
+            }
+          }
+          // User groups — revert adds, mutations, and deletes. Any group
+          // present post-apply but absent pre-apply is removed; any group
+          // whose contents changed is restored.
+          const postGroups  = WorkspaceDoc.getGroups(current.doc);
+          const preGroupMap = new Map(preGroups.map(g => [g.id, g]));
+          const postGroupMap = new Map(postGroups.map(g => [g.id, g]));
+          for (const g of postGroups) {
+            if (!preGroupMap.has(g.id)) {
+              console.warn("workspace.patch: non-admin group add, reverting", g.id);
+              WorkspaceDoc.removeGroup(current.doc, g.id);
+            } else {
+              const pre = preGroupMap.get(g.id);
+              if (JSON.stringify(pre) !== JSON.stringify(g)) {
+                console.warn("workspace.patch: non-admin group mutation, reverting", g.id);
+                WorkspaceDoc.addGroup(current.doc, pre);
+              }
+            }
+          }
+          for (const g of preGroups) {
+            if (!postGroupMap.has(g.id)) {
+              console.warn("workspace.patch: non-admin group delete, restoring", g.id);
+              WorkspaceDoc.addGroup(current.doc, g);
+            }
+          }
+          // Pins and pending promotions are open to any member by design
+          // (spec §5.4 pins, §4.3 promotion drafting) — no revert there.
+        }
+
+        // Persist the (possibly corrected) state as the new snapshot.
         await WorkspaceDoc.save(current.wsDB, current.doc);
         // Mirror to the kv `workspace_meta` record for paths that
         // still read from the legacy store (ws name in sidebar, etc.)
@@ -8884,11 +8995,20 @@ async function replayHistory(current, targetUserId) {
  * non-member workspace users can't even see the channel name or topic.
  */
 async function sendChannelCreate(current, name, topic, { isPrivate = false, isDm = false, isAnnounce = false, memberIds = null } = {}) {
+  const myUserId = bytesToB64Url(State.identity.pubkey);
+  // Slice F1-B / security: only owners/admins can create announcement
+  // channels. Sender-side guard so the honest-client UI hides the option;
+  // receivers also strip the flag from non-admin senders on dispatch.
+  if (isAnnounce) {
+    const me = current.members.find(m => m.id === myUserId);
+    if (!(me?.role === "owner" || me?.role === "admin")) {
+      throw new Error("Only admins can create announcement channels.");
+    }
+  }
   const aesKey = await Crypto.genAesKey();
   const rawKey = await Crypto.exportAesRaw(aesKey);
   const chId = bytesToB64Url(Crypto.rand(16));
   const chosenMembers = memberIds || current.members.map(m => m.id);
-  const myUserId = bytesToB64Url(State.identity.pubkey);
 
   const signKey = await Crypto.importSignKey(State.identity.privkey_pkcs8);
   const meta = current.meta;

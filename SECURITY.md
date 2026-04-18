@@ -82,6 +82,31 @@ Rate limiting (100 PUT requests per IP per minute) is enforced by the relay.
 
 Pairing codes are single-use: the relay deletes the pairing payload on first retrieval.
 
+## Workspace doc mutations (`workspace.patch`)
+
+The workspace's Yjs doc holds fields with different authorization levels. The `workspace.patch` receive handler enforces them by snapshotting admin-only fields before applying an incoming update and, if the sender is not an owner or admin, reverting any admin-only change with a local mutation. The corrections are local-only (no re-broadcast); online admins independently reach the same correction so the CRDT converges.
+
+| Field | Who can mutate |
+|---|---|
+| Workspace name | owner, admin |
+| Relay config | owner, admin — **this is the most sensitive field** (a forged relay would receive padded ciphertext and enable metadata analysis / drop-based DoS) |
+| Channel topics | owner, admin |
+| User groups (add / remove / mutate) | owner, admin |
+| Pinned messages (add / remove) | any member — by design, spec §5.4 |
+| Pending promotions (add / remove) | any member — by design, spec §4.3 |
+
+Channel membership, roles, and key material are distributed via dedicated envelope types (`channel.create`, `channel.rekey`, `member.promote`, `member.remove`, `workspace.rekey`), each with its own cryptographic authorization — not through the Yjs doc.
+
+### Message mentions
+
+The `inner.mentions` list on a `message.create` envelope is **not trusted** as-authored. Receivers re-parse the body against their own members + groups projection and use only the verified subset for notification decisions. Without this, a malicious sender could populate `mentions` with every user id and force notifications to break through mute / DND on every message.
+
+### Announcement channels
+
+Messages on announcement channels are dropped on receive unless the sender is currently an owner or admin. The creator of an announcement channel must also be currently an admin — the flag is stripped if a non-admin sets it.
+
+**Known limitation:** if an admin is legitimately demoted between send and receive, their in-flight messages on announcement channels are dropped by late-receiving peers. In v1 there is no demote envelope — the only way a sender "becomes a non-admin" is by being removed and re-invited, which is rare and typically intended to sever their authority. Accepted for v1; tracked for the v1.1 demote work.
+
 ## Bridge security
 
 The LAN bridge announces itself via mDNS. Any device on the same LAN can reach it. The bridge trusts all clients to push well-formed envelopes — it does not verify signatures (that is the recipient's job).
