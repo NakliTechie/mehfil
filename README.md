@@ -98,6 +98,23 @@ Browser-native, local-first team chat. Single HTML file. No accounts. No central
 - **LAN bridge** (`mehfil-bridge` Go binary) — 24h buffer on your local network, mDNS auto-discovery, fingerprint pinning
 - "Join by code" — 6-word pairing code, no URL needed, valid 5 minutes
 
+## Palette
+
+**Settings → Identity → Appearance** has a picker for the page colorway. The default keeps the original indigo and follows your OS light/dark preference; the named palettes are pulled from the [Rangrez](https://github.com/NakliTechie/rangrez) library and pin Mehfil to a specific aesthetic regardless of system theme.
+
+| Palette | Mood |
+|---|---|
+| **Indigo** _(default)_ | the original — follows OS light/dark |
+| **کہوہ Kahwa** | Kashmiri saffron + cardamom + almond — the literal mehfil setting |
+| **ঠাকুর Tagore** | Jorasanko whitewash, where Gitanjali was written |
+| **Mumbai Art Deco** | Marine Drive at dusk — Parsi merchants' Miami |
+| **خشت Khesht** | Yazd mud-brick warmth, 2,000-year-old wind towers |
+| **صحراء Sahara** | Erg Chebbi dunes at golden hour |
+| **Dal Lake Dusk** _(dark)_ | shikara on still water, lotus pads catching last sun |
+| **شب یلدا Yalda** _(dark)_ | Persian winter solstice — Hafez, pomegranate, stay awake till dawn |
+
+The choice is per-device (saved in `localStorage` under `mehfil:palette`) — it never leaves your browser and isn't shared with workspace members. Code blocks keep their syntax-highlight palette regardless of the chosen colorway.
+
 ## Run it
 
 **Fastest path** — open the hosted version at **[naklitechie.github.io/mehfil](https://naklitechie.github.io/mehfil/)**. It's the same single HTML file served from GitHub Pages; your keys and messages still live only in your browser.

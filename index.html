@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="color-scheme" content="light dark">
-<meta name="theme-color" content="#5b4fe8">
+<meta name="theme-color" content="#5b4fe8" id="meta-theme-color">
 <!-- PWA manifest — lets users install Mehfil as a standalone app on
      desktops and mobile home screens. No push-notification hooks in the
      service worker (spec §14.6 forbids push via central service). -->
@@ -64,6 +64,53 @@
       --accent: #818cf8;
       --shadow: 0 1px 2px rgba(0,0,0,0.3), 0 4px 12px rgba(0,0,0,0.2);
     }
+  }
+  /* Rangrez palettes — opt-in via :root[data-palette="…"]. When set,
+     overrides the prefers-color-scheme defaults above (higher specificity).
+     hljs-* tokens deliberately NOT overridden — language-semantic, not chrome. */
+  :root[data-palette="kahwa"] {
+    color-scheme: light;
+    --bg: #ecd498; --bg-elev: #f4dca8; --bg-sunken: #e0c884;
+    --fg: #2a1808; --fg-mute: #6e5832; --fg-dim: #998757; --line: #d4be7c;
+    --accent: #a83018; --accent-fg: #ffffff; --ok: #5a6a2a;
+  }
+  :root[data-palette="tagore"] {
+    color-scheme: light;
+    --bg: #f4e8e0; --bg-elev: #fcf0e8; --bg-sunken: #ecdcd0;
+    --fg: #2a1a18; --fg-mute: #6e5550; --fg-dim: #9a8580; --line: #e0d0c4;
+    --accent: #b83820; --accent-fg: #ffffff; --ok: #3a7a3a;
+  }
+  :root[data-palette="dal-lake"] {
+    color-scheme: dark;
+    --bg: #08182a; --bg-elev: #142438; --bg-sunken: #14283a;
+    --fg: #f0c870; --fg-mute: #b09058; --fg-dim: #7a6a48; --line: #2a3a52;
+    --accent: #c0481a; --accent-fg: #ffffff; --ok: #6a9a3a;
+    --shadow: 0 1px 2px rgba(0,0,0,0.4), 0 4px 12px rgba(0,0,0,0.3);
+  }
+  :root[data-palette="sahara"] {
+    color-scheme: light;
+    --bg: #f4e4c0; --bg-elev: #fcecc8; --bg-sunken: #e8d4a8;
+    --fg: #3a1f08; --fg-mute: #7a5a36; --fg-dim: #a08866; --line: #d8c498;
+    --accent: #b8401a; --accent-fg: #ffffff; --ok: #3a8a4a;
+  }
+  :root[data-palette="khesht"] {
+    color-scheme: light;
+    --bg: #f0dcc0; --bg-elev: #f8e8cc; --bg-sunken: #e4ccaa;
+    --fg: #3a1a08; --fg-mute: #7a5638; --fg-dim: #a08868; --line: #d4bc98;
+    --accent: #b8281a; --accent-fg: #ffffff; --ok: #5a7a2a;
+  }
+  :root[data-palette="mumbai-deco"] {
+    color-scheme: light;
+    --bg: #f5ede0; --bg-elev: #fcf5e8; --bg-sunken: #ece4d4;
+    --fg: #1a1818; --fg-mute: #6a5e58; --fg-dim: #968a82; --line: #d8d0c0;
+    --accent: #c8341a; --accent-fg: #ffffff; --ok: #2a5a2a;
+  }
+  :root[data-palette="yalda"] {
+    color-scheme: dark;
+    --bg: #14080c; --bg-elev: #1e0e14; --bg-sunken: #1e0c12;
+    --fg: #f0c870; --fg-mute: #b09058; --fg-dim: #7a6a48; --line: #321a22;
+    --accent: #d83828; --accent-fg: #ffffff; --ok: #7a9a3a;
+    --shadow: 0 1px 2px rgba(0,0,0,0.4), 0 4px 12px rgba(0,0,0,0.3);
   }
   * { box-sizing: border-box; }
   html, body { height: 100%; margin: 0; }
@@ -1271,7 +1318,52 @@
   #btn-huddle-leave { font-size: 11px; padding: 3px 8px; color: var(--danger); border-color: var(--danger); }
   #btn-huddle { transition: color 0.15s; }
   #btn-huddle.active { color: var(--ok); }
+  /* Rangrez palette picker (Settings → Identity → Appearance) */
+  .palette-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); gap: 8px; }
+  .palette-card {
+    cursor: pointer; padding: 10px; border-radius: 8px;
+    border: 1px solid var(--line); background: var(--bg-elev);
+    display: flex; gap: 10px; align-items: center;
+    transition: border-color 0.1s, transform 0.05s;
+  }
+  .palette-card:hover { border-color: var(--fg-dim); }
+  .palette-card:active { transform: translateY(1px); }
+  .palette-card.active { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
+  .palette-swatch {
+    width: 36px; height: 36px; border-radius: 6px; flex-shrink: 0;
+    display: grid; grid-template-columns: 1fr 1fr; grid-template-rows: 1fr 1fr;
+    overflow: hidden; border: 1px solid rgba(0,0,0,0.08);
+  }
+  .palette-swatch > span { display: block; }
+  .palette-card-info { min-width: 0; flex: 1; }
+  .palette-card-name { font-size: 13px; font-weight: 500; line-height: 1.2; }
+  .palette-card-tag  { font-size: 10px; color: var(--fg-dim); text-transform: uppercase; letter-spacing: 0.04em; margin-top: 2px; }
 </style>
+<!-- Rangrez palette: apply before first paint to avoid a flash. Mirrors the
+     PaletteRegistry in the main module — keep in sync. theme-color tracks
+     each palette's accent so installed PWA chrome matches the page. -->
+<script>
+(function () {
+  var ACCENTS = {
+    "default":     "#5b4fe8",
+    "kahwa":       "#a83018",
+    "tagore":      "#b83820",
+    "dal-lake":    "#c0481a",
+    "sahara":      "#b8401a",
+    "khesht":      "#b8281a",
+    "mumbai-deco": "#c8341a",
+    "yalda":       "#d83828"
+  };
+  try {
+    var p = localStorage.getItem("mehfil:palette");
+    if (p && ACCENTS[p] && p !== "default") {
+      document.documentElement.setAttribute("data-palette", p);
+    }
+    var meta = document.getElementById("meta-theme-color");
+    if (meta && ACCENTS[p || "default"]) meta.setAttribute("content", ACCENTS[p || "default"]);
+  } catch (e) { /* localStorage blocked — fall back to default */ }
+})();
+</script>
 </head>
 <body>
 <div id="app"></div>
@@ -5766,6 +5858,65 @@ function openRestoreModal() {
 }
 
 /* ------------------------------------------------------------
+ *  §10b Rangrez palette registry
+ *
+ *  Per-device aesthetic preference, persisted in localStorage under
+ *  "mehfil:palette". The early-load script in <head> applies the saved
+ *  palette before first paint — this object is the runtime source of
+ *  truth for the picker UI and any later switches.
+ *
+ *  Each entry's `accent` mirrors the BRAND token in the corresponding
+ *  CSS override (top of the <style> block) and the early-script ACCENTS
+ *  map. All three must agree.
+ *
+ *  Source: https://github.com/NakliTechie/rangrez
+ * ------------------------------------------------------------ */
+const Palette = (() => {
+  // swatch = [bg, panel, accent, fg] — drives the 2x2 preview tile.
+  const LIST = [
+    { id: "default",     label: "Indigo",          tag: "Default",        feel: "The original Mehfil indigo",                            accent: "#5b4fe8", role: "auto",  swatch: ["#fafaf7","#ffffff","#5b4fe8","#1a1a1a"] },
+    { id: "kahwa",       label: "کہوہ Kahwa",       tag: "Kashmir",        feel: "Saffron, cardamom, almond — the literal mehfil",        accent: "#a83018", role: "light", swatch: ["#ecd498","#f4dca8","#a83018","#2a1808"] },
+    { id: "tagore",      label: "ঠাকুর Tagore",      tag: "Bengal",         feel: "Jorasanko whitewash, where Gitanjali was written",      accent: "#b83820", role: "light", swatch: ["#f4e8e0","#fcf0e8","#b83820","#2a1a18"] },
+    { id: "mumbai-deco", label: "Mumbai Art Deco", tag: "Bombay",         feel: "Marine Drive at dusk, Parsi merchants' Miami",          accent: "#c8341a", role: "light", swatch: ["#f5ede0","#fcf5e8","#c8341a","#1a1818"] },
+    { id: "khesht",      label: "خشت Khesht",      tag: "Yazd",           feel: "Mud-brick warmth, 2,000-year-old wind towers",          accent: "#b8281a", role: "light", swatch: ["#f0dcc0","#f8e8cc","#b8281a","#3a1a08"] },
+    { id: "sahara",      label: "صحراء Sahara",    tag: "Morocco",        feel: "Erg Chebbi dunes at golden hour",                        accent: "#b8401a", role: "light", swatch: ["#f4e4c0","#fcecc8","#b8401a","#3a1f08"] },
+    { id: "dal-lake",    label: "Dal Lake Dusk",   tag: "Kashmir · dark", feel: "Shikara on still water, lotus pads catching last sun",  accent: "#c0481a", role: "dark",  swatch: ["#08182a","#142438","#c0481a","#f0c870"] },
+    { id: "yalda",       label: "شب یلدا Yalda",   tag: "Persia · dark",  feel: "Winter solstice, Hafez, pomegranate till dawn",         accent: "#d83828", role: "dark",  swatch: ["#14080c","#1e0e14","#d83828","#f0c870"] },
+  ];
+  const KEY = "mehfil:palette";
+
+  function list() { return LIST; }
+
+  function current() {
+    try {
+      const v = localStorage.getItem(KEY);
+      return LIST.find(p => p.id === v) ? v : "default";
+    } catch (e) { return "default"; }
+  }
+
+  function apply(id) {
+    const entry = LIST.find(p => p.id === id) || LIST[0];
+    if (entry.id === "default") {
+      document.documentElement.removeAttribute("data-palette");
+    } else {
+      document.documentElement.setAttribute("data-palette", entry.id);
+    }
+    const meta = document.getElementById("meta-theme-color");
+    if (meta) meta.setAttribute("content", entry.accent);
+    try { localStorage.setItem(KEY, entry.id); } catch (e) { /* private mode */ }
+    return entry;
+  }
+
+  return { list, current, apply };
+})();
+
+function paletteSwatchHTML(id) {
+  const entry = Palette.list().find(p => p.id === id);
+  if (!entry) return "";
+  return entry.swatch.map(c => `<span style="background:${c};"></span>`).join("");
+}
+
+/* ------------------------------------------------------------
  *  §11  Settings modal — Slice 5 full tabbed UI (WT-20, WT-21, WT-22)
  *
  *  Tabs:
@@ -5900,6 +6051,29 @@ function renderSettingsIdentityTab(me) {
         <button class="primary" id="profile-save">Save profile</button>
       </div>
       <div class="err" id="profile-err"></div>
+    </div>
+    <div class="field">
+      <label>Appearance</label>
+      <div style="font-size: 12px; color: var(--fg-dim); margin-bottom: 8px;">
+        Per-device — saved in this browser only. Drawn from
+        <a href="https://github.com/NakliTechie/rangrez" target="_blank" rel="noopener">Rangrez</a>.
+      </div>
+      <div class="palette-grid" id="palette-grid">
+        ${(() => {
+          const cur = Palette.current();
+          return Palette.list().map(p => {
+            const sw = paletteSwatchHTML(p.id);
+            return `
+              <div class="palette-card${p.id === cur ? " active" : ""}" data-palette-id="${p.id}" title="${escapeHTML(p.feel)}">
+                <div class="palette-swatch">${sw}</div>
+                <div class="palette-card-info">
+                  <div class="palette-card-name">${escapeHTML(p.label)}</div>
+                  <div class="palette-card-tag">${escapeHTML(p.tag)}</div>
+                </div>
+              </div>`;
+          }).join("");
+        })()}
+      </div>
     </div>
     <div class="field">
       <label>Backup status</label>
@@ -6238,6 +6412,18 @@ function wireSettingsTab(tab, wrap, current, me, wsName) {
         $save.disabled = false;
       }
     };
+    // Palette picker — apply on click, persist, update active highlight in place.
+    const $grid = wrap.querySelector("#palette-grid");
+    if ($grid) {
+      $grid.querySelectorAll(".palette-card").forEach(card => {
+        card.onclick = () => {
+          const id = card.dataset.paletteId;
+          Palette.apply(id);
+          $grid.querySelectorAll(".palette-card").forEach(c =>
+            c.classList.toggle("active", c.dataset.paletteId === id));
+        };
+      });
+    }
 
   } else if (tab === "devices") {
     const $addBtn = wrap.querySelector("#btn-add-device-pair");
