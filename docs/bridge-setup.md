@@ -6,10 +6,9 @@ The Mehfil Bridge is an optional LAN relay that lets devices sync even when they
 
 - Announces itself on your LAN via mDNS (`_mehfil._tcp.local`, port 8765) so Mehfil finds it automatically.
 - Stores incoming envelopes for 24 hours so offline devices can catch up.
-- Provides a WebSocket `/signal` endpoint for WebRTC offer/answer/ICE exchange between peers on the same LAN.
 - Identifies itself with an Ed25519 fingerprint that Mehfil pins on first connect, preventing impersonation.
 
-The bridge stores **only ciphertext** — it never holds keys and cannot read messages.
+The bridge stores **only ciphertext** — it never holds keys and cannot read messages. WebRTC signaling for huddles rides on the regular envelope path (no dedicated signaling endpoint); see `MEHFIL-SPEC.md` §7.1.
 
 ## Install
 

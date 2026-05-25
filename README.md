@@ -219,7 +219,7 @@ Two companion services live in separate repos:
 | Repo | Language | Purpose |
 |---|---|---|
 | [`mehfil-relay`](https://github.com/NakliTechie/mehfil-relay) | JS / Cloudflare Workers | Store-and-forward relay + pairing endpoint |
-| [`mehfil-bridge`](https://github.com/NakliTechie/mehfil-bridge) | Go | LAN buffer + mDNS discovery + WebRTC signaling |
+| [`mehfil-bridge`](https://github.com/NakliTechie/mehfil-bridge) | Go | LAN buffer + mDNS discovery |
 
 ## Documents
 

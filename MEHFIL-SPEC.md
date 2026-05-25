@@ -260,7 +260,7 @@ Mehfil supports four transport configurations. A workspace can use any of them, 
 
 **Mode C: Bridge mode (LAN with helper binary)**
 - `mehfil-bridge` runs on an always-on machine in the office
-- Provides mDNS announce, WebRTC signaling, peer registry, 24h LAN store-forward
+- Provides mDNS announce + 24 h LAN store-and-forward over `/ws/{ws_id}/envelopes`; WebRTC signaling rides on the envelope path (no dedicated endpoint — see §7.1)
 - Bridge sees only ciphertext
 - Bridge fingerprint is pinned per workspace in the workspace doc
 - Use case: office workspaces ≥6 people where async overlap is unreliable
@@ -287,16 +287,23 @@ The client surfaces tier transitions (see §12).
 
 ### 7.1 LAN transport: WebRTC mesh + servent gossip + bridge
 
-**Bridge (`mehfil-bridge`)** is a Go binary, ~200 LOC, single static file, cross-compiled per OS. Runs on any always-on machine in the office.
+**Bridge (`mehfil-bridge`)** is a Go binary, single static file, cross-compiled per OS. Runs on any always-on machine in the office.
 
 Bridge responsibilities:
 1. **mDNS announce** as `_mehfil._tcp.local`, also serves at `mehfil.local:8765`
-2. **`/signal`** WebSocket — WebRTC offer/answer/ICE relay
-3. **`/peers`** REST — currently connected pubkeys
-4. **`/lan-relay`** — store-and-forward last 24h of envelopes for clients that drop off
-5. Has its own keypair; signs `/peers` and `/signal` responses; bridge fingerprint pinned in workspace doc
+2. **`GET /health`** — liveness; response carries `X-Bridge-Fp` for fingerprint pinning
+3. **`PUT /ws/{ws_id}/envelopes`** — store one envelope (bounded 24 h in-memory ring, 2000 per workspace, 4 KB max each)
+4. **`GET /ws/{ws_id}/envelopes?since=<cursor>&limit=<n>`** — fetch envelopes since cursor (max 500 per call)
+5. **`GET /ws/{ws_id}/cursor`** — latest seq
+6. Has its own keypair; every response carries `X-Bridge-Fp`; bridge fingerprint pinned in workspace doc on first connect
 
-The bridge sees only signed encrypted envelopes. It cannot decrypt anything. Losing the bridge loses 24h of LAN store-forward and discovery; everything else lives on each device.
+The bridge sees only signed encrypted envelopes. It cannot decrypt anything. Losing the bridge loses 24 h of LAN store-forward and discovery; everything else lives on each device.
+
+**Signaling rides on the envelope path.** WebRTC offers, answers, and ICE candidates for huddles are sent as `huddle.signal` envelopes encrypted under the workspace root key, persisted in the bridge (or the relay), and picked up on the recipient's poll cycle. There is no dedicated `/signal` endpoint on the bridge.
+
+An earlier bridge design had a `/signal` WebSocket relay (textbook signaling-hub shape) and a `/peers` registry. Both were deleted on 2026-05-25 in [mehfil-bridge commit `e638a6d`](https://github.com/NakliTechie/mehfil-bridge/commit/e638a6d) — confirmed dead code (zero references in `index.html`; the app had quietly migrated to envelope-routed signaling at some earlier point). The envelope path is strictly better in three dimensions: trust (E2E encrypted under the workspace key vs. bridge-sees-cleartext SDP), transport-fallback (inherits relay + gossip + WebRTC peer paths), and offline recipients (store-and-forward catches them).
+
+**Future: low-latency signaling path (deferred).** The one cost of envelope-routed signaling is latency — each SDP / ICE candidate is a full envelope round-trip through the bridge's poll cycle (~3 s) or the relay's (~5 s). For 1:1 and small-group huddles this is fine; for 5+ peer huddles with O(N²) pairwise handshakes, or for renegotiation under ICE candidate updates during a call, cumulative delay becomes perceptible. If group huddles need sub-second connection setup, or screen-share renegotiation under network changes hiccups visibly, or a future feature wants high-frequency low-latency P2P (e.g., realtime multiplayer mini-features in a channel), a dedicated signaling path comes back — probably as a thin WebSocket on the bridge or relay, scoped specifically to `huddle.signal`-shaped messages, rate-limited per workspace, and inheriting the bridge's fingerprint-pin trust model rather than reverting to the cleartext-relay design we just dropped.
 
 **Servent gossip layer** (also runs in Mode B without a bridge): every client is also a relay. Once two clients have a WebRTC data channel, every envelope received is forwarded to all connected peers, deduped by seen-set.
 
