@@ -715,6 +715,36 @@ Calm by default. Channels, DMs, search, settings. No app marketplace, no workflo
 - Anything that requires Mehfil-operated infrastructure
 - Distribution via app stores as the primary path
 
+### 14.7 Living roadmap
+
+§14.1–14.5 capture the v1 scope-lock decisions as they were originally cut. This section is the **current snapshot** of what's still pending and what's been added since the lock, ranked by value-to-effort. Items below are the user-facing roadmap; deeper rationale and trigger conditions live in their per-item notes.
+
+**Still pending from §14.3 (v1.1):**
+
+- **Slash integrations** with sibling tools (`/bofh`, `/localmind`, `/kanzen`) — slash infra already supports arbitrary command registration; each integration is a one-line registry entry plus a tiny handler that opens the target app in a new tab or embeds a compact result back into the channel.
+- **S3-compatible relay adapter** — relay-type dropdown already surfaces "S3-compatible" as an option, but the SigV4-signed HTTP protocol isn't wired up. Needs presigned-URL generation (simpler) or full in-browser SigV4 signing, plus a mapping of `/ws/:id/envelopes` to S3 bucket/key paths. ~300 LOC plus test rig. Deferred.
+- **File attachment limit raised** — currently capped at 25 MB by the envelope-frame limit. Raising to 100 MB+ needs chunked upload to the relay with resume, streaming decrypt + content-address hashing, and per-relay size negotiation. Deferred until a concrete use case shows up.
+- **Multi-admin demote envelope** — see §14.7 known limitation below.
+
+**Still pending from §14.4 (v2):**
+
+- **Multi-office bridge federation** — multi-bridge sync between geographically separated offices.
+- **Shamir-split identity backup** — split the identity key into N shares with K-of-N threshold, useful for distributing backup across trusted contacts as an alternative to the current passphrase-wrapped `.mehfil-key` backup. Needs a correct Shamir implementation over GF(256) (~100 LOC of careful crypto) plus UI for split + reconstruct.
+
+**Canvas polish (v1.x → v2):** the v1 Canvas (shipped) is public-only with no cursor awareness and no rich editor. Known follow-ups:
+
+- **Private canvas** — needs per-channel-key-encrypted Y.Doc (not the shared workspace Y.Doc).
+- **Remote cursor positions** via Yjs awareness — a "who's editing now" indicator.
+- **Rich-text editor** — pull in Tiptap or ProseMirror if users want formatting beyond plain markdown.
+
+**Newly identified (not in §14.3/§14.4 originally):**
+
+- **Low-latency signaling path for huddles (v2.x)** — see §7.1. WebRTC handshake today rides on the regular envelope path; for 5+ peer huddles or ICE renegotiation, the ~3 s bridge-poll round-trip becomes perceptible. If group huddles need sub-second connection setup or screen-share renegotiation under network changes hiccups visibly, restore a dedicated signaling path — preferably as a thin WebSocket scoped to `huddle.signal`-shaped messages, not the cleartext-relay shape we dropped.
+
+**Known limitations (v1 by design):**
+
+- **Announcement channel demote edge case.** If a sender was a legitimate admin when they posted to an announcement channel but is demoted before late-arriving peers receive the message, those peers drop the message (the receiver-side gate checks role at delivery time, not at the envelope's `ts`). In v1 there's no demote envelope — the only path from admin back to non-admin is removal + re-invite, which is typically intentional scope removal, so accepting the drop is defensible. When the multi-admin demote envelope lands (v1.1, see above), revisit: accept if sender *was* admin at `env.ts`, which requires a role-history projection keyed on timestamp.
+
 ---
 
 ## 15. Threat model

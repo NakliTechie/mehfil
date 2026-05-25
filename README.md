@@ -221,6 +221,19 @@ Two companion services live in separate repos:
 | [`mehfil-relay`](https://github.com/NakliTechie/mehfil-relay) | JS / Cloudflare Workers | Store-and-forward relay + pairing endpoint |
 | [`mehfil-bridge`](https://github.com/NakliTechie/mehfil-bridge) | Go | LAN buffer + mDNS discovery |
 
+## Roadmap
+
+Next-up work, ranked by value-to-effort. Everything below is consistent with the local-first frame and `MEHFIL-SPEC.md` §14.6 — no bots, no workflows, no SFU, no central infrastructure.
+
+- **S3-compatible relay adapter (v1.1)** — bring-your-own object storage. The relay-type dropdown already surfaces "S3-compatible," but the SigV4-signed HTTP isn't wired up; deferred until someone needs it.
+- **Larger file attachments (v1.1)** — current cap is 25 MB. Raising it needs chunked upload with resume + streaming decrypt; deferred until a concrete use case shows up.
+- **Slash integrations** (`/bofh`, `/localmind`, `/kanzen`) — wiring the slash registry into the sibling NakliTechie tools so a `/bofh sha256 <text>` in a channel returns a result inline.
+- **Shamir-split identity backup (v2)** — N-of-K key shares distributed across trusted contacts as an alternative to the current passphrase-wrapped `.mehfil-key` backup.
+- **Canvas polish (v1.x → v2)** — private canvas (per-channel-key-encrypted Y.Doc), remote cursor positions via Yjs awareness, and an optional rich-text editor.
+- **Low-latency signaling path for huddles (v2.x)** — WebRTC signaling for huddles currently rides on the regular envelope path (~3 s per round-trip on the bridge). Fine for 1:1 and small groups; if group huddles need sub-second connection setup, a dedicated thin WebSocket signaling endpoint comes back. See `MEHFIL-SPEC.md` §7.1.
+
+The authoritative version-locked list (with shipped markers and a "Never" rule-out section) is `MEHFIL-SPEC.md` §14.
+
 ## Documents
 
 | File | Purpose |
