@@ -1,0 +1,16 @@
+{
+  // Mehfil is a static single-file app served from Cloudflare Workers static assets.
+  // No server-side code — `assets` with no `main` deploys an assets-only Worker.
+  // Connected to the GitHub repo (NakliTechie/mehfil); this file drives both the
+  // git-triggered Workers Build and local `wrangler deploy`.
+  "name": "mehfil",
+  "compatibility_date": "2026-07-02",
+  "assets": {
+    "directory": "./",
+    // hash-routed SPA — serve index.html for any unknown path
+    "not_found_handling": "single-page-application"
+  },
+  "routes": [
+    { "pattern": "mehfil.naklitechie.com", "custom_domain": true }
+  ]
+}

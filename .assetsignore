@@ -1,0 +1,15 @@
+# Files that must NOT be published as static assets.
+# The served site is: index.html, manifest.json, sw.js, guide/**
+.git
+.github
+.claude
+.wrangler
+node_modules
+plan
+docs
+*.md
+LICENSE
+.gitignore
+.assetsignore
+wrangler.jsonc
+.DS_Store

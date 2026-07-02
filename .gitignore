@@ -17,6 +17,8 @@
 !guide/index.html
 !guide/img/
 !guide/img/*.png
+!wrangler.jsonc
+!.assetsignore
 
 # wrangler files
 .wrangler
