@@ -3116,8 +3116,9 @@ function renderLanding() {
           <button id="btn-restore">I have a backup file</button>
         </div>
         ${State.workspaces.length ? renderWorkspaceList() : ""}
-        <p class="sub" style="margin-top: 22px; font-size: 12px; display: flex; gap: 16px; justify-content: center;">
+        <p class="sub" style="margin-top: 22px; font-size: 12px; display: flex; gap: 16px; justify-content: center; flex-wrap: wrap;">
           <a id="link-lost">What if I lose my key?</a>
+          <a id="link-download" title="Save Mehfil as a file so you can AirDrop / Quick Share / copy it to another phone — no internet needed">Download the app ↓</a>
           <a href="guide/index.html" target="_blank" style="color: var(--accent);">User guide ↗</a>
         </p>
       </div>
@@ -3133,11 +3134,51 @@ function renderLanding() {
     "a backup file, you'll need to be re-invited under a new identity. Back up your " +
     "key after your first message — we'll prompt you."
   );
+  document.getElementById("link-download").onclick = downloadAppFile;
   document.getElementById("btn-how").onclick = openHowItWorksModal;
   // Wire workspace list entries.
   document.querySelectorAll("[data-ws-open]").forEach(el => {
     el.onclick = () => openWorkspaceById(el.getAttribute("data-ws-open"));
   });
+}
+
+/**
+ * Save this page's own HTML as a file so someone can hand Mehfil to the next
+ * phone with no app store and no internet — AirDrop / Quick Share / USB the
+ * file, open it, done. This is the honest fix for the "get the app onto the
+ * next device" step of the offline-mesh flow (MEHFIL-OFFLINE-MESH-SPEC.md §5):
+ * a browser still needs index.html before anything runs, so we let the people
+ * who already have it pass it along. Works offline — the service worker serves
+ * the cached index.html.
+ */
+async function downloadAppFile() {
+  const link = document.getElementById("link-download");
+  const label = link ? link.textContent : "";
+  if (link) link.textContent = "Preparing…";
+  let html = null;
+  // Prefer the canonical file (a clean, unmutated copy); fall back to the
+  // current URL, then to serializing the live document (all code is inline, so
+  // even that is a working app) for the file:// case where fetch is blocked.
+  for (const u of [new URL("index.html", location.href).href, location.href]) {
+    try {
+      const res = await fetch(u, { cache: "force-cache" });
+      if (res.ok) { html = await res.text(); break; }
+    } catch {}
+  }
+  if (!html) html = "<!doctype html>\n" + document.documentElement.outerHTML;
+  try {
+    const url = URL.createObjectURL(new Blob([html], { type: "text/html" }));
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "mehfil.html";
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 5000);
+  } catch (e) {
+    alert("Couldn't prepare the download: " + (e.message || e));
+  }
+  if (link) link.textContent = label || "Download the app ↓";
 }
 
 function renderWorkspaceList() {
@@ -6996,10 +7037,13 @@ function renderInviteModal() {
         // back. No link, no server, no internet — camera to camera.
         $body.innerHTML = `
           <p class="sub">No internet needed. Have them open Mehfil on the same WiFi hotspot, tap <strong>Join by scanning (offline)</strong>, and point their camera here. When they show you their reply code, tap <strong>Scan their reply</strong>.</p>
+          <p class="sub" style="font-size: 12px;">Don't have Mehfil on their phone yet? <a id="inv-download" style="color: var(--accent); cursor: pointer;">Download it</a> and AirDrop / Quick Share the file across first.</p>
           <div id="qr-holder"><span class="sub">building code…</span></div>
           <div class="row" style="margin-top: 10px; justify-content: center;">
             <button class="primary" id="scan-reply-btn">Scan their reply</button>
           </div>`;
+        const invDl = card.querySelector("#inv-download");
+        if (invDl) invDl.onclick = downloadAppFile;
         if (inv._cyc) { inv._cyc.stop(); inv._cyc = null; }
         try {
           const frames = await QRFrames.encode({ j: inv.frag });

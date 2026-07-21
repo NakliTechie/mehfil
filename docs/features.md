@@ -144,7 +144,9 @@ uses the native detector where available and a bundled software decoder on iOS; 
 encoder is inlined too, so nothing loads from the network). The corner badge shows **🔵
 Offline mesh**. (Everyone must be on the same hotspot; venue WiFi with AP client isolation blocks it —
 a phone's own hotspot does not. Install Mehfil once, anywhere with signal, before you go
-somewhere without it.) Full design: [`MEHFIL-OFFLINE-MESH-SPEC.md`](../MEHFIL-OFFLINE-MESH-SPEC.md).
+somewhere without it — or use the **Download the app** link on the landing page to save
+`mehfil.html` and AirDrop / Quick Share it to a phone that doesn't have it yet.) Full design:
+[`MEHFIL-OFFLINE-MESH-SPEC.md`](../MEHFIL-OFFLINE-MESH-SPEC.md).
 
 ## Roadmap
 
