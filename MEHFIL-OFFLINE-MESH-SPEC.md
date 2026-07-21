@@ -214,6 +214,15 @@ caches it and the device never needs internet again for the app itself.
 someone discover it the hard way in a location with no signal. Suggested copy:
 "Install Mehfil once, anywhere with signal, before you go somewhere without it."
 
+To make handing the app to the *next* device a first-class action rather than a
+docs footnote, the front end offers a **"Download the app"** link (landing page,
+and inline in the offline invite screen) that saves this page's own HTML as
+`mehfil.html`. Anyone who already has Mehfil can then AirDrop / Quick Share / USB
+the single file to a phone that doesn't — no app store, no internet. It works
+offline because the service worker serves the cached `index.html`. This doesn't
+repeal the rule above (a browser still needs the file before anything runs), but
+it turns "get the app onto their phone" into one tap for whoever already has it.
+
 > **Implementation note (§10):** the QR *encoder* (qrcode-generator, MIT) is now
 > **vendored and inlined in the page** rather than lazy-loaded from a CDN, so
 > frames render offline with no prior online fetch and no cache-warming — the one
