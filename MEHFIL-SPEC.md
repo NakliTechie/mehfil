@@ -399,11 +399,27 @@ Corner badge, always visible:
 | State | Meaning |
 |---|---|
 | 🟢 Live | Connected to peers via WebRTC (Mode A/B/C) |
+| 🔵 Offline mesh | Connected via host-only ICE, no STUN/relay reachable, all peers on a local hotspot (see §7.7) |
 | 🟡 Sync | Connected to relay only, async delivery |
 | 🟠 Catching up | Fetching backlog |
 | 🔴 Offline | All transports down, queuing locally |
 
 Click to expand: full transport list, per-peer status, queued message count, last sync time, troubleshoot link.
+
+### 7.7 Offline mesh bootstrap (no internet, ever)
+
+Modes A and B still assume a reachable path to the open internet for their first
+handshake (an invite URL shared over some channel, a WebRTC connection that can
+reach STUN). In a remote area with no cellular signal and no ISP — only a phone
+running its own WiFi hotspot — neither holds. **MEHFIL-OFFLINE-MESH-SPEC.md**
+(v1.1 addendum) extends this section to cover that case: host-only ICE when no
+uplink is present, a multi-frame QR channel that carries the full gathered SDP
+camera-to-camera with no link and no server, and (M1, reserved) gossip-relayed
+signaling so a new peer needs exactly one QR scan with any one existing peer.
+
+M0 (the two-peer offline QR handshake) and the M0/M2 UX foundation ship in
+`index.html`; the multi-hop `signal.relay` mesh dialer (M1) is reserved pending
+its hardware gate. See that spec's §10 for the spec-to-code map.
 
 ---
 
@@ -739,6 +755,7 @@ Calm by default. Channels, DMs, search, settings. No app marketplace, no workflo
 
 **Newly identified (not in §14.3/§14.4 originally):**
 
+- **Offline mesh bootstrap (v1.1)** — see §7.7 and MEHFIL-OFFLINE-MESH-SPEC.md. **M0 shipped**: host-only ICE with no uplink, a multi-frame QR SDP channel (`QRFrames`), an in-page camera scanner (`BarcodeDetector`) with cycling-QR display, the offline invite/join flows, and the 🔵 Offline mesh badge — proven by a headless host-only WebRTC handshake carried entirely over QR frames. **Pending**: M1, the multi-hop `signal.relay` mesh dialer that lets a new peer reach the whole mesh from a single scan (envelope type is reserved and ephemeral, dialer deferred to its 3-peer hardware gate); and the M2 real-hardware three-device walkthrough. Open decision: whether `signal.relay` needs a rate limit distinct from message envelopes.
 - **Low-latency signaling path for huddles (v2.x)** — see §7.1. WebRTC handshake today rides on the regular envelope path; for 5+ peer huddles or ICE renegotiation, the ~3 s bridge-poll round-trip becomes perceptible. If group huddles need sub-second connection setup or screen-share renegotiation under network changes hiccups visibly, restore a dedicated signaling path — preferably as a thin WebSocket scoped to `huddle.signal`-shaped messages, not the cleartext-relay shape we dropped.
 
 **Known limitations (v1 by design):**

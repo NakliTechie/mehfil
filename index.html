@@ -415,6 +415,7 @@
   .badge.connecting .dot { background: var(--warn); animation: pulse 1.4s infinite; }
   .badge.offline .dot { background: var(--danger); }
   .badge.relay   .dot { background: color-mix(in srgb, var(--accent) 80%, white); }
+  .badge.offlinemesh .dot { background: #3b82f6; }
   @keyframes pulse {
     0%, 100% { opacity: 1; }
     50% { opacity: 0.35; }
@@ -3094,6 +3095,7 @@ function renderLanding() {
           <button class="primary" id="btn-start">Start a workspace</button>
           <button id="btn-join" disabled title="Open a join link instead">Join a workspace</button>
           <button id="btn-join-code">Join by code</button>
+          <button id="btn-join-scan">Join by scanning (offline)</button>
           <button id="btn-add-device">Add this device to an existing identity</button>
           <button id="btn-restore">I have a backup file</button>
         </div>
@@ -3107,6 +3109,7 @@ function renderLanding() {
   `;
   document.getElementById("btn-start").onclick = () => setState({ view: "name-input" });
   document.getElementById("btn-join-code").onclick = openPairingCodeJoinModal;
+  document.getElementById("btn-join-scan").onclick = beginScanToJoin;
   document.getElementById("btn-add-device").onclick = openDevicePairJoinerModal;
   document.getElementById("btn-restore").onclick = openRestoreModal;
   document.getElementById("link-lost").onclick = () => alert(
@@ -3244,7 +3247,7 @@ function renderWorkspace() {
   const peerStatus   = PeerMgr.status(current.meta.id);
   const relayStatus  = RelayMgr.status(current.meta.id);
   const bridgeStatus = BridgeMgr.status(current.meta.id);
-  const badge = computeBadge(peerStatus, current.members.length, relayStatus, bridgeStatus);
+  const badge = computeBadge(peerStatus, current.members.length, relayStatus, bridgeStatus, PeerMgr.anyOffline(current.meta.id));
 
   $app.innerHTML = `
     <div id="banner-slot"></div>
@@ -4231,11 +4234,17 @@ function renderWorkspace() {
   HighlightMgr.applyAll().catch(() => {});
 }
 
-function computeBadge(peerStatus, memberCount, relayStatus, bridgeStatus) {
+function computeBadge(peerStatus, memberCount, relayStatus, bridgeStatus, offlineMesh) {
   if (memberCount === 1) {
     return { cls: "local", label: "Local only", title: "You're the only member — invite someone to connect", dotStyle: "" };
   }
   if (peerStatus === "connected") {
+    // Offline-mesh spec §6: connected peers with no internet uplink are on
+    // a local hotspot via host-only ICE — surface that distinctly so the
+    // user knows the mesh is live even though nothing can reach the wire.
+    if (offlineMesh || isOffline()) {
+      return { cls: "offlinemesh", label: "Offline mesh", title: "Connected over local hotspot — host-only ICE, no internet uplink", dotStyle: "background: #3b82f6" };
+    }
     return { cls: "live", label: "Live", title: "Connected via WebRTC", dotStyle: "background: var(--ok)" };
   }
   if (peerStatus === "connecting") {
@@ -6831,31 +6840,41 @@ function wireSettingsTab(tab, wrap, current, me, wsName) {
  *       arrives from the joiner, welcome is sent back, sidebar
  *       updates with the new member.
  * ------------------------------------------------------------ */
+/**
+ * Gather a WebRTC offer and build the invite fragment + URL. `offline`
+ * forces host-only ICE (offline-mesh spec §2) for the in-room, no-internet
+ * handshake. Shared by the online modal open and the offline switch.
+ */
+async function prepareInvite(offline) {
+  const transport = await WebRTCTransport.asInviter(offline ? { offline: true } : {});
+  const current = State.current;
+  const myRaw = await idbGet(current.wsDB, "keys", "root");
+  const gchKey = await idbGet(current.wsDB, "keys", "ch:" + current.meta.general_channel_id);
+  const me = current.members.find(m => m.id === bytesToB64Url(State.identity.pubkey));
+  const fpHash = await Crypto.sha256(State.identity.pubkey);
+  const frag = await InvitePayload.encode({
+    ws: current.meta.id,
+    name: current.meta.name,
+    wrk: myRaw,
+    inviter: bytesToB64Url(State.identity.pubkey),
+    inviter_fp_bytes: fpHash.slice(0, 16),
+    inviter_name: me.name,
+    general_channel_id: current.meta.general_channel_id,
+    general_channel_key: gchKey,
+    offer_sdp: transport.localSdp(),
+    expires: Date.now() + 24 * 3600 * 1000
+  });
+  const url = `${location.origin}${location.pathname}#join=${frag}`;
+  return { transport, url, frag };
+}
+
 async function openInviteModal() {
   setState({ modal: "invite" });
   // Kick off the WebRTC gather + payload prep asynchronously.
   if (!State.invite) {
     State.invite = { phase: "gathering" };
     try {
-      const transport = await WebRTCTransport.asInviter();
-      const current = State.current;
-      const myRaw = await idbGet(current.wsDB, "keys", "root");
-      const gchKey = await idbGet(current.wsDB, "keys", "ch:" + current.meta.general_channel_id);
-      const me = current.members.find(m => m.id === bytesToB64Url(State.identity.pubkey));
-      const fpHash = await Crypto.sha256(State.identity.pubkey);
-      const frag = await InvitePayload.encode({
-        ws: current.meta.id,
-        name: current.meta.name,
-        wrk: myRaw,
-        inviter: bytesToB64Url(State.identity.pubkey),
-        inviter_fp_bytes: fpHash.slice(0, 16),
-        inviter_name: me.name,
-        general_channel_id: current.meta.general_channel_id,
-        general_channel_key: gchKey,
-        offer_sdp: transport.localSdp(),
-        expires: Date.now() + 24 * 3600 * 1000
-      });
-      const url = `${location.origin}${location.pathname}#join=${frag}`;
+      const { transport, url, frag } = await prepareInvite(isOffline());
       State.invite = { phase: "ready", transport, url, frag };
       if (State.modal === "invite") renderInviteModal();
     } catch (e) {
@@ -6863,6 +6882,28 @@ async function openInviteModal() {
       if (State.modal === "invite") renderInviteModal();
     }
   }
+}
+
+/**
+ * Switch the invite to the offline in-room handshake: re-gather the offer
+ * host-only (no STUN) so it works on a hotspot with no uplink, then show it
+ * as a cycling QR. Used when navigator.onLine can't be trusted (spec §2).
+ */
+async function switchInviteToOffline() {
+  const old = State.invite;
+  if (old && old.transport && !old.transport.offline && !PeerMgr.hasPeers(State.current?.meta?.id)) {
+    try { old.transport.close(); } catch {}
+  }
+  if (old && old._cyc) { old._cyc.stop(); old._cyc = null; }
+  State.invite = { phase: "gathering", forceOffline: true, tab: "room" };
+  renderInviteModal();
+  try {
+    const { transport, url, frag } = await prepareInvite(true);
+    State.invite = { phase: "ready", transport, url, frag, tab: "room", forceOffline: true };
+  } catch (e) {
+    State.invite = { phase: "error", error: e.message };
+  }
+  if (State.modal === "invite") renderInviteModal();
 }
 
 function renderInviteModal() {
@@ -6932,12 +6973,58 @@ function renderInviteModal() {
   const renderBody = async () => {
     const $body = card.querySelector("#invite-body");
     if (inv.tab === "room") {
-      $body.innerHTML = `<div class="qr-box" id="qr-holder"><span class="sub">loading QR…</span></div>`;
-      try {
-        const svg = await QR.toSVG(inv.url);
-        card.querySelector("#qr-holder").innerHTML = svg;
-      } catch (e) {
-        card.querySelector("#qr-holder").innerHTML = `<span class="sub" style="color: var(--danger);">${escapeHTML(e.message)}</span>`;
+      const offlineMode = isOffline() || inv.forceOffline;
+      if (offlineMode) {
+        // Offline-mesh spec §3.3 / §6: cycling multi-frame offer QR the
+        // other device scans in-page, plus a button to scan their reply
+        // back. No link, no server, no internet — camera to camera.
+        $body.innerHTML = `
+          <p class="sub">No internet needed. Have them open Mehfil on the same WiFi hotspot, tap <strong>Join by scanning (offline)</strong>, and point their camera here. When they show you their reply code, tap <strong>Scan their reply</strong>.</p>
+          <div id="qr-holder"><span class="sub">building code…</span></div>
+          <div class="row" style="margin-top: 10px; justify-content: center;">
+            <button class="primary" id="scan-reply-btn">Scan their reply</button>
+          </div>`;
+        if (inv._cyc) { inv._cyc.stop(); inv._cyc = null; }
+        try {
+          const frames = await QRFrames.encode({ j: inv.frag });
+          const holder = card.querySelector("#qr-holder");
+          if (holder) inv._cyc = await CyclingQR.render(holder, frames);
+        } catch (e) {
+          const holder = card.querySelector("#qr-holder");
+          if (holder) holder.innerHTML = `<span class="sub" style="color: var(--danger);">${escapeHTML(e.message)}</span>`;
+        }
+        const scanBtn = card.querySelector("#scan-reply-btn");
+        if (scanBtn) scanBtn.onclick = () => openScanModal({
+          title: "Scan their reply",
+          hint: "Point your camera at the reply code on their screen.",
+          expectKey: "r",
+          onDone: async (obj) => {
+            try {
+              if (!obj || typeof obj.r !== "string") throw new Error("That isn't a Mehfil reply code.");
+              const reply = await InvitePayload.decodeReply(obj.r);
+              if (reply.ws !== State.current.meta.id) throw new Error("That reply is for a different workspace.");
+              await inv.transport.acceptAnswer(reply.answer_sdp);
+              PeerMgr.attach(State.current.meta.id, inv.transport, reply.joiner_user_id);
+              if (inv._cyc) { inv._cyc.stop(); inv._cyc = null; }
+              State.invite = null;
+              closeInviteModal();
+            } catch (e) {
+              alert(e.message);
+            }
+          }
+        });
+      } else {
+        $body.innerHTML = `
+          <div class="qr-box" id="qr-holder"><span class="sub">loading QR…</span></div>
+          <p class="sub" style="text-align: center; margin-top: 8px;"><a id="go-offline" style="color: var(--accent); cursor: pointer;">No internet on this network? Scan-to-connect instead →</a></p>`;
+        try {
+          const svg = await QR.toSVG(inv.url);
+          card.querySelector("#qr-holder").innerHTML = svg;
+        } catch (e) {
+          card.querySelector("#qr-holder").innerHTML = `<span class="sub" style="color: var(--danger);">${escapeHTML(e.message)}</span>`;
+        }
+        const goOffline = card.querySelector("#go-offline");
+        if (goOffline) goOffline.onclick = switchInviteToOffline;
       }
     } else {
       $body.innerHTML = `
@@ -7001,6 +7088,7 @@ function renderInviteModal() {
 
 function closeInviteModal() {
   document.querySelectorAll(".modal-bg").forEach(el => el.remove());
+  if (State.invite && State.invite._cyc) { State.invite._cyc.stop(); State.invite._cyc = null; }
   // Don't tear down the transport if it was just accepted — only if
   // we're really canceling the invite flow entirely.
   if (State.invite && State.invite.phase === "ready" && !PeerMgr.hasPeers(State.current?.meta?.id)) {
@@ -7343,7 +7431,7 @@ function openGroupDmModal() {
  *  to send back → wait for data channel open + welcome envelope
  *  → transition into workspace shell.
  * ------------------------------------------------------------ */
-async function beginJoinFromFragment(fragment) {
+async function beginJoinFromFragment(fragment, viaScan = false) {
   try {
     const payload = await InvitePayload.decode(fragment);
     // Guard: if we already have this workspace locally, open it directly
@@ -7356,11 +7444,35 @@ async function beginJoinFromFragment(fragment) {
       await openWorkspaceById(payload.ws);
       return;
     }
-    State.join = { payload, phase: "verify" };
+    // viaScan: the offer arrived by camera on a hotspot with no internet
+    // (offline-mesh spec §3.3), so the reply travels back the same way —
+    // as a cycling QR — and the WebRTC side gathers host-only.
+    State.join = { payload, phase: "verify", viaScan };
     setState({ view: "join-verify" });
   } catch (e) {
     setState({ view: "error", error: new Error("Couldn't read that invite: " + e.message) });
   }
+}
+
+/**
+ * Offline-mesh spec §3.3 / §6: the joiner-side entry point. Scan the
+ * inviter's cycling offer QR in-page (no URL, no channel), then run the
+ * normal verify → name → handshake flow, returning the answer as a cycling
+ * QR the inviter scans back.
+ */
+function beginScanToJoin() {
+  openScanModal({
+    title: "Join by scanning",
+    hint: "On the same WiFi hotspot, point your camera at the code the other person is showing.",
+    expectKey: "j",
+    onDone: async (obj) => {
+      if (!obj || typeof obj.j !== "string") {
+        setState({ view: "error", error: new Error("That QR code isn't a Mehfil invite.") });
+        return;
+      }
+      await beginJoinFromFragment(obj.j, true);
+    }
+  });
 }
 
 function renderJoinVerify() {
@@ -7454,7 +7566,10 @@ async function beginJoinHandshake() {
   try {
     const p = State.join.payload;
     // 1. Spin up WebRTC as joiner, starting from the offer SDP in the payload.
-    const transport = await WebRTCTransport.asJoiner(p.offer_sdp);
+    //    A scanned (offline) handshake forces host-only ICE explicitly —
+    //    navigator.onLine can't be trusted to be false on a hotspot with no
+    //    uplink (spec §2), so the user's choice of the offline path decides.
+    const transport = await WebRTCTransport.asJoiner(p.offer_sdp, State.join.viaScan ? { offline: true } : {});
     const answerSdp = transport.localSdp();
     const myUserId = bytesToB64Url(State.identity.pubkey);
 
@@ -7538,7 +7653,8 @@ async function beginJoinHandshake() {
     });
     const replyUrl = `${location.origin}${location.pathname}#join-reply=${replyFrag}`;
     State.join.replyUrl = replyUrl;
-    State.join.phase = "reply-url";
+    State.join.replyFrag = replyFrag;
+    State.join.phase = State.join.viaScan ? "reply-scan" : "reply-url";
 
     // 6. When the data channel opens (after inviter accepts the reply),
     //    send the member.join envelope. member.welcome from inviter will
@@ -7585,6 +7701,9 @@ async function sendMemberJoin(current, selfMember) {
 }
 
 function renderJoinWaiting() {
+  // Offline-mesh spec §3.3: a scanned join sends the answer back as a
+  // cycling QR the inviter scans, not a URL to copy.
+  if (State.join.viaScan) return renderJoinScanReply();
   const url = State.join.replyUrl;
   $app.innerHTML = `
     <div class="center">
@@ -7611,6 +7730,34 @@ function renderJoinWaiting() {
       getSelection().addRange(range);
     }
   };
+}
+
+/**
+ * Offline-mesh spec §3.3: joiner's reply screen. Renders the answer SDP as
+ * a cycling QR for the inviter to scan back. The data channel opens when
+ * they accept it, and member.welcome then transitions us into the
+ * workspace shell — the cycling QR self-terminates when this view unmounts.
+ */
+function renderJoinScanReply() {
+  const p = State.join.payload;
+  $app.innerHTML = `
+    <div class="center">
+      <div class="card invite-panel">
+        <h1>Show them this code</h1>
+        <p class="sub">Hold this up to <strong>${escapeHTML(p.inviter_name)}</strong>'s camera. They tap <strong>Scan their reply</strong> to finish. You'll both land in the workspace the moment it connects.</p>
+        <div id="reply-qr-holder"><span class="sub">building code…</span></div>
+        <p class="sub" id="reply-wait" style="text-align: center; margin-top: 12px;">Waiting to connect…</p>
+      </div>
+    </div>
+  `;
+  if (State.join._cyc) { State.join._cyc.stop(); State.join._cyc = null; }
+  QRFrames.encode({ r: State.join.replyFrag })
+    .then(frames => CyclingQR.render(document.getElementById("reply-qr-holder"), frames))
+    .then(ctrl => { if (State.view === "join-waiting" && State.join) State.join._cyc = ctrl; else ctrl.stop(); })
+    .catch(e => {
+      const h = document.getElementById("reply-qr-holder");
+      if (h) h.innerHTML = `<span class="sub" style="color: var(--danger);">${escapeHTML(e.message)}</span>`;
+    });
 }
 
 /* ------------------------------------------------------------
@@ -7736,8 +7883,342 @@ const QR = {
   async toSVG(text) {
     const mod = await this.load();
     return mod.default.toString(text, { type: "svg", errorCorrectionLevel: "L", margin: 2, width: 260 });
+  },
+  /**
+   * QR for an offline multi-frame handshake frame (QRFrames §3.2). These
+   * carry the whole SDP + ICE set with no channel to trickle over, so the
+   * payload is denser than an invite URL — we drop to error-correction "M"
+   * for capacity while keeping frames small enough to scan off a phone.
+   */
+  async toSVGFrame(text) {
+    const mod = await this.load();
+    return mod.default.toString(text, { type: "svg", errorCorrectionLevel: "M", margin: 2, width: 280 });
   }
 };
+
+/* ------------------------------------------------------------
+ *  §17a  Offline detection + multi-frame QR SDP codec
+ *
+ *  Implements the offline-mesh bootstrap spec (MEHFIL-OFFLINE-MESH-SPEC.md).
+ *
+ *  `isOffline()` — the single source of truth for "no internet uplink."
+ *  Drives host-only ICE (§2) and the Offline-mesh badge (§6). We treat
+ *  `navigator.onLine === false` as authoritative; note it only means "no
+ *  network interface has a default route," which is exactly the phone-
+ *  hotspot-with-no-uplink case this spec targets.
+ *
+ *  `QRFrames` — splits an SDP handshake payload too large for one QR
+ *  frame into a sequence of scannable frames (spec §3.2):
+ *
+ *      MHFL1|<frame_idx>|<frame_count>|<payload_hash8>|<payload_chunk>
+ *
+ *  The receiver buffers by frame_idx, reassembles once frame_count frames
+ *  are collected (order-independent), verifies payload_hash8 against the
+ *  reassembled payload, and only then decompresses + parses — so a bad
+ *  scan surfaces as "damaged, try again" instead of a malformed-SDP throw.
+ *  Single-frame payloads (frame_count === 1) need no special-casing and
+ *  degrade to the §7.2 static-QR behavior.
+ * ------------------------------------------------------------ */
+function isOffline() {
+  try { return navigator.onLine === false; } catch { return false; }
+}
+
+const QRFrames = {
+  MAGIC: "MHFL1",
+  // Per-frame b64url-char budget. Conservative default for reliable phone-
+  // camera scanning at EC level M; the M0 hardware spike (spec §8) tunes
+  // this against real devices — deliberately not asserted as final here.
+  FRAME_BUDGET: 700,
+
+  /** First 8 hex chars of SHA-256(payloadStr). */
+  async _hash8(str) {
+    const h = await Crypto.sha256(new TextEncoder().encode(str));
+    return Array.from(h.slice(0, 4)).map(b => b.toString(16).padStart(2, "0")).join("");
+  },
+
+  /**
+   * Encode a JSON-able object (typically {type, sdp}) into an ordered
+   * array of QR frame strings. deflate-raw + base64url keeps the payload
+   * as small as the gathered candidate set allows.
+   */
+  async encode(obj, budget = this.FRAME_BUDGET) {
+    const json = JSON.stringify(obj);
+    const compressed = await SDPCodec.compress(json);
+    const payload = bytesToB64Url(compressed);
+    const hash8 = await this._hash8(payload);
+    const chunks = [];
+    for (let i = 0; i < payload.length; i += budget) chunks.push(payload.slice(i, i + budget));
+    if (chunks.length === 0) chunks.push("");
+    const count = chunks.length;
+    return chunks.map((c, i) => `${this.MAGIC}|${i}|${count}|${hash8}|${c}`);
+  },
+
+  /** Parse one scanned frame string → {idx, count, hash8, chunk} | null. */
+  parseFrame(text) {
+    if (typeof text !== "string" || !text.startsWith(this.MAGIC + "|")) return null;
+    const parts = text.split("|");
+    if (parts.length < 5) return null;
+    const idx = parseInt(parts[1], 10);
+    const count = parseInt(parts[2], 10);
+    const hash8 = parts[3];
+    // Rejoin the tail defensively; base64url never contains "|" so this is
+    // a no-op in practice, but it keeps the parser total.
+    const chunk = parts.slice(4).join("|");
+    if (!Number.isInteger(idx) || !Number.isInteger(count)) return null;
+    if (count < 1 || idx < 0 || idx >= count) return null;
+    if (!/^[0-9a-f]{8}$/.test(hash8)) return null;
+    return { idx, count, hash8, chunk };
+  },
+
+  /** A stateful reassembler for scanned frames. */
+  newReceiver() {
+    return { count: null, hash8: null, frames: new Map() };
+  },
+
+  /**
+   * Feed a parsed frame into a receiver. If a frame from a *different*
+   * payload arrives (the sender's SDP rotated mid-scan), the buffer resets
+   * to the newer payload rather than mixing two sets. Returns progress.
+   */
+  accept(recv, frame) {
+    if (!frame) return { done: false, have: recv.frames.size, need: recv.count, ok: false };
+    if (recv.hash8 === null) { recv.hash8 = frame.hash8; recv.count = frame.count; }
+    if (frame.hash8 !== recv.hash8 || frame.count !== recv.count) {
+      recv.frames.clear();
+      recv.hash8 = frame.hash8;
+      recv.count = frame.count;
+    }
+    recv.frames.set(frame.idx, frame.chunk);
+    return { done: recv.frames.size === recv.count, have: recv.frames.size, need: recv.count, ok: true };
+  },
+
+  /**
+   * Once every frame is collected, reassemble → verify hash → decompress →
+   * JSON.parse. Throws "Damaged scan" on hash mismatch (spec §3.2), which
+   * callers surface as a retry prompt rather than a hard error.
+   */
+  async finish(recv) {
+    if (recv.count === null || recv.frames.size !== recv.count) throw new Error("Scan incomplete.");
+    let payload = "";
+    for (let i = 0; i < recv.count; i++) {
+      const c = recv.frames.get(i);
+      if (c === undefined) throw new Error("Scan incomplete.");
+      payload += c;
+    }
+    const h = await this._hash8(payload);
+    if (h !== recv.hash8) throw new Error("Damaged scan — try again.");
+    const compressed = b64UrlToBytes(payload);
+    const json = await SDPCodec.decompress(compressed);
+    return JSON.parse(json);
+  }
+};
+
+/**
+ * Round-trip check for QRFrames: encode a synthetic multi-frame payload,
+ * scramble the frame order, reassemble, and assert we recover the input;
+ * then assert a corrupted frame is rejected as a "damaged scan." Throws on
+ * any mismatch. Called fire-and-forget at boot and exposed for the M0
+ * headless harness (offline-mesh spec §8).
+ */
+async function qrFramesSelfTest() {
+  // A payload comfortably larger than one frame budget (mimics a gathered
+  // SDP with a handful of host candidates). Deterministic pseudo-random
+  // bytes so it does NOT deflate away to a single frame — we need to
+  // exercise real splitting/reassembly.
+  let filler = "", seed = 0x9e3779b1;
+  for (let i = 0; i < 1500; i++) { seed = (seed * 1103515245 + 12345) & 0x7fffffff; filler += String.fromCharCode(33 + (seed % 90)); }
+  const obj = { type: "offer", sdp: "v=0\r\na=candidate:" + filler + "\r\n" };
+  const frames = await QRFrames.encode(obj, 700);
+  if (frames.length < 2) throw new Error("expected multi-frame split");
+
+  // Reassemble out of order.
+  const recv = QRFrames.newReceiver();
+  const shuffled = frames.slice().reverse();
+  let done = false;
+  for (const f of shuffled) done = QRFrames.accept(recv, QRFrames.parseFrame(f)).done;
+  if (!done) throw new Error("receiver never reported done");
+  const back = await QRFrames.finish(recv);
+  if (back.type !== obj.type || back.sdp !== obj.sdp) throw new Error("round-trip mismatch");
+
+  // A corrupted chunk must be caught by the payload hash, not parsed blindly.
+  const bad = QRFrames.newReceiver();
+  for (let i = 0; i < frames.length; i++) {
+    let f = QRFrames.parseFrame(frames[i]);
+    if (i === 0) f = { ...f, chunk: f.chunk.slice(0, -1) + (f.chunk.endsWith("A") ? "B" : "A") };
+    QRFrames.accept(bad, f);
+  }
+  let rejected = false;
+  try { await QRFrames.finish(bad); } catch { rejected = true; }
+  if (!rejected) throw new Error("corrupted payload was not rejected");
+}
+
+/* ------------------------------------------------------------
+ *  §17b  Camera QR scanner + cycling multi-frame QR display
+ *
+ *  The in-person, no-channel half of the offline handshake (spec §3.3,
+ *  §6). `CyclingQR` renders a multi-frame payload as an auto-cycling QR
+ *  with a manual prev/next fallback; `openScanModal` opens the rear camera
+ *  and reassembles frames via QRFrames until a full payload is recovered.
+ *
+ *  Scanning uses the native `BarcodeDetector` API — no bundled decoder, no
+ *  network — which is exactly right for the offline target (Chromium/
+ *  Android phone hotspots). Where it's unavailable (notably iOS Safari) we
+ *  fall back to pasting the link the other device shows, so the flow still
+ *  completes without a camera.
+ * ------------------------------------------------------------ */
+const QRScanner = {
+  supported() { try { return "BarcodeDetector" in window; } catch { return false; } }
+};
+
+const CyclingQR = {
+  /**
+   * Render `frames` (array of QRFrames strings) into `container`, cycling
+   * ~every 900ms with a manual prev/next fallback. Returns { stop() } — the
+   * caller MUST call stop() when its panel closes to clear the interval.
+   */
+  async render(container, frames, opts = {}) {
+    const interval = opts.interval || 900;
+    let idx = 0, timer = null, stopped = false;
+    const svgs = [];
+    for (const f of frames) {
+      try { svgs.push(await QR.toSVGFrame(f)); }
+      catch (e) {
+        container.innerHTML = `<span class="sub" style="color: var(--danger);">${escapeHTML(e.message)}</span>`;
+        return { stop() {} };
+      }
+    }
+    if (stopped) return { stop() {} };
+    const single = frames.length === 1;
+    const stopTimer = () => { if (timer) { clearInterval(timer); timer = null; } };
+    const paint = () => {
+      container.innerHTML = `
+        <div class="qr-box" style="padding: 10px;">${svgs[idx]}</div>
+        ${single ? "" : `
+          <div class="row" style="justify-content: center; gap: 12px; margin-top: 8px; align-items: center;">
+            <button data-qr-prev title="Previous frame">‹</button>
+            <span class="sub">frame ${idx + 1} / ${frames.length}</span>
+            <button data-qr-next title="Next frame">›</button>
+          </div>`}`;
+      if (!single) {
+        container.querySelector("[data-qr-prev]").onclick = () => { idx = (idx - 1 + frames.length) % frames.length; stopTimer(); paint(); start(); };
+        container.querySelector("[data-qr-next]").onclick = () => { idx = (idx + 1) % frames.length; stopTimer(); paint(); start(); };
+      }
+    };
+    const start = () => {
+      if (single || stopped) return;
+      timer = setInterval(() => {
+        // Self-terminate once the panel is gone from the DOM — belt-and-
+        // suspenders against a caller that forgets to stop() on navigation.
+        if (!container.isConnected) { stopTimer(); return; }
+        idx = (idx + 1) % frames.length;
+        paint();
+      }, interval);
+    };
+    paint();
+    start();
+    return { stop() { stopped = true; stopTimer(); } };
+  }
+};
+
+/**
+ * Open a camera scan overlay that reassembles a multi-frame QRFrames
+ * payload (spec §3.3). Calls `onDone(obj)` with the decoded object once a
+ * full payload is recovered and its hash verifies. `expectKey` shapes the
+ * paste-fallback result to match a scanned object (e.g. { j } or { r }).
+ * Returns { close } so callers can dismiss it programmatically.
+ */
+function openScanModal({ title, hint, expectKey, onDone }) {
+  document.querySelectorAll(".modal-bg.scan-modal").forEach(el => el.remove());
+  const wrap = document.createElement("div");
+  wrap.className = "modal-bg scan-modal";
+  const card = document.createElement("div");
+  card.className = "card";
+  card.style.maxWidth = "440px";
+  wrap.appendChild(card);
+  document.body.appendChild(wrap);
+
+  let stream = null, cancelled = false, loopTimer = null;
+  const recv = QRFrames.newReceiver();
+  const resetRecv = () => { recv.frames.clear(); recv.hash8 = null; recv.count = null; };
+
+  const cleanup = () => {
+    cancelled = true;
+    if (loopTimer) { clearTimeout(loopTimer); loopTimer = null; }
+    if (stream) { stream.getTracks().forEach(t => t.stop()); stream = null; }
+  };
+  const close = () => { cleanup(); wrap.remove(); };
+
+  // Fallback: no in-page QR scanning available → paste the link instead.
+  if (!QRScanner.supported()) {
+    card.innerHTML = `
+      <h1>${escapeHTML(title)}</h1>
+      <p class="sub">This browser can't scan QR codes in-page — that needs a Chromium-based browser such as Chrome on Android. Paste the link the other device shows instead:</p>
+      <div class="field">
+        <input type="text" id="scan-paste" placeholder="https://…#…">
+        <div class="err" id="scan-err"></div>
+      </div>
+      <div class="row"><button id="scan-cancel">Cancel</button><div class="grow"></div><button class="primary" id="scan-ok">Continue</button></div>`;
+    card.querySelector("#scan-cancel").onclick = close;
+    card.querySelector("#scan-ok").onclick = () => {
+      const raw = card.querySelector("#scan-paste").value.trim();
+      const m = raw.match(/#(?:join|join-reply)=([A-Za-z0-9_-]+)/);
+      if (!m) { card.querySelector("#scan-err").textContent = "That doesn't look like a Mehfil link."; return; }
+      close();
+      onDone({ [expectKey]: m[1] });
+    };
+    return { close };
+  }
+
+  card.innerHTML = `
+    <h1>${escapeHTML(title)}</h1>
+    ${hint ? `<p class="sub">${escapeHTML(hint)}</p>` : ""}
+    <div class="qr-box" style="padding: 0; overflow: hidden; background: #000;">
+      <video id="scan-video" autoplay playsinline muted style="width: 100%; max-width: 380px; display: block; border-radius: 8px; background: #000;"></video>
+    </div>
+    <p class="sub" id="scan-status" style="text-align: center; margin-top: 10px;">Point the camera at their QR code…</p>
+    <div class="row"><button id="scan-cancel">Cancel</button></div>`;
+  card.querySelector("#scan-cancel").onclick = close;
+
+  const video = card.querySelector("#scan-video");
+  const status = card.querySelector("#scan-status");
+  const detector = new window.BarcodeDetector({ formats: ["qr_code"] });
+
+  (async () => {
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment" } });
+    } catch (e) {
+      if (!cancelled) status.textContent = "Couldn't open the camera: " + e.message;
+      return;
+    }
+    if (cancelled) { stream.getTracks().forEach(t => t.stop()); return; }
+    video.srcObject = stream;
+
+    const loop = async () => {
+      if (cancelled) return;
+      try {
+        const codes = await detector.detect(video);
+        for (const c of codes) {
+          const frame = QRFrames.parseFrame(c.rawValue);
+          if (!frame) continue;
+          const prog = QRFrames.accept(recv, frame);
+          status.textContent = prog.need > 1 ? `Scanning… ${prog.have} / ${prog.need} frames` : "Reading…";
+          if (prog.done) {
+            let obj;
+            try { obj = await QRFrames.finish(recv); }
+            catch (err) { status.textContent = err.message; resetRecv(); continue; }
+            close();
+            onDone(obj);
+            return;
+          }
+        }
+      } catch { /* transient decode error — keep scanning */ }
+      if (!cancelled) loopTimer = setTimeout(loop, 120);
+    };
+    loop();
+  })();
+
+  return { close };
+}
 
 /* ------------------------------------------------------------
  *  §18  Invite payload — spec §10
@@ -7855,8 +8336,15 @@ const RTC_CONFIG = {
 };
 
 class WebRTCTransport {
-  constructor() {
-    this.pc = new RTCPeerConnection(RTC_CONFIG);
+  constructor(offline = false) {
+    // Offline-mesh spec §2: on a single hotspot subnet with no internet
+    // uplink, host candidates alone connect two peers — STUN only matters
+    // for NAT traversal across *different* networks, and reaching a STUN
+    // server needs the very internet we don't have. So we gather with an
+    // empty ICE server list, which keeps gathering near-instant and never
+    // stalls waiting on an unreachable STUN endpoint.
+    this.offline = offline;
+    this.pc = new RTCPeerConnection(offline ? { iceServers: [] } : RTC_CONFIG);
     this.dc = null;
     this.opened = new Promise(r => { this._resolveOpen = r; });
     this.closed = new Promise(r => { this._resolveClosed = r; });
@@ -7891,23 +8379,25 @@ class WebRTCTransport {
     };
   }
 
-  static async asInviter() {
-    const t = new WebRTCTransport();
+  static async asInviter(opts = {}) {
+    const offline = opts.offline ?? isOffline();
+    const t = new WebRTCTransport(offline);
     const dc = t.pc.createDataChannel("mehfil", { ordered: true });
     t._wireDataChannel(dc);
     const offer = await t.pc.createOffer();
     await t.pc.setLocalDescription(offer);
-    await gatheringComplete(t.pc);
+    await gatheringComplete(t.pc, offline);
     return t;
   }
 
-  static async asJoiner(offerSdp) {
-    const t = new WebRTCTransport();
+  static async asJoiner(offerSdp, opts = {}) {
+    const offline = opts.offline ?? isOffline();
+    const t = new WebRTCTransport(offline);
     t.pc.ondatachannel = (ev) => t._wireDataChannel(ev.channel);
     await t.pc.setRemoteDescription({ type: "offer", sdp: offerSdp });
     const answer = await t.pc.createAnswer();
     await t.pc.setLocalDescription(answer);
-    await gatheringComplete(t.pc);
+    await gatheringComplete(t.pc, offline);
     return t;
   }
 
@@ -7931,7 +8421,7 @@ class WebRTCTransport {
   }
 }
 
-function gatheringComplete(pc) {
+function gatheringComplete(pc, offline = false) {
   return new Promise(resolve => {
     if (pc.iceGatheringState === "complete") { resolve(); return; }
     const check = () => {
@@ -7941,8 +8431,10 @@ function gatheringComplete(pc) {
       }
     };
     pc.addEventListener("icegatheringstatechange", check);
-    // Safety timeout — 5s of gathering is enough for LAN/STUN combos.
-    setTimeout(resolve, 5000);
+    // Safety timeout. Host-only gathering (offline, no STUN) completes
+    // near-instantly, so cap it tight (spec §3.2: 2s on LAN); with STUN in
+    // the mix, 5s covers typical LAN/STUN candidate gathering.
+    setTimeout(resolve, offline ? 2000 : 5000);
   });
 }
 
@@ -8072,6 +8564,21 @@ const PeerMgr = {
       else if (p.transport.status === "connecting") anyConnecting = true;
     }
     return any ? "connected" : anyConnecting ? "connecting" : "offline";
+  },
+
+  /**
+   * Offline-mesh spec §6: true if at least one *connected* peer is on a
+   * host-only (STUN-less) transport — i.e. the mesh is a local hotspot with
+   * no internet uplink. Drives the "Offline mesh" badge even when
+   * navigator.onLine still reports true (WiFi with no route to the wire).
+   */
+  anyOffline(workspaceId) {
+    const wsPeers = this.peers.get(workspaceId);
+    if (!wsPeers) return false;
+    for (const p of wsPeers.values()) {
+      if (p.transport.status === "connected" && p.transport.offline) return true;
+    }
+    return false;
   },
 
   /** How many peers are attached for a workspace? */
@@ -9144,7 +9651,12 @@ const BlobTransfer = {
 // Spec §4.1 marks `presence.update` and `typing.start` as ephemeral.
 const EPHEMERAL_TYPES = new Set([
   "presence.update", "typing.start",
-  "huddle.join", "huddle.leave", "huddle.signal"
+  "huddle.join", "huddle.leave", "huddle.signal",
+  // Offline-mesh spec §4: gossip-relayed mesh signaling. Reserved here so
+  // it is never persisted to IDB or pushed to store-and-forward transports.
+  // The full multi-hop relay + auto-dial (M1) lands behind its own hardware
+  // gate — see the dispatch case and MEHFIL-OFFLINE-MESH-SPEC.md §4.
+  "signal.relay"
 ]);
 
 const EnvelopeDispatch = {
@@ -10095,6 +10607,18 @@ const EnvelopeDispatch = {
 
       case "huddle.signal":
         await HuddleMgr.onSignal(workspaceId, env, inner);
+        break;
+
+      case "signal.relay":
+        // Offline-mesh spec §4: peer-to-peer signaling relayed across the
+        // gossip mesh so a new peer needs exactly one QR handshake with any
+        // one existing peer, not one per pair. Inner:
+        //   { target_user_id, target_device_id, kind, sdp_frame }
+        // Reserved and no-op in this milestone (M0 ships the two-peer QR
+        // handshake; §8). The M1 build wires this to a mesh dialer + a
+        // forward-if-not-target rule; until then we drop it silently rather
+        // than emit an "unhandled type" warning, and the type is marked
+        // ephemeral above so it is never persisted.
         break;
 
       default:
@@ -15051,6 +15575,7 @@ if (/[?&]debug=1/.test(location.search)) {
     get State() { return State; },
     MP, Crypto, Envelope, Identity, Workspace,
     SDPCodec, TrustCard, QR, InvitePayload,
+    QRFrames, isOffline, qrFramesSelfTest,
     WebRTCTransport, PeerMgr, EnvelopeDispatch,
     openGlobalDB, openWorkspaceDB, idbGet, idbPut, idbGetAll,
     sendMessageNow, sendMemberJoin, sendWelcome,
@@ -15133,6 +15658,15 @@ async function boot() {
       throw new Error("Mehfil needs CompressionStream (Chrome 80+, Firefox 113+, Safari 16.4+).");
     }
     selfTest();
+    // Offline-mesh spec §8 (M0 gate, in miniature): a synchronous-ish
+    // round-trip of the multi-frame QR codec so a broken split/reassemble
+    // surfaces at boot in dev rather than mid-handshake in a field with no
+    // signal. Fire-and-forget — never blocks boot, only warns.
+    qrFramesSelfTest().catch(e => console.warn("QRFrames self-test:", e));
+    // Warm the QR-encoder module into the service-worker cache while we
+    // still (may) have internet, so the offline handshake screen can render
+    // frames later with no uplink (spec §5). Best-effort, non-blocking.
+    if (!isOffline()) QR.load().catch(() => {});
 
     // Load Yjs. This is the second external runtime dep after the QR
     // encoder (Slice 2) — also lazy-loaded from esm.sh, also cached by
@@ -15176,6 +15710,12 @@ window.addEventListener("error", (e) => {
 window.addEventListener("unhandledrejection", (e) => {
   console.error("Unhandled rejection:", e.reason);
 });
+
+// Offline-mesh spec §6: the transport badge derives its "Offline mesh"
+// state from isOffline() at render time, so a change in uplink status has
+// to trigger a re-render for the badge to flip. Cheap and idempotent.
+window.addEventListener("online",  () => { if (State.view === "workspace") render(); });
+window.addEventListener("offline", () => { if (State.view === "workspace") render(); });
 
 // Slice Q1: permalink hashchange — navigate to #msg/<ws>/<ch>/<id>
 // links when they change in-flight (e.g. user pastes a link into the

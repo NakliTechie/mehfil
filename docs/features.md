@@ -133,6 +133,17 @@ messages even when they aren't online at the same time — see
 [architecture.md § Networking](architecture.md#networking) and the setup guides
 ([relay](relay-setup.md), [bridge](bridge-setup.md)).
 
+### No internet at all? Scan to connect
+
+On a phone hotspot with **no uplink** — a remote site, no cellular, no ISP — skip the URL
+entirely. One person taps **+ Invite → They're in the room** (or "Scan-to-connect instead");
+the other opens Mehfil on the same hotspot and taps **Join by scanning (offline)**. The two
+phones scan each other's cycling QR codes camera-to-camera — that QR carries the whole WebRTC
+handshake, so no link, server, or channel is needed. The corner badge shows **🔵 Offline
+mesh**. (Everyone must be on the same hotspot; venue WiFi with AP client isolation blocks it —
+a phone's own hotspot does not. Install Mehfil once, anywhere with signal, before you go
+somewhere without it.) Full design: [`MEHFIL-OFFLINE-MESH-SPEC.md`](../MEHFIL-OFFLINE-MESH-SPEC.md).
+
 ## Roadmap
 
 Next-up work, ranked by value-to-effort. Everything below is consistent with the local-first frame and `MEHFIL-SPEC.md` §14.6 — no bots, no workflows, no SFU, no central infrastructure.
@@ -142,6 +153,7 @@ Next-up work, ranked by value-to-effort. Everything below is consistent with the
 - **Slash integrations** (`/bofh`, `/localmind`, `/kanzen`) — wiring the slash registry into the sibling NakliTechie tools so a `/bofh sha256 <text>` in a channel returns a result inline.
 - **Shamir-split identity backup (v2)** — N-of-K key shares distributed across trusted contacts as an alternative to the current passphrase-wrapped `.mehfil-key` backup.
 - **Canvas polish (v1.x → v2)** — private canvas (per-channel-key-encrypted Y.Doc), remote cursor positions via Yjs awareness, and an optional rich-text editor.
+- **Offline mesh — gossip-relayed signaling (v1.1, M1)** — the two-peer offline QR handshake ships today (host-only ICE, multi-frame QR, in-page scanner, 🔵 badge). M1 adds the multi-hop `signal.relay` mesh dialer so a new peer reaches the *whole* mesh from a single scan with any one member. The envelope type is reserved; the dialer lands after its 3-peer hardware gate. See `MEHFIL-OFFLINE-MESH-SPEC.md`.
 - **Low-latency signaling path for huddles (v2.x)** — WebRTC signaling for huddles currently rides on the regular envelope path (~3 s per round-trip on the bridge). Fine for 1:1 and small groups; if group huddles need sub-second connection setup, a dedicated thin WebSocket signaling endpoint comes back. See `MEHFIL-SPEC.md` §7.1.
 
 The authoritative version-locked list (with shipped markers and a "Never" rule-out section) is `MEHFIL-SPEC.md` §14.

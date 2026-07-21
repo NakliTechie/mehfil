@@ -91,6 +91,13 @@ each optional and independently configurable:
   fingerprint pinning. Exposes the same `/ws/:id/envelopes` HTTP API as the relay, so the
   client transport is identical. Setup: [bridge-setup.md](bridge-setup.md).
 - **Join by code** — a 6-word pairing code, valid 5 minutes, that works with no URL exchange.
+- **Offline mesh (no internet, ever)** — on a phone hotspot with no uplink, WebRTC gathers
+  **host-only ICE** (no STUN) and the full gathered SDP travels camera-to-camera as a
+  **multi-frame QR** (`QRFrames`, `MHFL1|idx|count|hash8|payload`), scanned in-page with the
+  native `BarcodeDetector`. No link, no server, no channel — the QR *is* the channel. Landing
+  → "Join by scanning (offline)"; the corner badge shows **🔵 Offline mesh**. The multi-hop
+  `signal.relay` mesh dialer (one scan reaches the whole mesh) is reserved for M1. Spec:
+  [`MEHFIL-OFFLINE-MESH-SPEC.md`](../MEHFIL-OFFLINE-MESH-SPEC.md).
 
 ### Companion services (separate repos)
 
