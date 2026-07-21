@@ -127,11 +127,13 @@ A: scan B's QR → reassemble → set as remote description
 No paste, no share sheet, no link. Two phones, camera to camera, in the same
 room, on the same hotspot.
 
-> **Implementation note (§10):** in-page scanning uses the native `BarcodeDetector`
-> API (no bundled decoder, no network) — well-supported on the offline target
-> (Chromium / Android hotspots). Where it's unavailable (notably iOS Safari) the
-> scan modal falls back to pasting the link the other device shows, so the flow
-> still completes without a camera.
+> **Implementation note (§10):** in-page scanning prefers the native
+> `BarcodeDetector` API (fast, hardware-accelerated) and falls back to a
+> **vendored jsQR software decoder inlined in the page** — no network either way.
+> The jsQR fallback is what makes scanning work on **iOS / WebKit**, where
+> `BarcodeDetector` doesn't exist, so the camera-to-camera handshake is genuinely
+> cross-platform (iPhone ↔ Android). The paste fallback now only appears if the
+> camera itself can't be opened (no camera, or permission denied).
 
 ---
 
@@ -212,11 +214,12 @@ caches it and the device never needs internet again for the app itself.
 someone discover it the hard way in a location with no signal. Suggested copy:
 "Install Mehfil once, anywhere with signal, before you go somewhere without it."
 
-> **Implementation note (§10):** the QR *encoder* module is lazy-loaded from a
-> CDN, so it too must be cached before going offline. Boot now warms that module
-> into the service-worker cache while online (`QR.load()` on boot when
-> `!isOffline()`), so the offline handshake screen can render frames later with
-> no uplink.
+> **Implementation note (§10):** the QR *encoder* (qrcode-generator, MIT) is now
+> **vendored and inlined in the page** rather than lazy-loaded from a CDN, so
+> frames render offline with no prior online fetch and no cache-warming — the one
+> file that gets installed/transferred already contains everything QR needs. This
+> still doesn't remove the §5 requirement (`index.html` itself must reach the
+> device once), but it does mean the QR path has zero runtime network dependency.
 
 ---
 
@@ -311,7 +314,8 @@ the map from spec to code; keep it honest.
 | Host-only ICE when offline | `WebRTCTransport` (`§19`), `gatheringComplete` | `asInviter({offline})` / `asJoiner(sdp, {offline})` gather with `iceServers: []` and a tight 2 s cap. Online paths are byte-for-byte unchanged. |
 | Multi-frame QR SDP codec | `QRFrames` (`§17a`) | `MHFL1\|idx\|count\|hash8\|chunk`; order-independent reassembly; hash-verify → "damaged scan" on mismatch; single-frame degrades to §7.2. |
 | Codec self-test | `qrFramesSelfTest()` | Fire-and-forget at boot; also the in-page half of the M0 gate. |
-| Camera scanner + cycling QR | `QRScanner`, `CyclingQR`, `openScanModal` (`§17b`) | `BarcodeDetector`, no network, no bundled decoder; paste fallback where unsupported. |
+| Camera scanner + cycling QR | `QRScanner`, `CyclingQR`, `openScanModal` (`§17b`) | Native `BarcodeDetector` when present, **vendored jsQR** software fallback otherwise → scans on **iOS/WebKit** too. Paste fallback only if the camera can't open. |
+| Vendored QR (no CDN) | inline `<script>` before the module; `QR` encoder (`§17`) | qrcode-generator (MIT, `window.qrcode`) + jsQR (Apache-2.0, `window.jsQR`), minified. Removes the esm.sh dependency for QR entirely — encode + decode work with zero network. |
 | Offline invite / join flows | invite modal "in the room" tab; landing "Join by scanning (offline)"; `renderJoinScanReply` | Reuses all existing join/crypto logic — only the SDP transport changes from URL to QR frames. |
 | 🔵 Offline mesh badge | `computeBadge`, `PeerMgr.anyOffline` | Lights whenever a connected peer's transport gathered host-only. |
 | `signal.relay` reservation | `EPHEMERAL_TYPES`, dispatch `case` | Registered + ephemeral, no-op for now (see §4). |

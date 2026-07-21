@@ -139,8 +139,10 @@ On a phone hotspot with **no uplink** — a remote site, no cellular, no ISP —
 entirely. One person taps **+ Invite → They're in the room** (or "Scan-to-connect instead");
 the other opens Mehfil on the same hotspot and taps **Join by scanning (offline)**. The two
 phones scan each other's cycling QR codes camera-to-camera — that QR carries the whole WebRTC
-handshake, so no link, server, or channel is needed. The corner badge shows **🔵 Offline
-mesh**. (Everyone must be on the same hotspot; venue WiFi with AP client isolation blocks it —
+handshake, so no link, server, or channel is needed. Works **iPhone ↔ Android** (the scanner
+uses the native detector where available and a bundled software decoder on iOS; the QR
+encoder is inlined too, so nothing loads from the network). The corner badge shows **🔵
+Offline mesh**. (Everyone must be on the same hotspot; venue WiFi with AP client isolation blocks it —
 a phone's own hotspot does not. Install Mehfil once, anywhere with signal, before you go
 somewhere without it.) Full design: [`MEHFIL-OFFLINE-MESH-SPEC.md`](../MEHFIL-OFFLINE-MESH-SPEC.md).
 
