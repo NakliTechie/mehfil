@@ -9061,7 +9061,15 @@ const CausalBuffer = {
     const expectedCounter = senderEntry[1];
     if (typeof expectedCounter !== "number") return true;
     const deviceHwm = bundle.hwm.get(env.from);
-    const currentHwm = (deviceHwm && deviceHwm.get(env.dev)) || 0;
+    // First contact with this (sender, device): accept and let advance()
+    // set the baseline. We cannot have observed the sender's earlier
+    // counters — ephemeral heartbeats (presence/announce) bump lc_counter
+    // but are never causally tracked on receive, and a joiner's pre-connect
+    // sends may have been dropped before the data channel opened. Gating the
+    // first real envelope (e.g. member.join arriving at counter 3) against
+    // "<= 1" strands it in the buffer forever, so a new peer never joins.
+    if (!deviceHwm || !deviceHwm.has(env.dev)) return true;
+    const currentHwm = deviceHwm.get(env.dev) || 0;
     // Allow delivery if:
     //   - the envelope advances the chain by exactly 1 (normal case)
     //   - the envelope is already delivered (same counter — idempotent)
@@ -12571,7 +12579,10 @@ const TypingMgr = {
     try {
       const signKey = await Crypto.importSignKey(State.identity.privkey_pkcs8);
       const meta = current.meta;
-      meta.lc_counter = (meta.lc_counter || 0) + 1;
+      // Ephemeral: do NOT advance lc_counter (see sendPresence) — typing.start
+      // is not causally tracked on receive, so bumping would strand the next
+      // real envelope behind an unfillable gap. Emit at the current counter.
+      const lc = meta.lc_counter || 0;
       const env = await Envelope.build({
         workspaceId: meta.id,
         channelId,
@@ -12581,7 +12592,7 @@ const TypingMgr = {
         deviceId: meta.device_id,
         type: "typing.start",
         inner: {},
-        vectorClock: [[bytesToB64Url(State.identity.pubkey), meta.lc_counter]]
+        vectorClock: [[bytesToB64Url(State.identity.pubkey), lc]]
       });
       PeerMgr.sendEnvelope(meta.id, env).catch(() => {});
     } catch (e) { console.warn("typing.start build failed:", e); }
@@ -12646,11 +12657,12 @@ async function sendPresence(current, status) {
   try {
     const signKey = await Crypto.importSignKey(State.identity.privkey_pkcs8);
     const meta = current.meta;
-    meta.lc_counter = (meta.lc_counter || 0) + 1;
-    // NOTE: we intentionally do NOT persist the updated meta for
-    // presence counter bumps. The lc_counter is advisory here; since
-    // presence envelopes don't go in the envelopes store, a stale
-    // counter on reload is harmless (next real envelope will catch up).
+    // Ephemeral: do NOT advance lc_counter. Presence is not causally tracked
+    // on receive (EPHEMERAL_TYPES skip CausalBuffer.advance), so a bump here
+    // would consume a sequence number that no receiver's hwm ever advances
+    // past — leaving a permanent gap that strands the next real envelope in
+    // the causal buffer. Emit at the current counter as a concurrent marker.
+    const lc = meta.lc_counter || 0;
     const inner = { status };
     if (customPayload) inner.custom = customPayload;
     const env = await Envelope.build({
@@ -12662,7 +12674,7 @@ async function sendPresence(current, status) {
       deviceId: meta.device_id,
       type: "presence.update",
       inner,
-      vectorClock: [[myUserId, meta.lc_counter]]
+      vectorClock: [[myUserId, lc]]
     });
     // NO idbPut — presence is ephemeral (§EPHEMERAL_TYPES).
     PeerMgr.sendEnvelope(meta.id, env).catch(e => console.warn("presence send failed:", e));
@@ -15716,6 +15728,10 @@ if (/[?&]debug=1/.test(location.search)) {
     RelayTransport, RelayMgr,
     PairingCode, openPairingCodeSendModal, openPairingCodeJoinModal,
     joinWorkspaceFromBundle,
+    // Invite / join entry points — exposed so the e2e mesh harness
+    // (scripts/verify-mesh.mjs) can drive the real offline handshake
+    // deterministically without scraping modal UI. Debug-gated only.
+    prepareInvite, beginJoinFromFragment, beginJoinHandshake, openInviteModal,
     // Slice 8
     BridgeTransport, BridgeMgr,
     detectBridge, openBridgeFpConfirmModal, showBridgeFpMismatchModal,
