@@ -7692,8 +7692,17 @@ async function beginJoinHandshake() {
     });
 
     // 3. Build an in-memory bundle matching Workspace.open shape.
+    //    This MUST carry every field Workspace.open returns — the incoming
+    //    member.welcome runs through the same dispatch pipeline as any
+    //    envelope, which reads bundle.hwm (CausalBuffer.canDeliver),
+    //    bundle.causalBuffer, bundle.gaps (GapTracker), and bundle.doc
+    //    (workspace.patch). A partial bundle here made canDeliver throw on
+    //    the first welcome, so join hung forever on "Waiting…" despite a
+    //    live connection. Seed the doc the same way Workspace.open does.
     const rootKey = await Crypto.importAesRaw(p.wrk);
     const generalKey = await Crypto.importAesRaw(p.general_channel_key);
+    let joinDoc = await WorkspaceDoc.load(wsDB);
+    if (!joinDoc) joinDoc = await WorkspaceDoc.migrateFromLegacy(wsDB, meta, [channelRec], [inviterMember, selfMember]);
     const bundle = {
       wsDB, meta,
       channels: [channelRec],
@@ -7701,7 +7710,19 @@ async function beginJoinHandshake() {
       channelKeys: { [p.general_channel_id]: generalKey },
       rootKey,
       messages: [],
-      presence: {}
+      presence: {},
+      // Causal-delivery + CRDT state (Slice 4b/4c) — empty for a fresh joiner,
+      // populated as envelopes arrive. Mirrors Workspace.open's return shape.
+      hwm: new Map(),
+      causalBuffer: [],
+      gaps: new Map(),
+      doc: joinDoc,
+      relays: meta.relays || [],
+      bridges: meta.bridges || [],
+      readMarkers: new Map(),
+      bookmarks: new Map(),
+      reminders: new Map(),
+      scheduledSends: new Map()
     };
     State.current = bundle;
     State.currentChannel = p.general_channel_id;
