@@ -20,6 +20,12 @@
 !guide/img/*.png
 !wrangler.jsonc
 !.assetsignore
+# e2e mesh harness (node_modules stays ignored — not whitelisted)
+!scripts/
+!scripts/verify-mesh.mjs
+!scripts/package.json
+!scripts/package-lock.json
+!scripts/README.md
 
 # wrangler files
 .wrangler

@@ -1,0 +1,12 @@
+{
+  "name": "mehfil-e2e",
+  "private": true,
+  "type": "module",
+  "description": "End-to-end mesh harness for Mehfil (multi-peer offline WebRTC over loopback).",
+  "scripts": {
+    "test:mesh": "node verify-mesh.mjs"
+  },
+  "devDependencies": {
+    "playwright": "^1.61.1"
+  }
+}
