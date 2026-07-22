@@ -17,7 +17,11 @@
  *    better for offline startup, and the CDN URLs are versioned so
  *    stale-cache bugs are bounded.
  */
-const CACHE_NAME = "mehfil-shell-v1";
+// Bump this whenever index.html changes so the new shell actually reaches
+// users. Cache-first (below) otherwise serves the previously-cached HTML for
+// the current session — e.g. the pre-inlined-Yjs build — and the update only
+// lands on a later load. v2: inlined Yjs + complete join bundle.
+const CACHE_NAME = "mehfil-shell-v2";
 const PRECACHE = [
   "./",
   "./index.html",
