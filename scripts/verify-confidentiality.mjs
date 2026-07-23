@@ -26,6 +26,20 @@
  * Topology: A owns the workspace. #secret is private, members {A, B}. A posts
  * in it. THEN B joins (entitled) and C joins (not entitled).
  *
+ * KNOWN LIMIT — read before trusting a green run. This asserts the two
+ * user-facing properties, but it does NOT isolate the welcome-snapshot code
+ * path. After a join the owner also runs replayHistory(), which re-sends the
+ * original channel.create carrying per-member `wrapped_keys`, so an entitled
+ * re-joiner can obtain a private channel by EITHER route. Verified by
+ * experiment: this harness passes against commit f70547d, in which the
+ * welcome-snapshot unwrap was completely broken — replay masked it.
+ *
+ * So: it will catch a leak (C getting keys it shouldn't) and it will catch a
+ * total entitlement failure, but it will NOT catch the welcome path alone
+ * regressing while replay still works. Isolating that needs replayHistory
+ * suppressed, which tests a configuration the app never runs in. Worth doing
+ * if the welcome snapshot is reworked again.
+ *
  * Run: node verify-confidentiality.mjs      Exit 0 all green, 1 any failure.
  */
 import { chromium } from 'playwright';
@@ -177,23 +191,89 @@ async function main() {
     const cCanRead = await ev(C, () => (window.__mehfil.State.current.messages || []).some(m => m.body === 'the-secret-payload'));
     check(!cCanRead, 'C cannot read the secret message');
 
-    log('[2] B IS a member of #secret — entitlement must survive the fix');
-    // B was already in the workspace when #secret was created, so it arrived
-    // by channel.create. Re-join B from scratch to force the WELCOME path,
-    // which is the one C3 rewrote.
-    const jb2 = await join(A, 'B2', 'Bravo');
-    check(jb2.entered, 'B2 (same-membership rejoin) entered the workspace');
-    const B2 = jb2.peer;
+    log('[2] entitlement — B re-joins with the SAME identity, so #secret must');
+    log('    arrive via the WELCOME snapshot. This is the path C3 rewrote, and');
+    log('    the only way to catch a fix that withholds keys from real members.');
+    const bHasKeyLive = (await keyInventory(B)).includes('ch:' + secretId);
+    check(bHasKeyLive, 'B holds the private channel key from channel.create');
+
+    // Re-join inside B's OWN browser context so the identity in the global DB
+    // is reused. Wiping just the workspace DB forces the whole join handshake
+    // again — and this time B is already in #secret's member list, so the key
+    // can only reach it through the welcome snapshot.
+    const wsIdForWipe = await ev(A, () => window.__mehfil.State.current.meta.id);
+    // B's page holds the workspace DB open, which makes deleteDatabase block
+    // and silently no-op — the re-join would then find the workspace still
+    // present and never exercise the welcome path at all. Close it first.
+    await B.page.close();
+    const B2page = await B.ctx.newPage();
+    errs['B2'] = [];
+    B2page.on('pageerror', e => errs['B2'].push('PAGEERR ' + e.message));
+    B2page.on('console', m => { if (m.type() === 'error' && !/frame-ancestors/.test(m.text())) errs['B2'].push(m.text().slice(0, 160)); });
+    await B2page.goto(BASE);
+    await B2page.waitForFunction(() => window.__mehfil && window.__mehfil.State);
+    const wiped = await B2page.evaluate(async (wsid) => {
+      const out = await new Promise(r => {
+        const rq = indexedDB.deleteDatabase('mehfil_' + wsid);
+        rq.onsuccess = () => r('deleted');
+        rq.onerror = () => r('error');
+        rq.onblocked = () => r('BLOCKED');
+      });
+      // Also drop the global workspace listing, or beginJoinFromFragment
+      // short-circuits into "you already have this workspace, reopening".
+      try {
+        const g = await window.__mehfil.openGlobalDB();
+        await new Promise(r => { const t = g.transaction('workspaces', 'readwrite'); t.objectStore('workspaces').delete(wsid); t.oncomplete = t.onerror = () => r(); });
+      } catch (_) {}
+      return out;
+    }, wsIdForWipe);
+    check(wiped === 'deleted', `B2's workspace DB actually wiped (got "${wiped}") — a BLOCKED wipe would fake a pass`);
+    await B2page.reload();
+    await B2page.waitForFunction(() => window.__mehfil && window.__mehfil.State);
+    const B2 = { label: 'B2', ctx: B.ctx, page: B2page, id: null };
+    peers.push(B2);
+    const sameIdentity = (await idOf(B2)) === B.id;
+    check(sameIdentity, 'B2 reuses B\'s identity (so it is already in #secret\'s member list)');
+
+    const inv2 = await ev(A, async () => {
+      const M = window.__mehfil;
+      const { transport, frag } = await M.prepareInvite(true);
+      window.__hostT = window.__hostT || {};
+      const k = 'k' + (window.__k = (window.__k || 0) + 1);
+      window.__hostT[k] = transport;
+      return { frag, k };
+    });
+    const res2 = await ev(B2, async ({ frag }) => {
+      const M = window.__mehfil;
+      await M.beginJoinFromFragment(frag, true);
+      if (!M.State.join) return { fail: true };
+      M.State.join.name = 'Bravo';
+      M.State.join.color = '#8b5cf6';
+      await M.beginJoinHandshake();
+      return { r: M.State.join.replyFrag };
+    }, { frag: inv2.frag });
+    if (!res2.fail) {
+      await ev(A, async ({ r, k }) => {
+        const M = window.__mehfil;
+        const d = await M.InvitePayload.decodeReply(r);
+        await window.__hostT[k].acceptAnswer(d.answer_sdp);
+        M.PeerMgr.attach(M.State.current.meta.id, window.__hostT[k], d.joiner_user_id);
+      }, { r: res2.r, k: inv2.k });
+    }
+    check(await until(B2, () => window.__mehfil.State.view === 'workspace', null, 30000),
+      'B2 entered the workspace via a fresh join');
     await sleep(3000);
+
     const b2Keys = await keyInventory(B2);
+    const b2Chans = await ev(B2, () => (window.__mehfil.State.current.channels || []).map(c => c.name));
     log(`    B2 key inventory: ${b2Keys.join(', ')}`);
-    // B2 is a fresh identity, so it is NOT in #secret's member list — the
-    // correct outcome is the same as C. The entitled case is B itself, which
-    // must still hold the key and be able to read.
-    const bHasKey = (await keyInventory(B)).includes('ch:' + secretId);
-    check(bHasKey, 'B (an actual member) still holds the private channel key');
-    const bCanRead = await ev(B, () => (window.__mehfil.State.current.messages || []).some(m => m.body === 'the-secret-payload'));
-    check(bCanRead, 'B (an actual member) can still DECRYPT the private message');
+    log(`    B2 channels:      ${b2Chans.join(', ')}`);
+    check(b2Keys.includes('ch:' + secretId),
+      'B2 RECEIVED the private channel key through the welcome snapshot');
+    check(b2Chans.includes('secret'),
+      'B2 can see #secret (entitlement preserved, not withheld from everyone)');
+    const b2Priv = await ev(B2, () => (window.__mehfil.State.current.channels || []).find(c => c.name === 'secret')?.private);
+    check(b2Priv === true, 'B2 projects #secret with private:true (M9 flags survived)');
 
     log('[3] M9 — flags survive the welcome projection');
     const cFlags = await ev(C, () => (window.__mehfil.State.current.channels || [])
