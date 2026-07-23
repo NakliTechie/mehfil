@@ -188,6 +188,54 @@ async function main() {
       } catch { got = false; }
       check(got, `${J.label} received Bravo's message (rebroadcast)`);
     }
+
+    // 6. Overlay densified: mesh auto-dial should give each leaf a direct edge
+    //    beyond the single inviter (A), so the graph isn't a fragile star.
+    //    Count CONNECTED edges (attach registers a peer before its DataChannel
+    //    opens), so the partition test below runs on a genuinely-live overlay.
+    log('\n[5] Mesh auto-dial should densify the star into a redundant overlay');
+    const wsId = await ev(A, () => window.__mehfil.State.current.meta.id);
+    const connCount = (peer) => ev(peer, (wsId) => {
+      const wsPeers = window.__mehfil.PeerMgr.peers.get(wsId);
+      if (!wsPeers) return 0;
+      let n = 0; for (const p of wsPeers.values()) if (p.transport.status === 'connected') n++;
+      return n;
+    }, wsId);
+    for (const J of joiners) {
+      let dense = false;
+      try {
+        await J.page.waitForFunction((wsId) => {
+          const wsPeers = window.__mehfil.PeerMgr.peers.get(wsId);
+          if (!wsPeers) return false;
+          let n = 0; for (const p of wsPeers.values()) if (p.transport.status === 'connected') n++;
+          return n >= 2;
+        }, wsId, { timeout: 25000 });
+        dense = true;
+      } catch { dense = false; }
+      const n = await connCount(J);
+      check(dense, `${J.label} has ≥2 CONNECTED peers (has ${n}) — overlay densified past the inviter`);
+    }
+
+    // 7. Partition resistance: the original hub A leaves. With leaf-leaf edges
+    //    formed, B/C/D must stay connected — a message from Bravo still reaches
+    //    Charlie & Delta WITHOUT A relaying.
+    log('\n[6] Hub A leaves — leaves must stay connected via direct edges');
+    await ev(A, (wsId) => window.__mehfil.PeerMgr.detach(wsId), wsId);
+    await sleep(2000);
+    await ev(joiners[0], async () => {
+      const M = window.__mehfil;
+      M.State.currentChannel = M.State.current.meta.general_channel_id;
+      await M.sendMessageNow('post-partition-from-Bravo');
+    });
+    for (const J of [joiners[1], joiners[2]]) {
+      let got = true;
+      try {
+        await J.page.waitForFunction(
+          () => (window.__mehfil.State.current?.messages || []).some(m => m.body === 'post-partition-from-Bravo'),
+          { timeout: 15000 });
+      } catch { got = false; }
+      check(got, `${J.label} received Bravo's message after A left (no hub) — no partition`);
+    }
   } finally {
     for (const p of peers) { try { await p.ctx.close(); } catch {} }
     await browser.close();
