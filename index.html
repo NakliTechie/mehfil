@@ -8599,6 +8599,9 @@ function gatheringComplete(pc, offline = false) {
 const PeerMgr = {
   // Map<workspace_id, Map<peer_id, {transport}>>
   peers: new Map(),
+  // Mesh auto-dial (spec §4): outbound offers awaiting an answer relayed
+  // back through the mesh. Map<workspace_id, Map<target_peer_id, transport>>.
+  pendingDials: new Map(),
 
   /**
    * Attach a transport for a specific peer in a specific workspace.
@@ -8627,6 +8630,13 @@ const PeerMgr = {
         console.error("Peer packet error:", e);
       }
     };
+
+    // Auto-clean a dropped edge so the mesh heals (re-dials) it. Guard against
+    // a stale transport's late close evicting the replacement we just attached.
+    transport.closed.then(() => {
+      const cur = this.peers.get(workspaceId)?.get(peerUserId);
+      if (cur && cur.transport === transport) this.detach(workspaceId, peerUserId);
+    }).catch(() => {});
 
     // Slice 3d.3: re-broadcast our current presence to the newly-attached
     // peer so they see us immediately rather than waiting up to 30s for
@@ -8658,11 +8668,13 @@ const PeerMgr = {
         try { p.transport.close(); } catch {}
         wsPeers.delete(peerUserId);
       }
+      this.pendingDials.get(workspaceId)?.delete(peerUserId);
     } else {
       for (const p of wsPeers.values()) {
         try { p.transport.close(); } catch {}
       }
       this.peers.delete(workspaceId);
+      this.pendingDials.delete(workspaceId);
       return;
     }
     if (wsPeers.size === 0) this.peers.delete(workspaceId);
@@ -8793,8 +8805,12 @@ const PeerMgr = {
       // Rebroadcast to every OTHER attached peer. Ephemeral envelopes
       // (presence, typing) are NOT rebroadcast — each peer sends their
       // own heartbeat directly, and forwarded heartbeats would mislead
-      // recipients about whose status it actually is.
-      if (!EPHEMERAL_TYPES.has(env.type)) {
+      // recipients about whose status it actually is. EXCEPT signal.relay
+      // (spec §4): it is ephemeral (never persisted) but MUST be forwarded
+      // so relayed WebRTC signaling reaches a target several hops away —
+      // that is the whole point of "one scan joins the mesh". The SeenSet
+      // still kills loops after one hop per peer.
+      if (!EPHEMERAL_TYPES.has(env.type) || env.type === "signal.relay") {
         await this.sendEnvelope(workspaceId, env, sourcePeerId);
       }
     } else if (tag === 0x02) {
@@ -10243,6 +10259,9 @@ const EnvelopeDispatch = {
           // And replay historic envelopes so the joiner sees prior messages.
           await replayHistory(current, env.from);
         }
+        // §4: a new member exists — form a direct edge to them if we win the
+        // tie-break and have room (bounded degree).
+        maybeDialMesh(current).catch(e => console.warn("mesh dial:", e));
         break;
       }
 
@@ -10301,6 +10320,10 @@ const EnvelopeDispatch = {
           // Kick off presence heartbeats for the newly-joined workspace.
           PresenceDriver.start(current);
         }
+        // §4: now that we know the full member list, densify the overlay —
+        // dial a few members directly instead of relying on the single
+        // inviter edge (redundancy + low diameter for a few-dozen mesh).
+        maybeDialMesh(current).catch(e => console.warn("mesh dial:", e));
         break;
       }
 
@@ -10354,6 +10377,9 @@ const EnvelopeDispatch = {
         // observed peers.
         if (!current.knownPeers) current.knownPeers = new Set();
         current.knownPeers.add(env.from);
+        // §4: a peer is reachable via gossip — try to form a direct edge
+        // (bounded degree) so the overlay densifies beyond the join topology.
+        maybeDialMesh(current).catch(e => console.warn("mesh dial:", e));
         break;
       }
 
@@ -10740,11 +10766,10 @@ const EnvelopeDispatch = {
         // gossip mesh so a new peer needs exactly one QR handshake with any
         // one existing peer, not one per pair. Inner:
         //   { target_user_id, target_device_id, kind, sdp_frame }
-        // Reserved and no-op in this milestone (M0 ships the two-peer QR
-        // handshake; §8). The M1 build wires this to a mesh dialer + a
-        // forward-if-not-target rule; until then we drop it silently rather
-        // than emit an "unhandled type" warning, and the type is marked
-        // ephemeral above so it is never persisted.
+        // Forwarding to non-targets is handled by PeerMgr.handlePacket
+        // (signal.relay is exempt from the ephemeral no-rebroadcast rule);
+        // here we act only if we are the target.
+        await handleSignalRelay(current, env, inner);
         break;
 
       default:
@@ -12490,6 +12515,120 @@ async function sendPeerAnnounce(current) {
   }
 }
 
+/* ------------------------------------------------------------
+ *  Mesh auto-dial (offline-mesh spec §4)
+ *
+ *  Turns the sparse "one QR edge per joiner" topology into a
+ *  bounded-degree gossip overlay that scales to a few dozen peers
+ *  without full-mesh O(N²) connections or N QR scans. A peer already
+ *  connected to the mesh (via any one edge) dials additional members
+ *  by relaying its WebRTC offer THROUGH the mesh as `signal.relay`
+ *  envelopes (forward-if-not-target); the target answers back the same
+ *  way. Host candidates are already bundled in the SDP (gatheringComplete),
+ *  so offer+answer is the whole handshake — no separate trickle-ICE.
+ *
+ *  Glare-free: for any pair, only the lexicographically-smaller user_id
+ *  initiates, so each edge is dialed by exactly one side. Degree is
+ *  bounded — we proactively dial up to TARGET, and accept inbound offers
+ *  up to MAX.
+ * ------------------------------------------------------------ */
+const MESH_TARGET_DEGREE = 6;   // proactively dial up to this many neighbors
+const MESH_MAX_DEGREE    = 12;  // accept inbound offers up to this many
+const MESH_HEAL_INTERVAL_MS = 2000;  // periodic re-dial: retry missed offers, heal dropped edges
+const MESH_DIAL_TIMEOUT_MS  = 5000;  // an unanswered offer expires so the target can be re-dialed
+
+async function sendSignalRelay(current, targetUserId, targetDeviceId, kind, sdp, dialId) {
+  const signKey  = await Crypto.importSignKey(State.identity.privkey_pkcs8);
+  const meta     = current.meta;
+  const myUserId = bytesToB64Url(State.identity.pubkey);
+  // Ephemeral (like presence): do NOT advance lc_counter.
+  const env = await Envelope.build({
+    workspaceId: meta.id,
+    channelId:   null,
+    channelKey:  current.rootKey,   // every mesh member can decrypt + forward
+    signKey,
+    signerPubkey: State.identity.pubkey,
+    deviceId:    meta.device_id,
+    type: "signal.relay",
+    // dial_id ties an answer to a specific offer: after a re-dial the pending
+    // transport is a NEW one, and a late answer for the expired offer must be
+    // rejected rather than applied to it (which would corrupt the new pc).
+    inner: { target_user_id: targetUserId, target_device_id: targetDeviceId || null, kind, sdp_frame: sdp, dial_id: dialId || null },
+    vectorClock: [[myUserId, meta.lc_counter || 0]]
+  });
+  await SeenSet.add(meta.id, env.id);   // drop the rebroadcast hop back to us
+  return PeerMgr.sendEnvelope(meta.id, env);
+}
+
+async function maybeDialMesh(current) {
+  if (!current || !State.identity) return;
+  const wsId     = current.meta.id;
+  const myUserId = bytesToB64Url(State.identity.pubkey);
+  const peers    = PeerMgr.peers.get(wsId);
+  if (!PeerMgr.pendingDials.has(wsId)) PeerMgr.pendingDials.set(wsId, new Map());
+  const pending  = PeerMgr.pendingDials.get(wsId);
+
+  // Expire unanswered offers so the target can be re-dialed. A relayed
+  // offer/answer can be dropped (arriving before the forwarding peer's
+  // channel is ready); without expiry the peer stays "pending" forever and
+  // healing never retries it.
+  const now = Date.now();
+  for (const [id, entry] of pending) {
+    if (now - entry.ts > MESH_DIAL_TIMEOUT_MS) {
+      try { entry.transport.close(); } catch {}
+      pending.delete(id);
+    }
+  }
+
+  const degree = () => (peers?.size || 0) + pending.size;
+  if (degree() >= MESH_TARGET_DEGREE) return;
+
+  for (const m of current.members) {
+    if (degree() >= MESH_TARGET_DEGREE) break;
+    if (m.id === myUserId) continue;
+    if (peers?.has(m.id) || pending.has(m.id)) continue;
+    if (myUserId >= m.id) continue;   // deterministic initiator — smaller id dials
+    try {
+      const transport = await WebRTCTransport.asInviter({ offline: isOffline() });
+      const dialId = bytesToB64Url(Crypto.rand(6));
+      pending.set(m.id, { transport, ts: Date.now(), dial_id: dialId });   // set BEFORE await-send so degree() counts it
+      await sendSignalRelay(current, m.id, null, "offer", transport.localSdp(), dialId);
+    } catch (e) {
+      pending.delete(m.id);
+      console.warn("mesh dial failed for", (m.id || "").slice(0, 8), e);
+    }
+  }
+}
+
+async function handleSignalRelay(current, env, inner) {
+  const myUserId = bytesToB64Url(State.identity.pubkey);
+  if (!inner || inner.target_user_id !== myUserId) return;  // forwarding handled by the mesh
+  const wsId = current.meta.id;
+  const from = env.from;
+  const peers = PeerMgr.peers.get(wsId);
+  if (inner.kind === "offer") {
+    const existing = peers?.get(from);
+    if (existing && existing.transport.status === "connected") return;  // already live
+    // Stale/half-open entry (we attached on a prior offer whose answer was
+    // lost, so it's stuck "connecting"): replace it, or re-dials are ignored
+    // forever by the has(from) check and the edge never forms.
+    if (existing) PeerMgr.detach(wsId, from);
+    if (PeerMgr.peerCount(wsId) >= MESH_MAX_DEGREE) return;         // degree cap
+    if (!inner.sdp_frame) return;
+    const transport = await WebRTCTransport.asJoiner(inner.sdp_frame, { offline: isOffline() });
+    PeerMgr.attach(wsId, transport, from);
+    await sendSignalRelay(current, from, inner.target_device_id, "answer", transport.localSdp(), inner.dial_id);
+  } else if (inner.kind === "answer") {
+    const entry = PeerMgr.pendingDials.get(wsId)?.get(from);
+    // Reject a stale answer (dial_id mismatch) — it's for an expired offer and
+    // would corrupt the current pending transport if applied.
+    if (!entry || !inner.sdp_frame || entry.dial_id !== inner.dial_id) return;
+    PeerMgr.pendingDials.get(wsId).delete(from);
+    await entry.transport.acceptAnswer(inner.sdp_frame);
+    PeerMgr.attach(wsId, entry.transport, from);
+  }
+}
+
 /**
  * Slice 4b.2: broadcast an incremental Yjs update as a `workspace.patch`
  * envelope. Called after any local `WorkspaceDoc.setName` / `addChannel`
@@ -12712,6 +12851,7 @@ async function setCustomStatus(status) {
 const PresenceDriver = {
   _interval: null,
   _staleTimer: null,
+  _meshTimer: null,
   _focusHandler: null,
   _blurHandler: null,
   _unloadHandler: null,
@@ -12730,6 +12870,14 @@ const PresenceDriver = {
       const status = document.hasFocus() ? "online" : "away";
       sendPresence(current, status);
     }, PRESENCE_INTERVAL_MS);
+
+    // Mesh self-healing (spec §4): retry missed dials and re-form dropped
+    // edges toward the target degree. Event-triggered dialing alone is
+    // lossy — a relayed offer/answer can arrive before the forwarding peer's
+    // channel is ready and simply be dropped, with nothing to retry it.
+    this._meshTimer = setInterval(() => {
+      maybeDialMesh(current).catch(() => {});
+    }, MESH_HEAL_INTERVAL_MS);
 
     // Focus/blur transitions — immediate, not waiting for the next tick.
     this._focusHandler = () => sendPresence(current, "online");
@@ -12767,6 +12915,7 @@ const PresenceDriver = {
   stop() {
     if (this._interval)    { clearInterval(this._interval);    this._interval = null; }
     if (this._staleTimer)  { clearInterval(this._staleTimer);  this._staleTimer = null; }
+    if (this._meshTimer)   { clearInterval(this._meshTimer);   this._meshTimer = null; }
     if (this._focusHandler)  { window.removeEventListener("focus",  this._focusHandler);  this._focusHandler = null; }
     if (this._blurHandler)   { window.removeEventListener("blur",   this._blurHandler);   this._blurHandler = null; }
     if (this._unloadHandler) { window.removeEventListener("beforeunload", this._unloadHandler); this._unloadHandler = null; }
@@ -15715,6 +15864,7 @@ if (/[?&]debug=1/.test(location.search)) {
     sendReactionAdd, sendReactionRemove, toggleReaction, parseMentions,
     sendPresence, PresenceDriver, EPHEMERAL_TYPES,
     sendPeerAnnounce, SeenSet, CausalBuffer,
+    maybeDialMesh, sendSignalRelay, MESH_TARGET_DEGREE, MESH_MAX_DEGREE,
     WorkspaceDoc, sendWorkspacePatch,
     GapTracker, ResyncResponder,
     // Slice 5
