@@ -322,18 +322,25 @@ run_tests() {
   : > "$results"
   for n in $N_LIST; do
     say "Running the mesh scale harness at N=$n"
-    # `set -o pipefail` matters: without it the pipeline's status is tail's,
-    # so a harness that failed six assertions still reported Success and the
-    # whole run exited 0. A green exit code on a red test is worse than no
-    # exit code at all — anything wired to this would have believed it.
+    # Capture the harness's exit code explicitly rather than piping into
+    # tail, whose status would mask it — a run with six failed assertions
+    # used to exit 0. Do NOT reach for `set -o pipefail` here: SSM's
+    # AWS-RunShellScript runs through /bin/sh (dash on Ubuntu), which
+    # rejects it outright, and every stage dies before a test runs.
+    # And it must be `|| rc=$?`, NOT `; rc=$?`: with `set -e` the plain form
+    # aborts the moment the harness exits non-zero, so tail never runs and a
+    # red stage reports no output at all — you learn that it failed but not
+    # what failed.
     #
     # Timeout scales with N: the harness's convergence budget is 15s + N*2.5s,
     # and under netem N=24 took ~38s to converge, so give it real room.
     if ssm_run "scale-N$n" 3600 "
 set -eu
-set -o pipefail
 cd /opt/mehfil/scripts
-N=$n CONVERGE_TIMEOUT_MS=$((60000 + n * 6000)) node verify-mesh-scale.mjs 2>&1 | tail -40
+rc=0
+N=$n CONVERGE_TIMEOUT_MS=$((60000 + n * 6000)) node verify-mesh-scale.mjs > /tmp/h.log 2>&1 || rc=\$?
+tail -40 /tmp/h.log
+exit \$rc
 " | tee -a "$results"; then :; else
       red=$((red+1)); info "N=$n went RED (continuing — the rest of the sweep is still informative)"
     fi
@@ -342,9 +349,11 @@ N=$n CONVERGE_TIMEOUT_MS=$((60000 + n * 6000)) node verify-mesh-scale.mjs 2>&1 |
   say "Running the multi-actor journeys"
   if ssm_run journeys 1800 '
 set -eu
-set -o pipefail
 cd /opt/mehfil/scripts
-node verify-journeys.mjs 2>&1 | tail -30
+rc=0
+node verify-journeys.mjs > /tmp/j.log 2>&1 || rc=$?
+tail -30 /tmp/j.log
+exit $rc
 ' | tee -a "$results"; then :; else
     red=$((red+1)); info "journeys went RED"
   fi
