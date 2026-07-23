@@ -20,7 +20,7 @@
      The primary XSS defence stays escapeHTML() on all rendered content. -->
 <meta http-equiv="Content-Security-Policy" content="
   default-src 'self';
-  script-src 'self' 'sha256-vfVDU8oFcqTkD0oExOyswDEc47NCykKKTmmdfh1aFwA=' 'sha256-ryup/9GePD9DBWqEdHd8MoluL367/pmDD3fbho0d9d8=' 'sha256-goPIZRlKMhNdChBKWKCSSf6h9hZds22cbDUmwV+QYxc=' https://esm.sh https://cdn.jsdelivr.net;
+  script-src 'self' 'sha256-vfVDU8oFcqTkD0oExOyswDEc47NCykKKTmmdfh1aFwA=' 'sha256-ryup/9GePD9DBWqEdHd8MoluL367/pmDD3fbho0d9d8=' 'sha256-UmFvp+NOd3G6GSgTQV1Lu1wiR2OuHdNosSpMI3GTT4Q=' https://esm.sh https://cdn.jsdelivr.net;
   style-src 'self' 'unsafe-inline';
   img-src 'self' data: blob:;
   media-src 'self' blob:;
@@ -2068,6 +2068,10 @@ const PRESENCE_STATUSES = ["online", "away", "offline"];
  * drift apart. Replay resistance comes from burning the promote nonce, not
  * from an expiry window — see the member.promote handler for why. */
 const PROMOTE_THRESHOLD = 2;
+
+/* The only roles the projection admits. A member.welcome snapshot is
+ * peer-supplied, so its `role` fields are clamped to this set (C2). */
+const MEMBER_ROLES = ["owner", "admin", "member"];
 
 const Envelope = {
   /**
@@ -7792,7 +7796,17 @@ async function beginJoinHandshake() {
       readMarkers: new Map(),
       bookmarks: new Map(),
       reminders: new Map(),
-      scheduledSends: new Map()
+      scheduledSends: new Map(),
+      // C2: the open join request this client is waiting on. A member.welcome
+      // rewrites our whole projection — channels, keys, members and their
+      // ROLES — so it is only ever legitimate as the answer to a join we
+      // started, from the inviter we verified out of band, addressed to us,
+      // carrying the nonce we minted. Cleared the moment one is applied, so
+      // it is single-use. Anything arriving outside that window is dropped.
+      pendingJoin: {
+        nonce: bytesToB64(Crypto.rand(16)),
+        inviter: canonUserId(p.inviter)
+      }
     };
     State.current = bundle;
     State.currentChannel = p.general_channel_id;
@@ -7843,6 +7857,10 @@ async function sendMemberJoin(current, selfMember) {
     type: "member.join",
     inner: {
       profile: { name: selfMember.name, color: selfMember.color },
+      // C2: the nonce the inviter must echo back in member.welcome. Binds
+      // the welcome to THIS join request rather than letting any root-key
+      // holder push a snapshot at us whenever they like.
+      join_nonce: current.pendingJoin?.nonce,
       devices: selfMember.devices,
       x25519_pub: State.identity.x25519_pub,  // Slice 3b: joiner publishes
                                               // their X25519 pubkey so the
@@ -10335,7 +10353,7 @@ const EnvelopeDispatch = {
         // If we're the existing member (not the joiner), respond with welcome.
         const imInviter = current.members[0].id === bytesToB64Url(State.identity.pubkey);
         if (imInviter && env.from !== current.members[0].id) {
-          await sendWelcome(current, env.from);
+          await sendWelcome(current, env.from, inner.join_nonce);
           // And replay historic envelopes so the joiner sees prior messages.
           await replayHistory(current, env.from);
         }
@@ -10346,6 +10364,42 @@ const EnvelopeDispatch = {
       }
 
       case "member.welcome": {
+        // C2: a welcome rewrites the entire projection — channels, channel
+        // keys, the member list and every member's ROLE. Applied unguarded it
+        // was a workspace takeover: any root-key holder could send one
+        // carrying {id: attacker, role: "admin"} and pass every downstream
+        // admin check from then on. Four conditions, all required:
+        //
+        //   1. we are actually mid-join (a settled member never needs one),
+        //   2. it is addressed to us and not to somebody else,
+        //   3. it came from the inviter whose fingerprint the user checked
+        //      out of band — not merely from someone holding the root key,
+        //   4. it echoes the nonce we minted for THIS join request.
+        //
+        // (3) is only as strong as the out-of-band fingerprint check, which
+        // C6 is what makes trustworthy — the two findings are a pair.
+        const pj = current.pendingJoin;
+        const myId = canonUserId(bytesToB64Url(State.identity.pubkey));
+        if (!pj) {
+          console.warn("member.welcome outside an active join, dropping", env.from);
+          break;
+        }
+        if (canonUserId(inner.target) !== myId) {
+          console.warn("member.welcome not addressed to us, dropping", inner.target);
+          break;
+        }
+        if (canonUserId(env.from) !== pj.inviter) {
+          console.warn("member.welcome from someone other than our inviter, dropping", env.from);
+          break;
+        }
+        if (!inner.join_nonce || inner.join_nonce !== pj.nonce) {
+          console.warn("member.welcome nonce mismatch, dropping");
+          break;
+        }
+        // Single-use: consume before applying, so a second welcome (or a
+        // replayed copy of this one) finds no open request.
+        current.pendingJoin = null;
+
         // Apply workspace doc snapshot: channels + their keys + members.
         if (inner.snapshot.channels) {
           for (const ch of inner.snapshot.channels) {
@@ -10372,6 +10426,12 @@ const EnvelopeDispatch = {
             const existing = current.members.find(x => x.id === m.id);
             if (!existing) {
               m.name = sanitizeDisplayName(m.name);   // H6 — feeds DM channel names
+              // C2: roles come from a peer-supplied blob, so clamp them to
+              // the known set and never let the snapshot hand US a role —
+              // ours is decided by the ops we can verify, not by whoever
+              // welcomed us. An unrecognised role degrades to "member".
+              m.role = MEMBER_ROLES.includes(m.role) ? m.role : "member";
+              if (canonUserId(m.id) === myId) m.role = "member";
               await attachFingerprint(m);
               current.members.push(m);
               await idbPut(current.wsDB, "members", m);
@@ -10915,7 +10975,7 @@ const EnvelopeDispatch = {
 /* ------------------------------------------------------------
  *  §22  member.welcome + history replay helpers
  * ------------------------------------------------------------ */
-async function sendWelcome(current, targetUserId) {
+async function sendWelcome(current, targetUserId, joinNonce) {
   // Build the snapshot: channels with their raw keys, current members,
   // and per-sender group DM keys so the joiner can decrypt group DM history.
   const snapshotChannels = [];
@@ -10985,7 +11045,11 @@ async function sendWelcome(current, targetUserId) {
     signerPubkey: State.identity.pubkey,
     deviceId: meta.device_id,
     type: "member.welcome",
-    inner: { target: targetUserId, snapshot },
+    // C2: echo the joiner's nonce so they can tell our answer apart from an
+    // unsolicited snapshot. Omitted only if the joiner never sent one, in
+    // which case the joiner will reject this — which is the intended
+    // outcome for a client that predates the nonce.
+    inner: { target: targetUserId, join_nonce: joinNonce, snapshot },
     vectorClock: [[userId, meta.lc_counter]]
   });
   await idbPut(current.wsDB, "keys", meta, "workspace_meta");
