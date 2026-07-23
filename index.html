@@ -2057,6 +2057,12 @@ const BlobStore = {
  * ------------------------------------------------------------ */
 const PROTOCOL_VERSION = 1;
 
+/* The only presence values the protocol admits. Declared here (not beside the
+ * presence code) because both the receive handler and the sidebar renderer
+ * whitelist against it, and neither should be able to drift from the other.
+ * Anything else on the wire is treated as "offline". */
+const PRESENCE_STATUSES = ["online", "away", "offline"];
+
 const Envelope = {
   /**
    * Build a fully-formed envelope: encrypt the inner payload under the
@@ -3390,7 +3396,13 @@ function renderWorkspace() {
               const p = (current.presence || {})[m.id];
               // §6: presence entries older than 90s are treated as stale → offline.
               const stale = p && (Date.now() - p.updated_at) > 90_000;
-              const status = (p && !stale) ? p.status : "offline";
+              // C1: `status` lands in a class attribute below, so it is pinned
+              // to a source literal rather than interpolated from stored data.
+              // The receive handler validates too; this is the sink-side half,
+              // so a hostile value can't reach the DOM even if it were stored
+              // by an older build or a future write path.
+              const rawStatus = (p && !stale) ? p.status : "offline";
+              const status = PRESENCE_STATUSES.includes(rawStatus) ? rawStatus : "offline";
               const custom = (p && !stale) ? p.custom : null;
               const customLabel = custom
                 ? `${custom.emoji ? custom.emoji + " " : ""}${custom.text || ""}`.trim()
@@ -3407,7 +3419,7 @@ function renderWorkspace() {
                 ? `<button class="icon-btn" data-sidebar-propose="${escapeHTML(m.id)}" title="Propose as admin" style="font-size:10px;padding:2px 5px;margin-left:auto;opacity:0.55;">★</button>`
                 : "";
               const customBadge = customLabel
-                ? `<span class="custom-status">${escapeHTML(customLabel).slice(0, 40)}</span>`
+                ? `<span class="custom-status">${escapeHTML(customLabel.slice(0, 40))}</span>`
                 : "";
               return `
               <div class="ch-item ${m.id === myUserId ? "" : "people-clickable"}" data-pmember="${m.id === myUserId ? "" : escapeHTML(m.id)}" title="${escapeHTML(title)}" style="display: flex; align-items: center; gap: 8px;">
@@ -10355,7 +10367,10 @@ const EnvelopeDispatch = {
           ? { text: String(inner.custom.text || "").slice(0, 80), emoji: String(inner.custom.emoji || "").slice(0, 8) }
           : null;
         current.presence[env.from] = {
-          status: inner.status,
+          // C1: `status` is a closed enum, not free text. It reaches a class
+          // attribute in the sidebar, so an unvalidated peer string is a
+          // stored-XSS vector. Anything off-list degrades to "offline".
+          status: PRESENCE_STATUSES.includes(inner.status) ? inner.status : "offline",
           custom,
           updated_at: Date.now()
         };
