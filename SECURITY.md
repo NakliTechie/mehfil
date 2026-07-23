@@ -61,16 +61,22 @@ Envelopes are verified by `Envelope.verify()` before being dispatched. Any envel
 
 ## Invite security
 
-The invite URL carries the workspace root key in the URL fragment (`#` — not sent to any server). It also carries the inviter's Ed25519 public key and a challenge signed by the inviter.
+The invite URL carries the workspace root key in the URL fragment (`#` — not sent to any server). It also carries the inviter's Ed25519 public key, and a **transcript signed by the inviter** covering every field that decides who you are talking to and what you connect to: the workspace id and name, the root key, the inviter key and display name, the general channel id and key, the offer SDP, the expiry, and a fresh nonce.
+
+The inviter's fingerprint is **not transmitted**. It is recomputed by the joiner from the inviter key inside the signed transcript, so it always describes the key you will actually be talking to — an attacker who substitutes their own key necessarily changes the fingerprint the user is reading out.
+
+> This is a signed transcript, not a challenge-response: there is no freshness proof from the joiner, so a genuine invite link stays usable by anyone holding it until it expires. That is by design (the link *is* the capability); it is why invites are short-lived.
 
 During join, the joiner:
-1. Verifies the inviter's signature on the challenge.
-2. Displays the inviter's fingerprint for the user to confirm out-of-band (shown as a 4×4 colored shape grid).
+1. Verifies the inviter's signature over the transcript, and rejects the invite if it fails, is absent, or the invite has expired.
+2. Displays the inviter's fingerprint — derived from the signed key — for the user to confirm out-of-band (shown as a 4×4 colored shape grid).
 3. Signs a `member.join` envelope with their own identity key, encrypted under the workspace root key.
 
 The inviter, on receipt:
 1. Re-displays the joiner's fingerprint for confirmation.
-2. Sends a `member.welcome` snapshot encrypted under the workspace root key.
+2. Sends a `member.welcome` snapshot encrypted under the workspace root key, echoing the nonce the joiner minted in its `member.join`.
+
+A joiner applies a `member.welcome` only while a join it started is open, only if the welcome is addressed to it, only from the inviter whose fingerprint was verified out of band, and only if it echoes that join's nonce — and the request is single-use. Holding the workspace root key is therefore *not* sufficient to push a projection at somebody: the snapshot rewrites channels, keys, members and roles, so it is bound to the specific join it answers.
 
 **If fingerprint verification is skipped**, a MITM attacker who intercepted the invite URL could impersonate the joiner. The application prevents skipping by requiring the user to click an explicit "fingerprint matches" button (same-size buttons, no keyboard shortcut to bypass).
 

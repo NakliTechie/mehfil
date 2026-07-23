@@ -299,7 +299,7 @@ Spec §7.2 defines the two-URL handshake: inviter sends URL A (contains offer), 
 
 - **One-shot ICE gathering.** Both sides wait for `iceGatheringState === 'complete'` before emitting their URL, with a 5-second safety timeout. This produces a stable SDP that can be copied once and sent. No trickle-ICE support in v1 (would require a signaling transport).
 - **SDP compression.** SDPs are ~1–4KB and highly repetitive. We use `CompressionStream('deflate-raw')` (browser-native) before base64url-encoding. Real SDPs compress ~1.3–3x depending on verbosity; typical invite URLs in Slice 2 testing are 700–1200 chars total, comfortably inside QR code capacity.
-- **Join payload** (`#join=<frag>`) carries: workspace id and name, workspace root key (raw), inviter pubkey + fingerprint + display name, general channel id + key (raw), compressed offer SDP, expiry.
+- **Join payload** (`#join=<frag>`) carries: workspace id and name, workspace root key (raw), inviter pubkey + display name, general channel id + key (raw), compressed offer SDP, expiry, a 16-byte nonce, and an Ed25519 signature by the inviter over all of the above. The fingerprint is **not** carried — the joiner recomputes it as `SHA-256(inviter_pubkey)[:16]`, so a substituted key can't come with a matching fingerprint. Decode rejects a missing/invalid signature or an expired invite (5-minute clock grace).
 - **Reply payload** (`#join-reply=<frag>`) carries: workspace id, joiner pubkey, joiner display name, joiner color, compressed answer SDP.
 - **No member.join via URL.** The joiner's identity announcement rides over the data channel as a signed `member.join` envelope *after* the WebRTC connection is established. The reply URL only establishes the transport; all signed state lives in envelopes.
 

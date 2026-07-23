@@ -20,7 +20,7 @@
      The primary XSS defence stays escapeHTML() on all rendered content. -->
 <meta http-equiv="Content-Security-Policy" content="
   default-src 'self';
-  script-src 'self' 'sha256-vfVDU8oFcqTkD0oExOyswDEc47NCykKKTmmdfh1aFwA=' 'sha256-ryup/9GePD9DBWqEdHd8MoluL367/pmDD3fbho0d9d8=' 'sha256-JOFT3hmYe84K8Fd3+oEkj5NuQPiR5hIlWY6uYU6/JBg=' https://esm.sh https://cdn.jsdelivr.net;
+  script-src 'self' 'sha256-vfVDU8oFcqTkD0oExOyswDEc47NCykKKTmmdfh1aFwA=' 'sha256-ryup/9GePD9DBWqEdHd8MoluL367/pmDD3fbho0d9d8=' 'sha256-SYgnBy2m35CHsPPUEzA5aLA5dyuSfnS4MhgsDuJBWW8=' https://esm.sh https://cdn.jsdelivr.net;
   style-src 'self' 'unsafe-inline';
   img-src 'self' data: blob:;
   media-src 'self' blob:;
@@ -2072,6 +2072,10 @@ const PROMOTE_THRESHOLD = 2;
 /* The only roles the projection admits. A member.welcome snapshot is
  * peer-supplied, so its `role` fields are clamped to this set (C2). */
 const MEMBER_ROLES = ["owner", "admin", "member"];
+
+/* Grace on the invite expiry check (C6/M8), so a joiner with a fast clock
+ * doesn't reject a still-valid invite and blame the inviter. */
+const INVITE_CLOCK_GRACE_MS = 5 * 60 * 1000;
 
 const Envelope = {
   /**
@@ -7584,6 +7588,19 @@ async function beginJoinFromFragment(fragment, viaScan = false) {
     State.join = { payload, phase: "verify", viaScan };
     setState({ view: "join-verify" });
   } catch (e) {
+    // C6/M8: an expired invite to a workspace we're ALREADY in is the
+    // "I bookmarked the join URL" case — reopen it rather than erroring.
+    // Only the expiry error qualifies, and only after the signature has
+    // already verified: moving the reopen check ahead of verification would
+    // reopen it for fully forged invites too.
+    if (e.code === "invite_expired" && e.ws) {
+      const held = await idbGet(State.globalDB, "workspaces", e.ws).catch(() => null);
+      if (held) {
+        history.replaceState(null, "", location.pathname);
+        await openWorkspaceById(e.ws);
+        return;
+      }
+    }
     setState({ view: "error", error: new Error("Couldn't read that invite: " + e.message) });
   }
 }
@@ -7635,7 +7652,6 @@ function renderJoinVerify() {
     </div>
   `;
   // Unskippable: no primary class, same size, no Enter shortcut.
-  TrustCard.render(p.inviter_fp_bytes, 80);
   const svg = TrustCard.render(p.inviter_fp_bytes, 80);
   document.getElementById("join-trust-card").innerHTML = svg;
   document.getElementById("join-cancel").onclick = () => {
@@ -7876,10 +7892,32 @@ async function sendMemberJoin(current, selfMember) {
   await PeerMgr.sendEnvelope(meta.id, env);
 }
 
+/**
+ * C2 fallout: a joiner drops any member.welcome that doesn't echo its nonce.
+ * That is correct, but against a client built before C2 the welcome never
+ * carries one — so the join stalls on "Waiting…" with no error, looking
+ * exactly like a dead connection while the inviter's side looks successful.
+ *
+ * There's no version on the wire to detect this properly, so use the only
+ * honest signal available: we connected and then nothing completed the join.
+ * Say what to check rather than spinning forever.
+ */
+function armJoinStallHint() {
+  if (State._joinStallTimer) clearTimeout(State._joinStallTimer);
+  State._joinStallTimer = setTimeout(() => {
+    if (State.view !== "join-waiting") return;
+    const el = document.getElementById("wait-msg");
+    if (!el) return;
+    el.innerHTML = `Still waiting. If they've already accepted, one of you may be running an
+      older version of Mehfil — reload both sides on the same version and try a fresh invite.`;
+    el.style.color = "var(--warn)";
+  }, 45_000);
+}
+
 function renderJoinWaiting() {
   // Offline-mesh spec §3.3: a scanned join sends the answer back as a
   // cycling QR the inviter scans, not a URL to copy.
-  if (State.join.viaScan) return renderJoinScanReply();
+  if (State.join.viaScan) { armJoinStallHint(); return renderJoinScanReply(); }
   const url = State.join.replyUrl;
   $app.innerHTML = `
     <div class="center">
@@ -7895,6 +7933,7 @@ function renderJoinWaiting() {
       </div>
     </div>
   `;
+  armJoinStallHint();
   document.getElementById("copy-reply").onclick = async () => {
     try {
       await navigator.clipboard.writeText(url);
@@ -8505,8 +8544,16 @@ const InvitePayload = {
    * Throws on a bad signature or an expired invite; callers surface it.
    */
   async decode(fragment) {
-    const mp = b64UrlToBytes(fragment);
-    const obj = MP.decode(mp);
+    // A truncated or mangled link fails inside atob/msgpack with a raw
+    // platform error ("Failed to execute 'atob'…"), which tells the user
+    // nothing. Name the likely cause instead.
+    let obj;
+    try {
+      obj = MP.decode(b64UrlToBytes(fragment));
+      if (!obj || typeof obj !== "object") throw new Error("not a map");
+    } catch (_) {
+      throw new Error("it isn't a complete Mehfil invite link — it may have been cut off when it was copied. Ask for the whole link again.");
+    }
 
     if (!obj.inviter || !obj.sig) {
       throw new Error("it carries no signature. Ask for a fresh invite link.");
@@ -8521,9 +8568,14 @@ const InvitePayload = {
     if (!verified) {
       throw new Error("the signature doesn't match, so it may have been tampered with in transit. Ask for a fresh invite link, sent a different way.");
     }
-    // M8: invites carry an expiry that was never enforced.
-    if (obj.expires && Date.now() > obj.expires) {
-      throw new Error("it has expired. Ask for a fresh invite link.");
+    // M8: invites carry an expiry that was never enforced. Allow a few
+    // minutes of grace — a joiner whose clock runs fast shouldn't reject a
+    // valid invite and blame the inviter for it.
+    if (obj.expires && Date.now() > obj.expires + INVITE_CLOCK_GRACE_MS) {
+      const err = new Error("it has expired. Ask for a fresh invite link.");
+      err.code = "invite_expired";
+      err.ws = obj.ws;
+      throw err;
     }
 
     const sdp = await SDPCodec.decompress(obj.offer);
@@ -10456,36 +10508,52 @@ const EnvelopeDispatch = {
         }
         // Single-use: consume before applying, so a second welcome (or a
         // replayed copy of this one) finds no open request.
+        //
+        // Consuming BEFORE the apply is the security-correct order, but it
+        // means a throw mid-apply would stand the joiner up forever: the
+        // request is spent, so a re-sent welcome would be dropped, and there
+        // is no retry path. So every record below is applied defensively —
+        // one unusable channel key or member row is skipped, never fatal.
         current.pendingJoin = null;
 
         // Apply workspace doc snapshot: channels + their keys + members.
-        if (inner.snapshot.channels) {
+        if (Array.isArray(inner.snapshot?.channels)) {
           for (const ch of inner.snapshot.channels) {
-            const existing = current.channels.find(c => c.id === ch.id);
-            if (!existing) {
-              const chRec = {
-                id: ch.id,
-                name: sanitizeChannelName(ch.name, !!ch.dm),   // H6 — third entry path
-                topic: ch.topic || "",
-                private: false, members: ch.members || [],
-                created_at: ch.created_at || env.ts
-              };
-              current.channels.push(chRec);
-              await idbPut(current.wsDB, "channels", chRec);
-              // Import the channel key.
-              const rawKey = ch.key;
-              await idbPut(current.wsDB, "keys", rawKey, "ch:" + ch.id);
-              current.channelKeys[ch.id] = await Crypto.importAesRaw(rawKey);
+            try {
+              if (!ch || typeof ch.id !== "string") continue;
+              const existing = current.channels.find(c => c.id === ch.id);
+              if (!existing) {
+                const chRec = {
+                  id: ch.id,
+                  name: sanitizeChannelName(ch.name, !!ch.dm),   // H6 — third entry path
+                  topic: ch.topic || "",
+                  private: false, members: ch.members || [],
+                  created_at: ch.created_at || env.ts
+                };
+                // Import the key FIRST: an unusable key is the one failure
+                // that must not leave a visible channel we can't decrypt.
+                const rawKey = ch.key;
+                current.channelKeys[ch.id] = await Crypto.importAesRaw(rawKey);
+                await idbPut(current.wsDB, "keys", rawKey, "ch:" + ch.id);
+                current.channels.push(chRec);
+                await idbPut(current.wsDB, "channels", chRec);
+              }
+            } catch (e) {
+              console.warn("member.welcome: skipping unusable channel record", ch?.id, e);
             }
           }
         }
-        if (inner.snapshot.members) {
+        if (Array.isArray(inner.snapshot?.members)) {
           for (const m of inner.snapshot.members) {
+           try {
+            if (!m || typeof m !== "object") continue;
             // C4: canonicalise here too. member.join already collapses alias
             // spellings of a key, but a snapshot could still seed two rows
             // for one identity — which no longer buys votes (the promote
             // handler compares canonically) but does inflate member_count
-            // and leave member.remove incomplete.
+            // and leave member.remove incomplete. A record whose id doesn't
+            // decode is skipped rather than handed to attachFingerprint,
+            // which would throw and abort the whole batch.
             const canonId = canonUserId(m.id);
             if (!canonId) continue;
             m.id = canonId;
@@ -10507,6 +10575,9 @@ const EnvelopeDispatch = {
               existing.x25519_pub = m.x25519_pub;
               await idbPut(current.wsDB, "members", existing);
             }
+           } catch (e) {
+             console.warn("member.welcome: skipping unusable member record", e);
+           }
           }
           current.meta.member_count = current.members.length;
           await idbPut(current.wsDB, "keys", current.meta, "workspace_meta");
