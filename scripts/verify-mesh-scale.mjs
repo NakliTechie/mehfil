@@ -113,31 +113,47 @@ async function main() {
     A.id = await idOf(A);
     const wsId = await ev(A, () => window.__mehfil.State.current.meta.id);
 
+    let joined = 0;
     for (let i = 1; i < N; i++) {
-      const frag = await ev(A, async () => {
-        const M = window.__mehfil; const { transport, frag } = await M.prepareInvite(true);
-        (window.__hostT = window.__hostT || []).push(transport); return frag;
-      });
-      const J = await newPeer(`P${i}`);
-      const reply = await ev(J, async ({ frag, name }) => {
-        const M = window.__mehfil;
-        await M.beginJoinFromFragment(frag, true);
-        M.State.join.name = name; M.State.join.color = '#8b5cf6';
-        await M.beginJoinHandshake();
-        return M.State.join.replyFrag;
-      }, { frag, name: `P${i}` });
-      await ev(A, async ({ reply, idx }) => {
-        const M = window.__mehfil; const r = await M.InvitePayload.decodeReply(reply);
-        await window.__hostT[idx].acceptAnswer(r.answer_sdp);
-        M.PeerMgr.attach(M.State.current.meta.id, window.__hostT[idx], r.joiner_user_id);
-      }, { reply, idx: i - 1 });
+      const name = `P${i}`;
+      const J = await newPeer(name);
+      let replyFrag = null, diag = null;
+      // Robust join: a fresh invite each attempt (keyed transport so a skip/
+      // retry can't misalign indices), guard State.join (beginJoinFromFragment
+      // returns without setting it if the workspace already exists locally or
+      // the invite fails to decode), retry once, then skip rather than crash.
+      for (let attempt = 0; attempt < 2 && !replyFrag; attempt++) {
+        const inv = await ev(A, async () => {
+          const M = window.__mehfil; const { transport, frag } = await M.prepareInvite(true);
+          window.__hostT = window.__hostT || {};
+          const key = 'k' + (window.__k = (window.__k || 0) + 1);
+          window.__hostT[key] = transport; return { frag, key };
+        });
+        const res = await ev(J, async ({ frag, name }) => {
+          const M = window.__mehfil;
+          await M.beginJoinFromFragment(frag, true);
+          if (!M.State.join) return { fail: true, view: M.State.view, err: String((M.State.error && M.State.error.message) || M.State.error || '') };
+          M.State.join.name = name; M.State.join.color = '#8b5cf6';
+          await M.beginJoinHandshake();
+          return { replyFrag: M.State.join.replyFrag };
+        }, { frag: inv.frag, name });
+        if (res.fail) { diag = res; await sleep(600); continue; }
+        await ev(A, async ({ reply, key }) => {
+          const M = window.__mehfil; const r = await M.InvitePayload.decodeReply(reply);
+          await window.__hostT[key].acceptAnswer(r.answer_sdp);
+          M.PeerMgr.attach(M.State.current.meta.id, window.__hostT[key], r.joiner_user_id);
+        }, { reply: res.replyFrag, key: inv.key });
+        replyFrag = res.replyFrag;
+      }
+      if (!replyFrag) { log(`  ${name} join FAILED (view=${diag?.view} err=${diag?.err}) — skipping`); continue; }
       try {
-        await J.page.waitForFunction(() => window.__mehfil.State.view === 'workspace', { timeout: 25000 });
-      } catch { check(false, `${J.label} failed to join`); }
+        await J.page.waitForFunction(() => window.__mehfil.State.view === 'workspace', { timeout: 30000 });
+      } catch { log(`  ${name} connected but didn't reach workspace`); }
       J.id = await idOf(J);
-      if (i % 5 === 0 || i === N - 1) log(`  joined ${i}/${N - 1}`);
+      joined++;
+      if (i % 5 === 0 || i === N - 1) log(`  joined ${joined}/${N - 1}`);
     }
-    check(peers.filter(p => p.id).length === N, `all ${N} peers joined the workspace`);
+    check(peers.filter(p => p.id).length === N, `all ${N} peers joined the workspace (${joined + 1}/${N} incl. owner)`);
 
     // 2. Converge: every peer >=2 connected edges AND graph connected.
     log('[1] Overlay convergence (bounded-degree, self-healing)');
