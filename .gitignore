@@ -28,6 +28,7 @@
 !scripts/verify-mesh.mjs
 !scripts/verify-mesh-scale.mjs
 !scripts/verify-journeys.mjs
+!scripts/verify-confidentiality.mjs
 !scripts/csp-hash.mjs
 !scripts/scale-test-aws.sh
 !scripts/package.json

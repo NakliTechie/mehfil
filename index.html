@@ -20,7 +20,7 @@
      The primary XSS defence stays escapeHTML() on all rendered content. -->
 <meta http-equiv="Content-Security-Policy" content="
   default-src 'self';
-  script-src 'self' 'sha256-vfVDU8oFcqTkD0oExOyswDEc47NCykKKTmmdfh1aFwA=' 'sha256-ryup/9GePD9DBWqEdHd8MoluL367/pmDD3fbho0d9d8=' 'sha256-P5ykYxHMgbck+1aAbaeCXj2j2cIh+hVId7iWEvFuKf4=' https://esm.sh https://cdn.jsdelivr.net;
+  script-src 'self' 'sha256-vfVDU8oFcqTkD0oExOyswDEc47NCykKKTmmdfh1aFwA=' 'sha256-ryup/9GePD9DBWqEdHd8MoluL367/pmDD3fbho0d9d8=' 'sha256-f5rksXpjNlUM0jqsL5Rn0TXNNYn/tp6EXO1X1cDOIf4=' https://esm.sh https://cdn.jsdelivr.net;
   style-src 'self' 'unsafe-inline';
   img-src 'self' data: blob:;
   media-src 'self' blob:;
@@ -10516,6 +10516,36 @@ const EnvelopeDispatch = {
         // one unusable channel key or member row is skipped, never fatal.
         current.pendingJoin = null;
 
+        // C3: resolve the inviter's X25519 key BEFORE the channels loop.
+        //
+        // The channels loop needs it to unwrap restricted channel keys, but
+        // the only inviter row a joiner has at this point is the stub
+        // beginJoinHandshake seeds with `x25519_pub: null` — the real key
+        // arrives in *this* envelope's member list, which used to be applied
+        // afterwards. So the unwrap always failed and every private channel
+        // and group DM silently vanished for every joiner. Read it out of the
+        // snapshot directly rather than depending on the order of two loops.
+        const senderCanon = canonUserId(env.from);
+        const senderX25519 =
+          (Array.isArray(inner.snapshot?.members)
+            ? inner.snapshot.members.find(m => canonUserId(m?.id) === senderCanon)?.x25519_pub
+            : null)
+          || current.members.find(m => canonUserId(m.id) === senderCanon)?.x25519_pub
+          || null;
+        // Derived once — the KEK is the same for every record in the snapshot.
+        let welcomeKek = null;
+        if (senderX25519) {
+          try {
+            welcomeKek = await Crypto.deriveX25519AesKey(
+              await Crypto.importX25519Priv(State.identity.x25519_priv_pkcs8),
+              await Crypto.importX25519Pub(senderX25519)
+            );
+          } catch (e) { console.warn("member.welcome: cannot derive unwrap key", e); }
+        }
+        const unwrapForMe = async (blob) => new Uint8Array(await crypto.subtle.decrypt(
+          { name: "AES-GCM", iv: blob.iv }, welcomeKek, blob.ct
+        ));
+
         // Apply workspace doc snapshot: channels + their keys + members.
         if (Array.isArray(inner.snapshot?.channels)) {
           for (const ch of inner.snapshot.channels) {
@@ -10540,21 +10570,32 @@ const EnvelopeDispatch = {
                   created_at: ch.created_at || env.ts
                 };
                 // C3: public channels carry the key raw; private channels and
-                // group DMs are sealed to our X25519 key by the inviter, so
-                // unwrap with ECDH against the sender.
+                // group DMs are sealed to our X25519 key by the inviter.
+                //
+                // Enforced on this side too, not just the sender's: refuse a
+                // restricted channel we aren't a member of, and refuse a raw
+                // key for one. Otherwise C3 would be sender-enforced only —
+                // a welcome could still hand us a private channel's key with
+                // `key: raw` and we'd install it.
+                const restricted = !!ch.private || !!ch.dm;
                 let rawKey;
-                if (ch.wrapped_key) {
-                  const sender = current.members.find(m => canonUserId(m.id) === canonUserId(env.from));
-                  if (!sender?.x25519_pub) {
-                    console.warn("member.welcome: no sender x25519_pub, cannot unwrap", ch.id);
+                if (restricted) {
+                  const meCanon = canonUserId(bytesToB64Url(State.identity.pubkey));
+                  const listed = Array.isArray(ch.members)
+                    && ch.members.some(id => canonUserId(id) === meCanon);
+                  if (!listed) {
+                    console.warn("member.welcome: restricted channel we're not a member of, dropping", ch.id);
                     continue;
                   }
-                  const myPriv = await Crypto.importX25519Priv(State.identity.x25519_priv_pkcs8);
-                  const theirPub = await Crypto.importX25519Pub(sender.x25519_pub);
-                  const kek = await Crypto.deriveX25519AesKey(myPriv, theirPub);
-                  rawKey = new Uint8Array(await crypto.subtle.decrypt(
-                    { name: "AES-GCM", iv: ch.wrapped_key.iv }, kek, ch.wrapped_key.ct
-                  ));
+                  if (!ch.wrapped_key) {
+                    console.warn("member.welcome: restricted channel sent unsealed, dropping", ch.id);
+                    continue;
+                  }
+                  if (!welcomeKek) {
+                    console.warn("member.welcome: no unwrap key available for", ch.id);
+                    continue;
+                  }
+                  rawKey = await unwrapForMe(ch.wrapped_key);
                 } else {
                   rawKey = ch.key;
                 }
@@ -10612,7 +10653,7 @@ const EnvelopeDispatch = {
         // Import per-sender group DM keys from the snapshot so the joiner
         // can decrypt group DM history without waiting for individual
         // group_dm.sender_key envelopes to replay.
-        if (Array.isArray(inner.snapshot.senderKeys)) {
+        if (Array.isArray(inner.snapshot?.senderKeys)) {
           // C3: these arrive sealed to our X25519 key now (they decrypt other
           // people's DMs, so they were the worst thing in the old raw
           // snapshot). `raw` is still accepted so a snapshot built by a peer
@@ -10624,14 +10665,8 @@ const EnvelopeDispatch = {
               if (!channelId || !senderId) continue;
               let keyRaw = raw;
               if (wrapped) {
-                const sender = current.members.find(m => canonUserId(m.id) === canonUserId(env.from));
-                if (!sender?.x25519_pub) continue;
-                const myPriv = await Crypto.importX25519Priv(State.identity.x25519_priv_pkcs8);
-                const theirPub = await Crypto.importX25519Pub(sender.x25519_pub);
-                const kek = await Crypto.deriveX25519AesKey(myPriv, theirPub);
-                keyRaw = new Uint8Array(await crypto.subtle.decrypt(
-                  { name: "AES-GCM", iv: wrapped.iv }, kek, wrapped.ct
-                ));
+                if (!welcomeKek) continue;
+                keyRaw = await unwrapForMe(wrapped);
               }
               if (!keyRaw) continue;
               await idbPut(current.wsDB, "keys", keyRaw, "sk:" + channelId + ":" + senderId);
@@ -10644,7 +10679,7 @@ const EnvelopeDispatch = {
         // After welcome, the joiner can finally enter the workspace shell.
         if (State.view === "join-waiting") {
           State.current = current;
-          State.currentChannel = inner.snapshot.channels[0]?.id || current.meta.general_channel_id;
+          State.currentChannel = inner.snapshot?.channels?.[0]?.id || current.meta.general_channel_id;
           setState({ view: "workspace" });
           // Kick off presence heartbeats for the newly-joined workspace.
           PresenceDriver.start(current);
@@ -11218,6 +11253,13 @@ async function sendWelcome(current, targetUserId, joinNonce) {
       }
     }
     const raw = await idbGet(current.wsDB, "keys", "ch:" + ch.id);
+    // A missing key would make wrapForTarget throw, and this runs inside the
+    // member.join dispatch case — an exception here stalls the OWNER's causal
+    // buffer for this joiner. Skip the channel instead.
+    if (!raw) {
+      console.warn("welcome: no stored key for channel, omitting", ch.id);
+      continue;
+    }
     snapshotChannels.push({
       id: ch.id,
       name: ch.name,
@@ -11245,8 +11287,12 @@ async function sendWelcome(current, targetUserId, joinNonce) {
   // they decrypt other people's DMs — and they were shipped raw, for every
   // group DM in the workspace, to every joiner. Same rule as the channels:
   // only for group DMs the target belongs to, and sealed to their key.
+  // Written out rather than as a ternary: the previous form parsed correctly
+  // but read as though it excluded private non-DM channels, which it doesn't.
+  // Restricted-and-ours is the rule; `sk:` entries only exist for group DMs
+  // today, so the private ones simply match nothing.
   const sendableChannelIds = new Set(
-    current.channels.filter(ch => !ch.private && !ch.dm ? false : isMemberOf(ch)).map(ch => ch.id)
+    current.channels.filter(ch => (ch.private || ch.dm) && isMemberOf(ch)).map(ch => ch.id)
   );
   const senderKeys = await new Promise((res, rej) => {
     const tx  = current.wsDB.transaction("keys", "readonly");
