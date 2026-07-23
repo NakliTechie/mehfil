@@ -23,6 +23,7 @@
 # e2e mesh harness (node_modules stays ignored — not whitelisted)
 !scripts/
 !scripts/verify-mesh.mjs
+!scripts/verify-mesh-scale.mjs
 !scripts/package.json
 !scripts/package-lock.json
 !scripts/README.md
