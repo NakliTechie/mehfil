@@ -20,7 +20,7 @@
      The primary XSS defence stays escapeHTML() on all rendered content. -->
 <meta http-equiv="Content-Security-Policy" content="
   default-src 'self';
-  script-src 'self' 'unsafe-inline' https://esm.sh https://cdn.jsdelivr.net;
+  script-src 'self' 'sha256-vfVDU8oFcqTkD0oExOyswDEc47NCykKKTmmdfh1aFwA=' 'sha256-ryup/9GePD9DBWqEdHd8MoluL367/pmDD3fbho0d9d8=' 'sha256-SYgnBy2m35CHsPPUEzA5aLA5dyuSfnS4MhgsDuJBWW8=' https://esm.sh https://cdn.jsdelivr.net;
   style-src 'self' 'unsafe-inline';
   img-src 'self' data: blob:;
   media-src 'self' blob:;
@@ -2057,6 +2057,26 @@ const BlobStore = {
  * ------------------------------------------------------------ */
 const PROTOCOL_VERSION = 1;
 
+/* The only presence values the protocol admits. Declared here (not beside the
+ * presence code) because both the receive handler and the sidebar renderer
+ * whitelist against it, and neither should be able to drift from the other.
+ * Anything else on the wire is treated as "offline". */
+const PRESENCE_STATUSES = ["online", "away", "offline"];
+
+/* Promote-by-consensus (§33): how many distinct member signatures a promote
+ * needs. Shared by the drafting side and the verifying side so they can't
+ * drift apart. Replay resistance comes from burning the promote nonce, not
+ * from an expiry window — see the member.promote handler for why. */
+const PROMOTE_THRESHOLD = 2;
+
+/* The only roles the projection admits. A member.welcome snapshot is
+ * peer-supplied, so its `role` fields are clamped to this set (C2). */
+const MEMBER_ROLES = ["owner", "admin", "member"];
+
+/* Grace on the invite expiry check (C6/M8), so a joiner with a fast clock
+ * doesn't reject a still-valid invite and blame the inviter. */
+const INVITE_CLOCK_GRACE_MS = 5 * 60 * 1000;
+
 const Envelope = {
   /**
    * Build a fully-formed envelope: encrypt the inner payload under the
@@ -2662,7 +2682,9 @@ const Workspace = {
               }
             }
             const chRec = {
-              id: inner.id, name: inner.name, topic: inner.topic || "",
+              id: inner.id,
+              name: sanitizeChannelName(inner.name, !!inner.dm),   // H6
+              topic: inner.topic || "",
               private: !!inner.private, dm: !!inner.dm, dm_with: null,
               announce: announceReplay,
               canvas: !!inner.canvas && !inner.private,
@@ -3390,7 +3412,13 @@ function renderWorkspace() {
               const p = (current.presence || {})[m.id];
               // §6: presence entries older than 90s are treated as stale → offline.
               const stale = p && (Date.now() - p.updated_at) > 90_000;
-              const status = (p && !stale) ? p.status : "offline";
+              // C1: `status` lands in a class attribute below, so it is pinned
+              // to a source literal rather than interpolated from stored data.
+              // The receive handler validates too; this is the sink-side half,
+              // so a hostile value can't reach the DOM even if it were stored
+              // by an older build or a future write path.
+              const rawStatus = (p && !stale) ? p.status : "offline";
+              const status = PRESENCE_STATUSES.includes(rawStatus) ? rawStatus : "offline";
               const custom = (p && !stale) ? p.custom : null;
               const customLabel = custom
                 ? `${custom.emoji ? custom.emoji + " " : ""}${custom.text || ""}`.trim()
@@ -3407,7 +3435,7 @@ function renderWorkspace() {
                 ? `<button class="icon-btn" data-sidebar-propose="${escapeHTML(m.id)}" title="Propose as admin" style="font-size:10px;padding:2px 5px;margin-left:auto;opacity:0.55;">★</button>`
                 : "";
               const customBadge = customLabel
-                ? `<span class="custom-status">${escapeHTML(customLabel).slice(0, 40)}</span>`
+                ? `<span class="custom-status">${escapeHTML(customLabel.slice(0, 40))}</span>`
                 : "";
               return `
               <div class="ch-item ${m.id === myUserId ? "" : "people-clickable"}" data-pmember="${m.id === myUserId ? "" : escapeHTML(m.id)}" title="${escapeHTML(title)}" style="display: flex; align-items: center; gap: 8px;">
@@ -3547,7 +3575,7 @@ function renderWorkspace() {
           return `
             <div class="composer">
               <div class="composer-box" id="composer-box">
-                <textarea id="composer" rows="2" placeholder="${composePlaceholder(channel, current)}" autofocus></textarea>
+                <textarea id="composer" rows="2" placeholder="${escapeHTML(composePlaceholder(channel, current))}" autofocus></textarea>
                 <div class="composer-actions">
                   <input type="file" id="attach-input" style="display:none">
                   <button class="icon-btn" id="btn-attach" title="Attach a file">📎</button>
@@ -4346,6 +4374,49 @@ function memberTier(current) {
 /**
  * §6 Compose placeholder — tier-1 solo nudge.
  */
+/**
+ * H6: normalise a channel name arriving from a peer.
+ *
+ * The `/^[a-z0-9][a-z0-9-]{0,39}$/i` rule is enforced in the create modal,
+ * but that only constrains *our own* client — a crafted `channel.create`
+ * from a peer carried any string straight into the projection, and from
+ * there into the composer placeholder attribute.
+ *
+ * Sanitises rather than rejects, deliberately: dropping the envelope would
+ * leave some members with the channel and some without, and a projection
+ * that diverges per-peer is a worse failure than a renamed channel. Every
+ * peer applies the same deterministic transform, so they still converge.
+ *
+ * Group DM names are exempt from the slug rule — they're built from member
+ * display names ("Ada, Grace"), so they only get control chars stripped
+ * and a length bound. Escaping at the sinks is what makes them safe.
+ */
+function sanitizeChannelName(name, isDm) {
+  // `typeof` rather than String(): MP.decode builds maps with a null
+  // prototype, and String() on one THROWS. That throw would escape into the
+  // dispatch loop and leave `hwm` un-advanced, so every later envelope from
+  // that sender buffers forever — one packet silently mutes a peer.
+  const raw = (typeof name === "string" ? name : "").replace(/[\u0000-\u001F\u007F]/g, "");
+  if (isDm) return raw.slice(0, 120) || "Direct message";
+  const slug = raw.replace(/[^a-zA-Z0-9-]/g, "").replace(/^-+/, "").slice(0, 40);
+  return slug || "channel";
+}
+
+/**
+ * H6: normalise a member display name arriving from a peer.
+ *
+ * Display names are free text (no slug rule), but they are not inert: a DM
+ * channel takes its name straight from the other member's name, so an
+ * unvalidated name is a second, indirect way to control a channel name.
+ * Strip control characters and bound the length; escaping at the sinks does
+ * the rest. `typeof` guard for the same null-prototype reason as above.
+ */
+function sanitizeDisplayName(name) {
+  const raw = (typeof name === "string" ? name : "").replace(/[\u0000-\u001F\u007F]/g, "").trim();
+  // slice AFTER trim can leave a trailing space at the cut; trim again.
+  return raw.slice(0, 60).trim() || "Member";
+}
+
 function composePlaceholder(channel, current) {
   const name = channel.dm ? channel.name : '#' + channel.name;
   if (current.members.length === 1) return `Message ${name} — or invite someone first`;
@@ -6914,19 +6985,20 @@ async function prepareInvite(offline) {
   const myRaw = await idbGet(current.wsDB, "keys", "root");
   const gchKey = await idbGet(current.wsDB, "keys", "ch:" + current.meta.general_channel_id);
   const me = current.members.find(m => m.id === bytesToB64Url(State.identity.pubkey));
-  const fpHash = await Crypto.sha256(State.identity.pubkey);
+  // C6: sign the invite transcript. The joiner recomputes the fingerprint
+  // from the signed key, so `inviter_fp_bytes` is no longer sent.
+  const inviteSignKey = await Crypto.importSignKey(State.identity.privkey_pkcs8);
   const frag = await InvitePayload.encode({
     ws: current.meta.id,
     name: current.meta.name,
     wrk: myRaw,
     inviter: bytesToB64Url(State.identity.pubkey),
-    inviter_fp_bytes: fpHash.slice(0, 16),
     inviter_name: me.name,
     general_channel_id: current.meta.general_channel_id,
     general_channel_key: gchKey,
     offer_sdp: transport.localSdp(),
     expires: Date.now() + 24 * 3600 * 1000
-  });
+  }, inviteSignKey);
   const url = `${location.origin}${location.pathname}#join=${frag}`;
   return { transport, url, frag };
 }
@@ -7516,6 +7588,19 @@ async function beginJoinFromFragment(fragment, viaScan = false) {
     State.join = { payload, phase: "verify", viaScan };
     setState({ view: "join-verify" });
   } catch (e) {
+    // C6/M8: an expired invite to a workspace we're ALREADY in is the
+    // "I bookmarked the join URL" case — reopen it rather than erroring.
+    // Only the expiry error qualifies, and only after the signature has
+    // already verified: moving the reopen check ahead of verification would
+    // reopen it for fully forged invites too.
+    if (e.code === "invite_expired" && e.ws) {
+      const held = await idbGet(State.globalDB, "workspaces", e.ws).catch(() => null);
+      if (held) {
+        history.replaceState(null, "", location.pathname);
+        await openWorkspaceById(e.ws);
+        return;
+      }
+    }
     setState({ view: "error", error: new Error("Couldn't read that invite: " + e.message) });
   }
 }
@@ -7567,7 +7652,6 @@ function renderJoinVerify() {
     </div>
   `;
   // Unskippable: no primary class, same size, no Enter shortcut.
-  TrustCard.render(p.inviter_fp_bytes, 80);
   const svg = TrustCard.render(p.inviter_fp_bytes, 80);
   document.getElementById("join-trust-card").innerHTML = svg;
   document.getElementById("join-cancel").onclick = () => {
@@ -7661,7 +7745,10 @@ async function beginJoinHandshake() {
     // Seed members: self + inviter (Asha). Inviter's full member info will
     // be refined when member.welcome arrives with the authoritative snapshot.
     const selfMember = {
-      id: myUserId, name: State.join.name, color: State.join.color,
+      // H6: sanitise our OWN name too. Peers run it through
+      // sanitizeDisplayName on receipt, so seeding the raw string here is
+      // how our record ends up differing from everyone else's copy of it.
+      id: myUserId, name: sanitizeDisplayName(State.join.name), color: State.join.color,
       role: "member", devices: [deviceId], joined_at: Date.now(),
       x25519_pub: State.identity.x25519_pub
     };
@@ -7669,7 +7756,11 @@ async function beginJoinHandshake() {
     // arrives with member.welcome. Seed as null for now; dispatch will
     // overwrite on welcome receipt.
     const inviterMember = {
-      id: p.inviter, name: p.inviter_name, color: avatarColorFor(p.inviter),
+      // H6: the invite payload is attacker-shaped input like any other — and
+      // this record is seeded before the welcome arrives, so the snapshot
+      // loop's sanitise never reaches it (it only runs for members it hasn't
+      // already seen). This is the one place the inviter's name gets cleaned.
+      id: p.inviter, name: sanitizeDisplayName(p.inviter_name), color: avatarColorFor(p.inviter),
       role: "owner", devices: [], joined_at: Date.now(),
       x25519_pub: null
     };
@@ -7722,7 +7813,17 @@ async function beginJoinHandshake() {
       readMarkers: new Map(),
       bookmarks: new Map(),
       reminders: new Map(),
-      scheduledSends: new Map()
+      scheduledSends: new Map(),
+      // C2: the open join request this client is waiting on. A member.welcome
+      // rewrites our whole projection — channels, keys, members and their
+      // ROLES — so it is only ever legitimate as the answer to a join we
+      // started, from the inviter we verified out of band, addressed to us,
+      // carrying the nonce we minted. Cleared the moment one is applied, so
+      // it is single-use. Anything arriving outside that window is dropped.
+      pendingJoin: {
+        nonce: bytesToB64(Crypto.rand(16)),
+        inviter: canonUserId(p.inviter)
+      }
     };
     State.current = bundle;
     State.currentChannel = p.general_channel_id;
@@ -7773,6 +7874,10 @@ async function sendMemberJoin(current, selfMember) {
     type: "member.join",
     inner: {
       profile: { name: selfMember.name, color: selfMember.color },
+      // C2: the nonce the inviter must echo back in member.welcome. Binds
+      // the welcome to THIS join request rather than letting any root-key
+      // holder push a snapshot at us whenever they like.
+      join_nonce: current.pendingJoin?.nonce,
       devices: selfMember.devices,
       x25519_pub: State.identity.x25519_pub,  // Slice 3b: joiner publishes
                                               // their X25519 pubkey so the
@@ -7787,10 +7892,32 @@ async function sendMemberJoin(current, selfMember) {
   await PeerMgr.sendEnvelope(meta.id, env);
 }
 
+/**
+ * C2 fallout: a joiner drops any member.welcome that doesn't echo its nonce.
+ * That is correct, but against a client built before C2 the welcome never
+ * carries one — so the join stalls on "Waiting…" with no error, looking
+ * exactly like a dead connection while the inviter's side looks successful.
+ *
+ * There's no version on the wire to detect this properly, so use the only
+ * honest signal available: we connected and then nothing completed the join.
+ * Say what to check rather than spinning forever.
+ */
+function armJoinStallHint() {
+  if (State._joinStallTimer) clearTimeout(State._joinStallTimer);
+  State._joinStallTimer = setTimeout(() => {
+    if (State.view !== "join-waiting") return;
+    const el = document.getElementById("wait-msg");
+    if (!el) return;
+    el.innerHTML = `Still waiting. If they've already accepted, one of you may be running an
+      older version of Mehfil — reload both sides on the same version and try a fresh invite.`;
+    el.style.color = "var(--warn)";
+  }, 45_000);
+}
+
 function renderJoinWaiting() {
   // Offline-mesh spec §3.3: a scanned join sends the answer back as a
   // cycling QR the inviter scans, not a URL to copy.
-  if (State.join.viaScan) return renderJoinScanReply();
+  if (State.join.viaScan) { armJoinStallHint(); return renderJoinScanReply(); }
   const url = State.join.replyUrl;
   $app.innerHTML = `
     <div class="center">
@@ -7806,6 +7933,7 @@ function renderJoinWaiting() {
       </div>
     </div>
   `;
+  armJoinStallHint();
   document.getElementById("copy-reply").onclick = async () => {
     try {
       await navigator.clipboard.writeText(url);
@@ -8361,35 +8489,105 @@ const InvitePayload = {
    *   general_channel_id, general_channel_key, inviter_name, expires
    * }
    */
-  async encode(payload) {
+  /**
+   * C6: the bytes the inviter signs. Everything that decides who you are
+   * talking to and what you will connect to — the inviter key, the SDP, the
+   * workspace keys, the expiry, and a per-invite nonce — is inside the
+   * signature. The `inviter_fp` field is deliberately NOT here: it is not
+   * transmitted at all any more, it is derived from `inviter` on the
+   * receiving side, so there is nothing for an attacker to set.
+   */
+  _transcript(o) {
+    return MP.encode({
+      v: o.v, ws: o.ws, name: o.name, wrk: o.wrk,
+      inviter: o.inviter, inviter_name: o.inviter_name,
+      gch: o.gch, gck: o.gck, offer: o.offer,
+      expires: o.expires, nonce: o.nonce
+    });
+  },
+
+  async encode(payload, signKey) {
     const compressed = await SDPCodec.compress(payload.offer_sdp);
-    const mp = MP.encode({
+    const body = {
       v:           1,
       ws:          payload.ws,
       name:        payload.name,
       wrk:         payload.wrk,           // raw 32 bytes
       inviter:     payload.inviter,
-      inviter_fp:  payload.inviter_fp_bytes, // first 16 bytes of SHA-256(pubkey)
       inviter_name: payload.inviter_name,
       gch:         payload.general_channel_id,
       gck:         payload.general_channel_key,  // raw 32 bytes
       offer:       compressed,
-      expires:     payload.expires
-    });
-    return bytesToB64Url(mp);
+      expires:     payload.expires,
+      nonce:       Crypto.rand(16)
+    };
+    const sig = await Crypto.sign(signKey, InvitePayload._transcript(body));
+    return bytesToB64Url(MP.encode({ ...body, sig }));
   },
 
+  /**
+   * Decode and AUTHENTICATE an invite.
+   *
+   * C6: previously the payload independently supplied the inviter key, the
+   * SDP, the workspace keys, AND the fingerprint that got displayed for the
+   * out-of-band check — with nothing tying them together. A MITM swapped the
+   * inviter key and SDP for their own and swapped the shown fingerprint to
+   * match, so the "unskippable verification" step compared the attacker's
+   * fingerprint against itself and agreed.
+   *
+   * Two changes close that. The fingerprint is now RECOMPUTED from the
+   * inviter key rather than read off the wire, so it always describes the
+   * key you will actually talk to; and the transcript is signed by that key,
+   * so the SDP and workspace keys can't be spliced without also replacing
+   * the identity — which changes the fingerprint the user is checking.
+   *
+   * Throws on a bad signature or an expired invite; callers surface it.
+   */
   async decode(fragment) {
-    const mp = b64UrlToBytes(fragment);
-    const obj = MP.decode(mp);
+    // A truncated or mangled link fails inside atob/msgpack with a raw
+    // platform error ("Failed to execute 'atob'…"), which tells the user
+    // nothing. Name the likely cause instead.
+    let obj;
+    try {
+      obj = MP.decode(b64UrlToBytes(fragment));
+      if (!obj || typeof obj !== "object") throw new Error("not a map");
+    } catch (_) {
+      throw new Error("it isn't a complete Mehfil invite link — it may have been cut off when it was copied. Ask for the whole link again.");
+    }
+
+    if (!obj.inviter || !obj.sig) {
+      throw new Error("it carries no signature. Ask for a fresh invite link.");
+    }
+    // Verify against the key the invite claims — then show the user the
+    // fingerprint OF THAT KEY, so substituting it is visible out of band.
+    let verified = false;
+    try {
+      const vk = await Crypto.importVerifyKey(b64UrlToBytes(obj.inviter));
+      verified = await Crypto.verify(vk, obj.sig, InvitePayload._transcript(obj));
+    } catch (_) { verified = false; }
+    if (!verified) {
+      throw new Error("the signature doesn't match, so it may have been tampered with in transit. Ask for a fresh invite link, sent a different way.");
+    }
+    // M8: invites carry an expiry that was never enforced. Allow a few
+    // minutes of grace — a joiner whose clock runs fast shouldn't reject a
+    // valid invite and blame the inviter for it.
+    if (obj.expires && Date.now() > obj.expires + INVITE_CLOCK_GRACE_MS) {
+      const err = new Error("it has expired. Ask for a fresh invite link.");
+      err.code = "invite_expired";
+      err.ws = obj.ws;
+      throw err;
+    }
+
     const sdp = await SDPCodec.decompress(obj.offer);
+    const fpHash = await Crypto.sha256(b64UrlToBytes(obj.inviter));
     return {
       v: obj.v,
       ws: obj.ws,
       name: obj.name,
       wrk: obj.wrk,
       inviter: obj.inviter,
-      inviter_fp_bytes: obj.inviter_fp,
+      // Derived, never transmitted — see above.
+      inviter_fp_bytes: fpHash.slice(0, 16),
       inviter_name: obj.inviter_name,
       general_channel_id: obj.gch,
       general_channel_key: obj.gck,
@@ -10216,7 +10414,7 @@ const EnvelopeDispatch = {
         }
         const chRec = {
           id: inner.id,
-          name: inner.name,
+          name: sanitizeChannelName(inner.name, !!inner.dm),   // H6
           topic: inner.topic || "",
           private: !!inner.private,
           dm: !!inner.dm,   // group DMs carry dm:true in the envelope
@@ -10237,15 +10435,25 @@ const EnvelopeDispatch = {
         // A new member has joined. Add to members projection.
         const newMember = {
           id: env.from,
-          name: inner.profile.name,
-          color: inner.profile.color,
+          name: sanitizeDisplayName(inner.profile?.name),   // H6 — feeds DM channel names
+          color: inner.profile?.color,
           role: "member",
           devices: inner.devices || [env.dev],
           joined_at: env.ts,
           x25519_pub: inner.x25519_pub || null,  // Slice 3b
           bridge_name: inner.bridge_name || null  // office label for sidebar grouping
         };
-        if (!current.members.find(m => m.id === newMember.id)) {
+        // C4: compare canonically. "X" and "X=" are the same Ed25519 key but
+        // different strings, so an unpadded/padded pair used to open TWO
+        // member rows for one keypair — enough on its own to reach the
+        // promote threshold, and enough to leave member.remove incomplete.
+        const joinId = canonUserId(newMember.id);
+        if (!joinId) {
+          console.warn("member.join: undecodable user id, ignoring", newMember.id);
+          break;
+        }
+        newMember.id = joinId;
+        if (!current.members.find(m => canonUserId(m.id) === joinId)) {
           await attachFingerprint(newMember);
           current.members.push(newMember);
           await idbPut(current.wsDB, "members", newMember);
@@ -10255,7 +10463,7 @@ const EnvelopeDispatch = {
         // If we're the existing member (not the joiner), respond with welcome.
         const imInviter = current.members[0].id === bytesToB64Url(State.identity.pubkey);
         if (imInviter && env.from !== current.members[0].id) {
-          await sendWelcome(current, env.from);
+          await sendWelcome(current, env.from, inner.join_nonce);
           // And replay historic envelopes so the joiner sees prior messages.
           await replayHistory(current, env.from);
         }
@@ -10266,29 +10474,98 @@ const EnvelopeDispatch = {
       }
 
       case "member.welcome": {
+        // C2: a welcome rewrites the entire projection — channels, channel
+        // keys, the member list and every member's ROLE. Applied unguarded it
+        // was a workspace takeover: any root-key holder could send one
+        // carrying {id: attacker, role: "admin"} and pass every downstream
+        // admin check from then on. Four conditions, all required:
+        //
+        //   1. we are actually mid-join (a settled member never needs one),
+        //   2. it is addressed to us and not to somebody else,
+        //   3. it came from the inviter whose fingerprint the user checked
+        //      out of band — not merely from someone holding the root key,
+        //   4. it echoes the nonce we minted for THIS join request.
+        //
+        // (3) is only as strong as the out-of-band fingerprint check, which
+        // C6 is what makes trustworthy — the two findings are a pair.
+        const pj = current.pendingJoin;
+        const myId = canonUserId(bytesToB64Url(State.identity.pubkey));
+        if (!pj) {
+          console.warn("member.welcome outside an active join, dropping", env.from);
+          break;
+        }
+        if (canonUserId(inner.target) !== myId) {
+          console.warn("member.welcome not addressed to us, dropping", inner.target);
+          break;
+        }
+        if (canonUserId(env.from) !== pj.inviter) {
+          console.warn("member.welcome from someone other than our inviter, dropping", env.from);
+          break;
+        }
+        if (!inner.join_nonce || inner.join_nonce !== pj.nonce) {
+          console.warn("member.welcome nonce mismatch, dropping");
+          break;
+        }
+        // Single-use: consume before applying, so a second welcome (or a
+        // replayed copy of this one) finds no open request.
+        //
+        // Consuming BEFORE the apply is the security-correct order, but it
+        // means a throw mid-apply would stand the joiner up forever: the
+        // request is spent, so a re-sent welcome would be dropped, and there
+        // is no retry path. So every record below is applied defensively —
+        // one unusable channel key or member row is skipped, never fatal.
+        current.pendingJoin = null;
+
         // Apply workspace doc snapshot: channels + their keys + members.
-        if (inner.snapshot.channels) {
+        if (Array.isArray(inner.snapshot?.channels)) {
           for (const ch of inner.snapshot.channels) {
-            const existing = current.channels.find(c => c.id === ch.id);
-            if (!existing) {
-              const chRec = {
-                id: ch.id, name: ch.name, topic: ch.topic || "",
-                private: false, members: ch.members || [],
-                created_at: ch.created_at || env.ts
-              };
-              current.channels.push(chRec);
-              await idbPut(current.wsDB, "channels", chRec);
-              // Import the channel key.
-              const rawKey = ch.key;
-              await idbPut(current.wsDB, "keys", rawKey, "ch:" + ch.id);
-              current.channelKeys[ch.id] = await Crypto.importAesRaw(rawKey);
+            try {
+              if (!ch || typeof ch.id !== "string") continue;
+              const existing = current.channels.find(c => c.id === ch.id);
+              if (!existing) {
+                const chRec = {
+                  id: ch.id,
+                  name: sanitizeChannelName(ch.name, !!ch.dm),   // H6 — third entry path
+                  topic: ch.topic || "",
+                  private: false, members: ch.members || [],
+                  created_at: ch.created_at || env.ts
+                };
+                // Import the key FIRST: an unusable key is the one failure
+                // that must not leave a visible channel we can't decrypt.
+                const rawKey = ch.key;
+                current.channelKeys[ch.id] = await Crypto.importAesRaw(rawKey);
+                await idbPut(current.wsDB, "keys", rawKey, "ch:" + ch.id);
+                current.channels.push(chRec);
+                await idbPut(current.wsDB, "channels", chRec);
+              }
+            } catch (e) {
+              console.warn("member.welcome: skipping unusable channel record", ch?.id, e);
             }
           }
         }
-        if (inner.snapshot.members) {
+        if (Array.isArray(inner.snapshot?.members)) {
           for (const m of inner.snapshot.members) {
-            const existing = current.members.find(x => x.id === m.id);
+           try {
+            if (!m || typeof m !== "object") continue;
+            // C4: canonicalise here too. member.join already collapses alias
+            // spellings of a key, but a snapshot could still seed two rows
+            // for one identity — which no longer buys votes (the promote
+            // handler compares canonically) but does inflate member_count
+            // and leave member.remove incomplete. A record whose id doesn't
+            // decode is skipped rather than handed to attachFingerprint,
+            // which would throw and abort the whole batch.
+            const canonId = canonUserId(m.id);
+            if (!canonId) continue;
+            m.id = canonId;
+            const existing = current.members.find(x => canonUserId(x.id) === canonId);
             if (!existing) {
+              m.name = sanitizeDisplayName(m.name);   // H6 — feeds DM channel names
+              // C2: roles come from a peer-supplied blob, so clamp them to
+              // the known set and never let the snapshot hand US a role —
+              // ours is decided by the ops we can verify, not by whoever
+              // welcomed us. An unrecognised role degrades to "member".
+              m.role = MEMBER_ROLES.includes(m.role) ? m.role : "member";
+              if (canonUserId(m.id) === myId) m.role = "member";
               await attachFingerprint(m);
               current.members.push(m);
               await idbPut(current.wsDB, "members", m);
@@ -10298,6 +10575,9 @@ const EnvelopeDispatch = {
               existing.x25519_pub = m.x25519_pub;
               await idbPut(current.wsDB, "members", existing);
             }
+           } catch (e) {
+             console.warn("member.welcome: skipping unusable member record", e);
+           }
           }
           current.meta.member_count = current.members.length;
           await idbPut(current.wsDB, "keys", current.meta, "workspace_meta");
@@ -10355,7 +10635,10 @@ const EnvelopeDispatch = {
           ? { text: String(inner.custom.text || "").slice(0, 80), emoji: String(inner.custom.emoji || "").slice(0, 8) }
           : null;
         current.presence[env.from] = {
-          status: inner.status,
+          // C1: `status` is a closed enum, not free text. It reaches a class
+          // attribute in the sidebar, so an unvalidated peer string is a
+          // stored-XSS vector. Anything off-list degrades to "offline".
+          status: PRESENCE_STATUSES.includes(inner.status) ? inner.status : "offline",
           custom,
           updated_at: Date.now()
         };
@@ -10668,29 +10951,76 @@ const EnvelopeDispatch = {
         // `inner.signers` carries [{user_id, sig}] from the proposal — each
         // signed the canonical promote payload independently. Verify each sig
         // against the canonical bytes and count distinct valid signers.
-        const targetId = inner.target;
-        if (!targetId || !inner.ts || !inner.nonce || !Array.isArray(inner.signers)) break;
+        const targetId = canonUserId(inner.target);
+        if (!targetId || !inner.ts || !Array.isArray(inner.signers)) break;
+        // The nonce is the replay key, so it has to be real bytes. A string
+        // or a msgpack map would collapse through bytesToB64 to a constant
+        // ("AAAA…"), poisoning one burn slot for everybody.
+        if (!(inner.nonce instanceof Uint8Array) || inner.nonce.length < 8) break;
 
-        const sigPayload = MP.encode({ type: "member.promote", target: targetId, ts: inner.ts, nonce: inner.nonce });
+        // C4: the sender must itself be a member. Anyone holding the root key
+        // could previously inject a promote without being in the workspace.
+        const promoteFrom = canonUserId(env.from);
+        if (!promoteFrom || !current.members.some(m => canonUserId(m.id) === promoteFrom)) {
+          console.warn("member.promote: sender is not a member, dropping", env.from);
+          break;
+        }
+
+        // C4: burn the nonce. Without this the exact same cosig set could be
+        // re-wrapped in a fresh envelope (new env.id, so the SeenSet misses
+        // it) and replayed — including after the target stepped down, which
+        // silently re-promotes them. Burning is deliberately clock-free: an
+        // expiry window would make an authz projection depend on each peer's
+        // wall clock, so a peer partitioned past the window would diverge
+        // permanently from everyone else on a role.
+        const promoteNonce = bytesToB64(inner.nonce);
+        const burned = (await idbGet(current.wsDB, "keys", "promote_nonces")) || [];
+        if (burned.includes(promoteNonce)) {
+          console.warn("member.promote: nonce already used, dropping replay");
+          break;
+        }
+
+        const sigPayload = MP.encode({ type: "member.promote", target: inner.target, ts: inner.ts, nonce: inner.nonce });
 
         let validSigners = new Set();
         for (const signer of inner.signers) {
           if (!signer.user_id || !signer.sig) continue;
+          // C4: a signature is only a *vote* if it belongs to someone who can
+          // vote. Previously any Ed25519 keypair counted, so two throwaway
+          // keys reached the threshold and self-escalated to admin.
+          //
+          // Compared canonically: "X" and "X=" decode to the same pubkey but
+          // compare as different strings, so one keypair could hold two
+          // member rows and cast two votes.
+          const signerId = canonUserId(signer.user_id);
+          if (!signerId) continue;
+          if (!current.members.some(m => canonUserId(m.id) === signerId)) continue;
+          // C4: the target can't vote for their own promotion.
+          if (signerId === targetId) continue;
           try {
             const pub = b64UrlToBytes(signer.user_id);
             const vk  = await Crypto.importVerifyKey(pub);
             if (await Crypto.verify(vk, signer.sig, sigPayload)) {
-              validSigners.add(signer.user_id);
+              validSigners.add(signerId);
             }
           } catch (_) { /* bad sig — ignore */ }
         }
 
-        if (validSigners.size < 2) {
+        if (validSigners.size < PROMOTE_THRESHOLD) {
           console.warn("member.promote: insufficient valid signers (" + validSigners.size + "), dropping");
           break;
         }
 
-        const target = current.members.find(m => m.id === targetId);
+        burned.push(promoteNonce);
+        // Bounded so the record can't grow forever. The bound is itself a
+        // weakening — evicting an old nonce makes that promote replayable
+        // again — but filling it needs thousands of *successful* promotes,
+        // which needs sybil identities, which is the parked admission-control
+        // gap (see plan/pending.md). Raise or key by (nonce, target) if that
+        // ever closes and this bound becomes the weakest link.
+        await idbPut(current.wsDB, "keys", burned.slice(-4096), "promote_nonces");
+
+        const target = current.members.find(m => canonUserId(m.id) === targetId);
         if (target && target.role === "member") {
           target.role = "admin";
           await idbPut(current.wsDB, "members", target);
@@ -10791,7 +11121,7 @@ const EnvelopeDispatch = {
 /* ------------------------------------------------------------
  *  §22  member.welcome + history replay helpers
  * ------------------------------------------------------------ */
-async function sendWelcome(current, targetUserId) {
+async function sendWelcome(current, targetUserId, joinNonce) {
   // Build the snapshot: channels with their raw keys, current members,
   // and per-sender group DM keys so the joiner can decrypt group DM history.
   const snapshotChannels = [];
@@ -10801,6 +11131,19 @@ async function sendWelcome(current, targetUserId) {
       id: ch.id,
       name: ch.name,
       topic: ch.topic,
+      // H6: the receiver needs to know this is a group DM. Its name is
+      // built from member display names ("Ada, Grace"), which the channel
+      // slug rule would mangle — without this flag a late joiner projects
+      // a different name than everyone else.
+      //
+      // NOTE (M9 still open): the receiving side does NOT persist `dm` onto
+      // its channel record, so a joiner renders a group DM with public-
+      // channel chrome. That also means this line is only correct because
+      // the welcome is sent by the owner alone (see the `members[0]` gate in
+      // the member.join handler) — the owner is the one peer guaranteed to
+      // hold `dm: true`. If welcome ever moves off that gate, fix M9 first
+      // or late joiners start slugifying group-DM names again.
+      dm: !!ch.dm,
       members: ch.members,
       created_at: ch.created_at,
       key: raw
@@ -10848,7 +11191,11 @@ async function sendWelcome(current, targetUserId) {
     signerPubkey: State.identity.pubkey,
     deviceId: meta.device_id,
     type: "member.welcome",
-    inner: { target: targetUserId, snapshot },
+    // C2: echo the joiner's nonce so they can tell our answer apart from an
+    // unsolicited snapshot. Omitted only if the joiner never sent one, in
+    // which case the joiner will reject this — which is the intended
+    // outcome for a client that predates the nonce.
+    inner: { target: targetUserId, join_nonce: joinNonce, snapshot },
     vectorClock: [[userId, meta.lc_counter]]
   });
   await idbPut(current.wsDB, "keys", meta, "workspace_meta");
@@ -13849,7 +14196,9 @@ async function finalizePromotion(current, proposalId) {
   const promos   = WorkspaceDoc.getPendingPromotions(current.doc);
   const proposal = promos.find(p => p.id === proposalId);
   if (!proposal) throw new Error("Proposal not found.");
-  if (proposal.cosigs.length < 2) throw new Error("Need at least 2 supporters first.");
+  if (proposal.cosigs.length < PROMOTE_THRESHOLD) {
+    throw new Error("Need at least " + PROMOTE_THRESHOLD + " supporters first.");
+  }
 
   const nonce      = b64ToBytes(proposal.nonce_b64);
   const sigPayload = MP.encode({ type: "member.promote", target: proposal.target_id, ts: proposal.ts, nonce });
@@ -14150,6 +14499,24 @@ function b64UrlToBytes(s) {
   const padded = s.replace(/-/g, "+").replace(/_/g, "/");
   const need = (4 - (padded.length % 4)) % 4;
   return b64ToBytes(padded + "=".repeat(need));
+}
+/**
+ * C4: collapse a user_id to its one canonical spelling.
+ *
+ * `bytesToB64Url` emits unpadded, but `b64UrlToBytes` re-pads before atob,
+ * so "X" and "X=" decode to the SAME pubkey while comparing as different
+ * strings. Every identity check in the app is a string compare against
+ * `members`, so one keypair could hold two member rows and cast two votes
+ * toward the promote threshold. Round-trip through the decoder to get the
+ * single spelling. Returns null if the id isn't decodable at all.
+ */
+function canonUserId(id) {
+  if (typeof id !== "string" || !id) return null;
+  try {
+    const bytes = b64UrlToBytes(id);
+    if (!bytes || bytes.length !== 32) return null;   // Ed25519 pubkeys only
+    return bytesToB64Url(bytes);
+  } catch (_) { return null; }
 }
 function u64BE(n) {
   const b = new Uint8Array(8);

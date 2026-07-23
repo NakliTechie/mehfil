@@ -21,7 +21,11 @@
 // users. Cache-first (below) otherwise serves the previously-cached HTML for
 // the current session — e.g. the pre-inlined-Yjs build — and the update only
 // lands on a later load. v2: inlined Yjs + complete join bundle.
-const CACHE_NAME = "mehfil-shell-v2";
+// v3: Batch A security fixes. Bumping matters more than usual here — C2 and
+// C6 change the wire format, so a user still on the v2 shell and a user on v3
+// cannot complete a join with each other. Leaving them on a stale shell turns
+// a one-session lag into a silent "Waiting…" hang between the two.
+const CACHE_NAME = "mehfil-shell-v3";
 const PRECACHE = [
   "./",
   "./index.html",
