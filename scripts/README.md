@@ -15,8 +15,25 @@ leaves via A's gossip rebroadcast (multi-hop).
 npm install
 npx playwright install chromium
 npm run test:mesh      # or: node verify-mesh.mjs
+npm run test:journeys  # multi-actor journeys (channels, reactions, DMs, admin)
 ```
 Exit 0 = all green, 1 = any failure.
+
+## `csp-hash.mjs` — keep the CSP hashes current
+
+`script-src` pins each inline `<script>` block by SHA-256 instead of allowing
+`'unsafe-inline'`, so an HTML-injection bug can't turn into script execution
+(finding L1). The hashes cover the exact bytes of those blocks, so **editing
+index.html invalidates them and the app then refuses to boot at all**.
+
+```sh
+npm run csp:check      # exit 1 if stale — run before committing
+npm run csp:write      # recompute and rewrite in place after editing
+```
+
+This is not a build step: index.html still opens straight from disk. A stale
+hash is caught loudly rather than silently — both harnesses boot the real page,
+so they go red immediately.
 
 ## Notes
 - Needs `?debug=1` (exposes `window.__mehfil`) — the harness drives the real

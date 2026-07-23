@@ -4,7 +4,10 @@
   "type": "module",
   "description": "End-to-end mesh harness for Mehfil (multi-peer offline WebRTC over loopback).",
   "scripts": {
-    "test:mesh": "node verify-mesh.mjs"
+    "test:mesh": "node verify-mesh.mjs",
+    "test:journeys": "node verify-journeys.mjs",
+    "csp:check": "node csp-hash.mjs --check",
+    "csp:write": "node csp-hash.mjs --write"
   },
   "devDependencies": {
     "playwright": "^1.61.1"
