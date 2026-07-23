@@ -20,7 +20,7 @@
      The primary XSS defence stays escapeHTML() on all rendered content. -->
 <meta http-equiv="Content-Security-Policy" content="
   default-src 'self';
-  script-src 'self' 'sha256-vfVDU8oFcqTkD0oExOyswDEc47NCykKKTmmdfh1aFwA=' 'sha256-ryup/9GePD9DBWqEdHd8MoluL367/pmDD3fbho0d9d8=' 'sha256-UmFvp+NOd3G6GSgTQV1Lu1wiR2OuHdNosSpMI3GTT4Q=' https://esm.sh https://cdn.jsdelivr.net;
+  script-src 'self' 'sha256-vfVDU8oFcqTkD0oExOyswDEc47NCykKKTmmdfh1aFwA=' 'sha256-ryup/9GePD9DBWqEdHd8MoluL367/pmDD3fbho0d9d8=' 'sha256-rSFw4YJxxAK0mGEcxNnU6DLd9H/1Fp55G3URHYkEefI=' https://esm.sh https://cdn.jsdelivr.net;
   style-src 'self' 'unsafe-inline';
   img-src 'self' data: blob:;
   media-src 'self' blob:;
@@ -6981,19 +6981,20 @@ async function prepareInvite(offline) {
   const myRaw = await idbGet(current.wsDB, "keys", "root");
   const gchKey = await idbGet(current.wsDB, "keys", "ch:" + current.meta.general_channel_id);
   const me = current.members.find(m => m.id === bytesToB64Url(State.identity.pubkey));
-  const fpHash = await Crypto.sha256(State.identity.pubkey);
+  // C6: sign the invite transcript. The joiner recomputes the fingerprint
+  // from the signed key, so `inviter_fp_bytes` is no longer sent.
+  const inviteSignKey = await Crypto.importSignKey(State.identity.privkey_pkcs8);
   const frag = await InvitePayload.encode({
     ws: current.meta.id,
     name: current.meta.name,
     wrk: myRaw,
     inviter: bytesToB64Url(State.identity.pubkey),
-    inviter_fp_bytes: fpHash.slice(0, 16),
     inviter_name: me.name,
     general_channel_id: current.meta.general_channel_id,
     general_channel_key: gchKey,
     offer_sdp: transport.localSdp(),
     expires: Date.now() + 24 * 3600 * 1000
-  });
+  }, inviteSignKey);
   const url = `${location.origin}${location.pathname}#join=${frag}`;
   return { transport, url, frag };
 }
@@ -8449,35 +8450,92 @@ const InvitePayload = {
    *   general_channel_id, general_channel_key, inviter_name, expires
    * }
    */
-  async encode(payload) {
+  /**
+   * C6: the bytes the inviter signs. Everything that decides who you are
+   * talking to and what you will connect to — the inviter key, the SDP, the
+   * workspace keys, the expiry, and a per-invite nonce — is inside the
+   * signature. The `inviter_fp` field is deliberately NOT here: it is not
+   * transmitted at all any more, it is derived from `inviter` on the
+   * receiving side, so there is nothing for an attacker to set.
+   */
+  _transcript(o) {
+    return MP.encode({
+      v: o.v, ws: o.ws, name: o.name, wrk: o.wrk,
+      inviter: o.inviter, inviter_name: o.inviter_name,
+      gch: o.gch, gck: o.gck, offer: o.offer,
+      expires: o.expires, nonce: o.nonce
+    });
+  },
+
+  async encode(payload, signKey) {
     const compressed = await SDPCodec.compress(payload.offer_sdp);
-    const mp = MP.encode({
+    const body = {
       v:           1,
       ws:          payload.ws,
       name:        payload.name,
       wrk:         payload.wrk,           // raw 32 bytes
       inviter:     payload.inviter,
-      inviter_fp:  payload.inviter_fp_bytes, // first 16 bytes of SHA-256(pubkey)
       inviter_name: payload.inviter_name,
       gch:         payload.general_channel_id,
       gck:         payload.general_channel_key,  // raw 32 bytes
       offer:       compressed,
-      expires:     payload.expires
-    });
-    return bytesToB64Url(mp);
+      expires:     payload.expires,
+      nonce:       Crypto.rand(16)
+    };
+    const sig = await Crypto.sign(signKey, InvitePayload._transcript(body));
+    return bytesToB64Url(MP.encode({ ...body, sig }));
   },
 
+  /**
+   * Decode and AUTHENTICATE an invite.
+   *
+   * C6: previously the payload independently supplied the inviter key, the
+   * SDP, the workspace keys, AND the fingerprint that got displayed for the
+   * out-of-band check — with nothing tying them together. A MITM swapped the
+   * inviter key and SDP for their own and swapped the shown fingerprint to
+   * match, so the "unskippable verification" step compared the attacker's
+   * fingerprint against itself and agreed.
+   *
+   * Two changes close that. The fingerprint is now RECOMPUTED from the
+   * inviter key rather than read off the wire, so it always describes the
+   * key you will actually talk to; and the transcript is signed by that key,
+   * so the SDP and workspace keys can't be spliced without also replacing
+   * the identity — which changes the fingerprint the user is checking.
+   *
+   * Throws on a bad signature or an expired invite; callers surface it.
+   */
   async decode(fragment) {
     const mp = b64UrlToBytes(fragment);
     const obj = MP.decode(mp);
+
+    if (!obj.inviter || !obj.sig) {
+      throw new Error("it carries no signature. Ask for a fresh invite link.");
+    }
+    // Verify against the key the invite claims — then show the user the
+    // fingerprint OF THAT KEY, so substituting it is visible out of band.
+    let verified = false;
+    try {
+      const vk = await Crypto.importVerifyKey(b64UrlToBytes(obj.inviter));
+      verified = await Crypto.verify(vk, obj.sig, InvitePayload._transcript(obj));
+    } catch (_) { verified = false; }
+    if (!verified) {
+      throw new Error("the signature doesn't match, so it may have been tampered with in transit. Ask for a fresh invite link, sent a different way.");
+    }
+    // M8: invites carry an expiry that was never enforced.
+    if (obj.expires && Date.now() > obj.expires) {
+      throw new Error("it has expired. Ask for a fresh invite link.");
+    }
+
     const sdp = await SDPCodec.decompress(obj.offer);
+    const fpHash = await Crypto.sha256(b64UrlToBytes(obj.inviter));
     return {
       v: obj.v,
       ws: obj.ws,
       name: obj.name,
       wrk: obj.wrk,
       inviter: obj.inviter,
-      inviter_fp_bytes: obj.inviter_fp,
+      // Derived, never transmitted — see above.
+      inviter_fp_bytes: fpHash.slice(0, 16),
       inviter_name: obj.inviter_name,
       general_channel_id: obj.gch,
       general_channel_key: obj.gck,
