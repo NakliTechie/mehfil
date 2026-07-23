@@ -20,7 +20,7 @@
      The primary XSS defence stays escapeHTML() on all rendered content. -->
 <meta http-equiv="Content-Security-Policy" content="
   default-src 'self';
-  script-src 'self' 'sha256-vfVDU8oFcqTkD0oExOyswDEc47NCykKKTmmdfh1aFwA=' 'sha256-ryup/9GePD9DBWqEdHd8MoluL367/pmDD3fbho0d9d8=' 'sha256-rSFw4YJxxAK0mGEcxNnU6DLd9H/1Fp55G3URHYkEefI=' https://esm.sh https://cdn.jsdelivr.net;
+  script-src 'self' 'sha256-vfVDU8oFcqTkD0oExOyswDEc47NCykKKTmmdfh1aFwA=' 'sha256-ryup/9GePD9DBWqEdHd8MoluL367/pmDD3fbho0d9d8=' 'sha256-JOFT3hmYe84K8Fd3+oEkj5NuQPiR5hIlWY6uYU6/JBg=' https://esm.sh https://cdn.jsdelivr.net;
   style-src 'self' 'unsafe-inline';
   img-src 'self' data: blob:;
   media-src 'self' blob:;
@@ -10481,7 +10481,15 @@ const EnvelopeDispatch = {
         }
         if (inner.snapshot.members) {
           for (const m of inner.snapshot.members) {
-            const existing = current.members.find(x => x.id === m.id);
+            // C4: canonicalise here too. member.join already collapses alias
+            // spellings of a key, but a snapshot could still seed two rows
+            // for one identity — which no longer buys votes (the promote
+            // handler compares canonically) but does inflate member_count
+            // and leave member.remove incomplete.
+            const canonId = canonUserId(m.id);
+            if (!canonId) continue;
+            m.id = canonId;
+            const existing = current.members.find(x => canonUserId(x.id) === canonId);
             if (!existing) {
               m.name = sanitizeDisplayName(m.name);   // H6 — feeds DM channel names
               // C2: roles come from a peer-supplied blob, so clamp them to
@@ -10873,7 +10881,11 @@ const EnvelopeDispatch = {
         // signed the canonical promote payload independently. Verify each sig
         // against the canonical bytes and count distinct valid signers.
         const targetId = canonUserId(inner.target);
-        if (!targetId || !inner.ts || !inner.nonce || !Array.isArray(inner.signers)) break;
+        if (!targetId || !inner.ts || !Array.isArray(inner.signers)) break;
+        // The nonce is the replay key, so it has to be real bytes. A string
+        // or a msgpack map would collapse through bytesToB64 to a constant
+        // ("AAAA…"), poisoning one burn slot for everybody.
+        if (!(inner.nonce instanceof Uint8Array) || inner.nonce.length < 8) break;
 
         // C4: the sender must itself be a member. Anyone holding the root key
         // could previously inject a promote without being in the workspace.
@@ -10929,8 +10941,13 @@ const EnvelopeDispatch = {
         }
 
         burned.push(promoteNonce);
-        // Bounded: keep the most recent 512 so the record can't grow forever.
-        await idbPut(current.wsDB, "keys", burned.slice(-512), "promote_nonces");
+        // Bounded so the record can't grow forever. The bound is itself a
+        // weakening — evicting an old nonce makes that promote replayable
+        // again — but filling it needs thousands of *successful* promotes,
+        // which needs sybil identities, which is the parked admission-control
+        // gap (see plan/pending.md). Raise or key by (nonce, target) if that
+        // ever closes and this bound becomes the weakest link.
+        await idbPut(current.wsDB, "keys", burned.slice(-4096), "promote_nonces");
 
         const target = current.members.find(m => canonUserId(m.id) === targetId);
         if (target && target.role === "member") {
