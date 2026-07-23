@@ -1,1061 +1,129 @@
-<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Mehfil — User Guide</title>
 <style>
-  :root {
-    --accent: #5b4fe8;
-    --accent-light: #ece9ff;
-    --fg: #1a1a1a;
-    --fg-dim: #6b7280;
-    --bg: #faf9f6;
-    --bg-card: #ffffff;
-    --border: #e5e7eb;
-    --radius: 10px;
-    --sidebar-w: 220px;
-  }
-  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-
-  body {
-    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-    background: var(--bg);
-    color: var(--fg);
-    line-height: 1.6;
-    display: flex;
-    min-height: 100vh;
-  }
-
-  /* ── Sidebar nav ── */
-  nav {
-    position: fixed;
-    top: 0; left: 0; bottom: 0;
-    width: var(--sidebar-w);
-    background: var(--bg-card);
-    border-right: 1px solid var(--border);
-    padding: 28px 0 24px;
-    overflow-y: auto;
-    z-index: 10;
-  }
-  nav .logo {
-    font-size: 18px;
-    font-weight: 700;
-    color: var(--accent);
-    padding: 0 20px 20px;
-    display: block;
-    text-decoration: none;
-  }
-  nav .logo span { color: var(--fg); font-weight: 400; font-size: 13px; display: block; margin-top: 2px; }
-  nav ul { list-style: none; }
-  nav ul li a {
-    display: block;
-    padding: 7px 20px;
-    font-size: 13.5px;
-    color: var(--fg-dim);
-    text-decoration: none;
-    border-left: 2px solid transparent;
-    transition: color 0.15s, border-color 0.15s, background 0.15s;
-  }
-  nav ul li a:hover { color: var(--fg); background: var(--bg); }
-  nav ul li a.active { color: var(--accent); border-left-color: var(--accent); background: var(--accent-light); font-weight: 500; }
-  nav .section-label {
-    font-size: 10px;
-    font-weight: 600;
-    letter-spacing: 0.08em;
-    text-transform: uppercase;
-    color: var(--fg-dim);
-    padding: 18px 20px 6px;
-  }
-
-  /* ── Main content ── */
-  main {
-    margin-left: var(--sidebar-w);
-    max-width: 820px;
-    padding: 56px 48px 80px;
-    flex: 1;
-  }
-
-  /* ── Sections ── */
-  section { padding-top: 20px; }
-  section + section { margin-top: 56px; border-top: 1px solid var(--border); padding-top: 48px; }
-
-  h1 {
-    font-size: 32px;
-    font-weight: 700;
-    line-height: 1.2;
-    margin-bottom: 12px;
-  }
-  h1 .tag {
-    display: inline-block;
-    font-size: 11px;
-    font-weight: 600;
-    background: var(--accent-light);
-    color: var(--accent);
-    border-radius: 4px;
-    padding: 2px 8px;
-    vertical-align: middle;
-    margin-left: 10px;
-    letter-spacing: 0.04em;
-  }
-  h2 {
-    font-size: 21px;
-    font-weight: 600;
-    margin-bottom: 10px;
-    display: flex;
-    align-items: center;
-    gap: 8px;
-  }
-  h2 .icon { font-size: 20px; }
-  h3 {
-    font-size: 15px;
-    font-weight: 600;
-    margin: 24px 0 6px;
-    color: var(--fg);
-  }
-  p { font-size: 15px; color: #374151; margin-bottom: 14px; }
-  p:last-child { margin-bottom: 0; }
-  .lead { font-size: 17px; color: var(--fg-dim); margin-bottom: 24px; line-height: 1.55; }
-
-  ul, ol { padding-left: 22px; margin-bottom: 14px; }
-  li { font-size: 15px; color: #374151; margin-bottom: 5px; }
-
-  /* ── Screenshots ── */
-  .shot {
-    margin: 22px 0;
-    border-radius: var(--radius);
-    border: 1px solid var(--border);
-    overflow: hidden;
-    box-shadow: 0 2px 12px rgba(0,0,0,0.07);
-  }
-  .shot img { display: block; width: 100%; height: auto; }
-  .shot figcaption {
-    font-size: 12.5px;
-    color: var(--fg-dim);
-    background: var(--bg);
-    padding: 8px 14px;
-    border-top: 1px solid var(--border);
-  }
-
-  /* ── Steps ── */
-  .steps { counter-reset: step; list-style: none; padding: 0; margin: 18px 0; }
-  .steps li {
-    counter-increment: step;
-    display: flex;
-    gap: 14px;
-    align-items: flex-start;
-    margin-bottom: 14px;
-    font-size: 15px;
-    color: #374151;
-  }
-  .steps li::before {
-    content: counter(step);
-    flex-shrink: 0;
-    width: 26px; height: 26px;
-    border-radius: 50%;
-    background: var(--accent);
-    color: #fff;
-    font-size: 12px;
-    font-weight: 700;
-    display: flex; align-items: center; justify-content: center;
-    margin-top: 1px;
-  }
-
-  /* ── Callout boxes ── */
-  .callout {
-    border-radius: var(--radius);
-    padding: 14px 18px;
-    margin: 18px 0;
-    font-size: 14px;
-    line-height: 1.55;
-    display: flex;
-    gap: 12px;
-    align-items: flex-start;
-  }
-  .callout .icon { font-size: 18px; flex-shrink: 0; margin-top: 1px; }
-  .callout.info  { background: #eff6ff; border: 1px solid #bfdbfe; color: #1e40af; }
-  .callout.tip   { background: #f0fdf4; border: 1px solid #86efac; color: #166534; }
-  .callout.warn  { background: #fffbeb; border: 1px solid #fcd34d; color: #92400e; }
-
-  /* ── Keyboard shortcuts ── */
-  kbd {
-    display: inline-block;
-    background: #f3f4f6;
-    border: 1px solid #d1d5db;
-    border-radius: 4px;
-    padding: 1px 7px;
-    font-size: 12px;
-    font-family: ui-monospace, monospace;
-    color: var(--fg);
-    box-shadow: 0 1px 0 #d1d5db;
-  }
-
-  /* ── Two-column layout for settings tabs ── */
-  .cols { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin: 18px 0; }
-  @media (max-width: 680px) { .cols { grid-template-columns: 1fr; } }
-
-  /* ── Hero ── */
-  .hero {
-    background: linear-gradient(135deg, var(--accent) 0%, #8b5cf6 100%);
-    border-radius: 14px;
-    padding: 40px 40px 36px;
-    color: #fff;
-    margin-bottom: 40px;
-  }
-  .hero h1 { color: #fff; font-size: 36px; margin-bottom: 8px; }
-  .hero p { color: rgba(255,255,255,0.85); font-size: 16px; margin-bottom: 0; }
-
-  /* ── Back to app link ── */
-  .back-link {
-    display: inline-flex;
-    align-items: center;
-    gap: 6px;
-    font-size: 13px;
-    color: var(--fg-dim);
-    text-decoration: none;
-    margin-bottom: 32px;
-  }
-  .back-link:hover { color: var(--accent); }
-
-  /* ── Mobile nav toggle ── */
-  #nav-toggle {
-    display: none;
-    position: fixed;
-    top: 12px; left: 12px;
-    z-index: 30;
-    background: var(--bg-card);
-    border: 1px solid var(--border);
-    border-radius: 8px;
-    padding: 8px 12px;
-    font-size: 16px;
-    cursor: pointer;
-    box-shadow: 0 2px 8px rgba(0,0,0,0.08);
-  }
-  #nav-overlay {
-    display: none;
-    position: fixed;
-    inset: 0;
-    background: rgba(0,0,0,0.35);
-    z-index: 19;
-  }
-
-  /* ── Mobile responsive ── */
-  @media (max-width: 720px) {
-    :root { --sidebar-w: 0px; }
-
-    body { display: block; }
-
-    nav {
-      transform: translateX(-100%);
-      transition: transform 0.22s ease;
-      width: 260px;
-      z-index: 20;
-    }
-    nav.open { transform: translateX(0); }
-
-    #nav-toggle { display: block; }
-    #nav-overlay.open { display: block; }
-
-    main {
-      margin-left: 0;
-      padding: 52px 20px 60px;
-    }
-
-    .hero { padding: 28px 22px 24px; border-radius: 10px; }
-    .hero h1 { font-size: 26px; }
-    .hero p  { font-size: 14px; }
-
-    h1 { font-size: 24px; }
-    h2 { font-size: 18px; }
-
-    .shot { margin: 16px 0; }
-
-    pre { font-size: 12px !important; padding: 12px !important; }
-  }
-
-  /* ── Scroll spy highlight ── */
-  html { scroll-behavior: smooth; }
-</style>
-</head>
+  :root{ --bg:#fafaf7; --elev:#fff; --sunken:#f0eee8; --fg:#1a1a1a; --mute:#6b6b6b; --dim:#9a9a9a; --line:#e6e3da; --accent:#4f46e5; --accent-fg:#fff;
+    --sans:-apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif; --mono:ui-monospace,"SF Mono",Menlo,Consolas,monospace; }
+  @media (prefers-color-scheme: dark){ :root{ --bg:#15151a; --elev:#1d1d23; --sunken:#101015; --fg:#ececec; --mute:#9a9a9a; --dim:#6b6b6b; --line:#2a2a32; --accent:#818cf8; } }
+  *{box-sizing:border-box} html{scroll-behavior:smooth}
+  body{margin:0;background:var(--bg);color:var(--fg);font-family:var(--sans);line-height:1.5}
+  header{padding:56px 24px 28px;max-width:1100px;margin:0 auto}
+  h1{font-size:34px;margin:0 0 6px;letter-spacing:-.02em}
+  .tag{color:var(--mute);font-size:16px;max-width:640px}
+  .tag code{font-family:var(--mono);font-size:13px;background:var(--sunken);padding:1px 5px;border-radius:5px}
+  .bar{position:sticky;top:0;z-index:10;background:var(--bg);border-bottom:1px solid var(--line);padding:12px 24px}
+  .bar .inner{max-width:1100px;margin:0 auto;display:flex;gap:14px;align-items:center;flex-wrap:wrap}
+  #q{flex:1;min-width:200px;padding:9px 13px;border:1px solid var(--line);border-radius:9px;background:var(--elev);color:var(--fg);font-size:14px;font-family:var(--sans)}
+  #q:focus{outline:none;border-color:var(--accent)}
+  .toc{display:flex;gap:6px;flex-wrap:wrap}
+  .toc a{font-size:12.5px;color:var(--mute);text-decoration:none;padding:5px 10px;border-radius:7px;background:var(--sunken);white-space:nowrap}
+  .toc a:hover{color:var(--accent-fg);background:var(--accent)}
+  main{max-width:1100px;margin:0 auto;padding:8px 24px 80px}
+  .grp{margin:40px 0}
+  .grp h2{font-size:22px;margin:0 0 4px;letter-spacing:-.01em}
+  .intro{color:var(--mute);margin:0 0 20px;max-width:720px}
+  .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(340px,1fr));gap:22px}
+  .card{margin:0;background:var(--elev);border:1px solid var(--line);border-radius:13px;overflow:hidden;box-shadow:0 1px 2px rgba(0,0,0,.04)}
+  .card.hidden{display:none}
+  .card img{width:100%;display:block;border-bottom:1px solid var(--line);background:var(--sunken);aspect-ratio:14/9;object-fit:cover;object-position:top}
+  figcaption{padding:13px 15px 15px}
+  figcaption h3{margin:0 0 4px;font-size:15px}
+  figcaption p{margin:0;color:var(--mute);font-size:13.5px}
+  .grp.empty{display:none}
+  #none{display:none;color:var(--mute);padding:40px 0;text-align:center}
+  footer{max-width:1100px;margin:0 auto;padding:0 24px 60px;color:var(--dim);font-size:13px}
+  footer a{color:var(--accent)}
+</style></head>
 <body>
-
-<!-- ── Mobile nav toggle ── -->
-<button id="nav-toggle" aria-label="Open navigation">☰</button>
-<div id="nav-overlay"></div>
-
-<!-- ── Sidebar ── -->
-<nav id="nav">
-  <a class="logo" href="../index.html">Mehfil <span>User Guide</span></a>
-  <div class="section-label">Getting started</div>
-  <ul>
-    <li><a href="#getting-started">What is Mehfil?</a></li>
-    <li><a href="#create-workspace">Create a workspace</a></li>
-    <li><a href="#invite">Invite someone</a></li>
-    <li><a href="#join">Join a workspace</a></li>
-  </ul>
-  <div class="section-label">Day-to-day</div>
-  <ul>
-    <li><a href="#channels">Channels</a></li>
-    <li><a href="#messaging">Messaging</a></li>
-    <li><a href="#dms">Direct messages</a></li>
-    <li><a href="#attention">Staying on top</a></li>
-    <li><a href="#pins">Pinned messages</a></li>
-    <li><a href="#switcher">⌘K quick switcher</a></li>
-    <li><a href="#search">Message search</a></li>
-    <li><a href="#permalinks">Permalinks &amp; forward</a></li>
-    <li><a href="#slash">Slash commands</a></li>
-    <li><a href="#shortcuts">Keyboard shortcuts</a></li>
-  </ul>
-  <div class="section-label">Identity &amp; devices</div>
-  <ul>
-    <li><a href="#identity">Your identity</a></li>
-    <li><a href="#status">Custom status</a></li>
-    <li><a href="#backup">Backup &amp; restore</a></li>
-    <li><a href="#devices">Multiple devices</a></li>
-  </ul>
-  <div class="section-label">Administration</div>
-  <ul>
-    <li><a href="#admin">Admin controls</a></li>
-    <li><a href="#announce">Announcement channels</a></li>
-    <li><a href="#groups">User groups</a></li>
-    <li><a href="#relay">Relay setup</a></li>
-    <li><a href="#bridge">LAN bridge</a></li>
-    <li><a href="#huddles">Huddles</a></li>
-  </ul>
-  <div class="section-label">Mobile</div>
-  <ul>
-    <li><a href="#mobile">Using on mobile</a></li>
-  </ul>
-</nav>
-
-<!-- ── Main ── -->
+<header>
+  <h1>Mehfil — User Guide</h1>
+  <p class="tag">Browser-native, local-first team chat in a single HTML file. No accounts, no servers, end-to-end encrypted. Works fully offline — a group on one hotspot connects peer-to-peer and self-organizes into a mesh. <a href="../index.html" style="color:var(--accent)">Open Mehfil →</a></p>
+</header>
+<div class="bar"><div class="inner">
+  <input id="q" type="search" placeholder="Search features…  ( / to focus, Esc to clear )" autocomplete="off">
+  <nav class="toc"><a href="#s0">Getting started</a><a href="#s1">Connect your team — offline</a><a href="#s2">Messaging</a><a href="#s3">Find &amp; navigate</a><a href="#s4">Settings &amp; admin</a></nav>
+</div></div>
 <main>
-
-  <div class="hero">
-    <h1>Mehfil Guide</h1>
-    <p>Browser-native team chat. No accounts, no servers — your messages stay on your devices.</p>
-  </div>
-
-  <!-- ─────────────────────────────── GETTING STARTED ─── -->
-  <section id="getting-started">
-    <h2><span class="icon">👋</span> What is Mehfil?</h2>
-    <p class="lead">Mehfil is a single HTML file that runs entirely in your browser. There's no signup, no email address, no cloud account. Your messages are end-to-end encrypted and stored only on the devices of the people in your workspace.</p>
-
-    <div class="callout info">
-      <span class="icon">ℹ️</span>
-      <div>Mehfil uses <strong>Ed25519 + X25519 + AES-256-GCM</strong> via native browser Web Crypto. No third-party library touches your keys.</div>
-    </div>
-
-    <h3>How it works in one sentence</h3>
-    <p>You create a workspace → invite people → messages flow peer-to-peer over WebRTC (or via a relay you control). Nothing routes through Mehfil servers because there are none.</p>
-
-    <h3>What you need</h3>
-    <ul>
-      <li>Chrome 113+, Firefox 130+, or Safari 17+</li>
-      <li>The <code>index.html</code> file — open it directly or serve it with <code>python3 -m http.server</code></li>
-    </ul>
-  </section>
-
-  <!-- ─────────────────────────────── CREATE WORKSPACE ─── -->
-  <section id="create-workspace">
-    <h2><span class="icon">🏠</span> Create a workspace</h2>
-    <p>When you open Mehfil for the first time you see the landing screen. Click <strong>Start a workspace</strong>.</p>
-
-    <figure class="shot">
-      <img src="img/01-landing.png" alt="Mehfil landing screen">
-      <figcaption>The landing screen — your entry point every time you open Mehfil.</figcaption>
-    </figure>
-
-    <p>Give the workspace a name (this is just a label visible to members — pick anything).</p>
-
-    <figure class="shot">
-      <img src="img/02-create-workspace.png" alt="Name your workspace">
-      <figcaption>Name your workspace, then click Create workspace.</figcaption>
-    </figure>
-
-    <p>Mehfil generates a fresh Ed25519 identity for you, creates a <strong>#general</strong> channel, and drops you straight into the workspace.</p>
-
-    <figure class="shot">
-      <img src="img/14-workspace-populated.png" alt="Workspace with channels and messages">
-      <figcaption>A workspace with multiple channels and messages. Sidebar shows channels (top), people (bottom).</figcaption>
-    </figure>
-
-    <div class="callout tip">
-      <span class="icon">💡</span>
-      <div>The first thing you should do after creating a workspace is <strong>back up your identity</strong>. The backup nag banner at the top reminds you. See <a href="#backup">Backup &amp; restore</a>.</div>
-    </div>
-  </section>
-
-  <!-- ─────────────────────────────── INVITE ─── -->
-  <section id="invite">
-    <h2><span class="icon">🔗</span> Invite someone</h2>
-    <p>Click <strong>+ Invite someone</strong> in the sidebar. You have two options:</p>
-
-    <figure class="shot">
-      <img src="img/05-invite.png" alt="Invite modal">
-      <figcaption>The invite modal. Copy the link and send it — or share the 6-word code if you have a relay set up.</figcaption>
-    </figure>
-
-    <h3>They're in the room (URL invite)</h3>
-    <ol class="steps">
-      <li>Copy the invite URL from the <em>They're in the room</em> tab and send it to your invitee via any channel (email, SMS, etc.).</li>
-      <li>They paste the URL in their browser. Both sides verify the fingerprint matches — <strong>this is the trust check, don't skip it</strong>.</li>
-      <li>They enter a name and color, click Join. A reply URL appears — they send it back to you.</li>
-      <li>You paste the reply URL and click Accept. The badge turns <strong>🟢 Live</strong> and history backfills.</li>
-    </ol>
-
-    <h3>Join by code (requires relay)</h3>
-    <p>If you have a relay configured, the modal also shows a 6-word pairing code valid for 5 minutes. Share the words verbally or via text — no URL needed.</p>
-
-    <div class="callout warn">
-      <span class="icon">⚠️</span>
-      <div>Both URLs must be exchanged — the handshake is intentionally two-way. This is what proves both parties are who they say they are.</div>
-    </div>
-  </section>
-
-  <!-- ─────────────────────────────── JOIN ─── -->
-  <section id="join">
-    <h2><span class="icon">🚪</span> Join a workspace</h2>
-    <p>From the landing screen you have three ways in:</p>
-
-    <ul>
-      <li><strong>Join a workspace</strong> — paste an invite URL someone sent you.</li>
-      <li><strong>Join by code</strong> — enter a 6-word code shared by the workspace admin.</li>
-      <li><strong>I have a backup file</strong> — restore a <code>.mehfil-key</code> you exported from another device.</li>
-    </ul>
-
-    <figure class="shot">
-      <img src="img/12-join-by-code.png" alt="Join by code modal">
-      <figcaption>Join by code — enter the 6 words separated by spaces.</figcaption>
-    </figure>
-  </section>
-
-  <!-- ─────────────────────────────── CHANNELS ─── -->
-  <section id="channels">
-    <h2><span class="icon">#</span> Channels</h2>
-    <p>Channels are the main places for conversation. <strong>#general</strong> is created automatically. Use the <strong>+</strong> button next to the CHANNELS heading to create more.</p>
-
-    <figure class="shot">
-      <img src="img/06-create-channel.png" alt="Create channel modal">
-      <figcaption>Create a channel — give it a name (lowercase letters, numbers, hyphens), an optional topic, and choose public or private.</figcaption>
-    </figure>
-
-    <h3>Public vs private</h3>
-    <ul>
-      <li><strong>Public channels</strong> — all workspace members can see and join.</li>
-      <li><strong>Private channels 🔒</strong> — only invited members can decrypt messages. The channel key is wrapped individually per-member via X25519 ECDH.</li>
-      <li><strong>Announcement channels 📢</strong> — only owners and admins can post; everyone else reads. Useful for company-wide updates where replies would be noise. See <a href="#announce">Announcement channels</a>.</li>
-    </ul>
-
-    <h3>Channel topic</h3>
-    <p>Each channel can carry a short topic that renders next to the channel name in the header. Set it in the create-channel form, or at any time with the <code>/topic &lt;text&gt;</code> slash command (owner/admin only). Topics sync to every member live via the Yjs workspace doc — no reload needed.</p>
-
-    <h3>Jumping around</h3>
-    <ul>
-      <li><kbd>⌘</kbd>+<kbd>K</kbd> — quick switcher (channels, DMs, people). See <a href="#switcher">⌘K quick switcher</a>.</li>
-      <li><kbd>⌘</kbd>+<kbd>1</kbd>–<kbd>9</kbd> — switch to a recent workspace by position.</li>
-      <li><kbd>⌘</kbd>+<kbd>T</kbd> — back to the workspace picker.</li>
-    </ul>
-  </section>
-
-  <!-- ─────────────────────────────── MESSAGING ─── -->
-  <section id="messaging">
-    <h2><span class="icon">💬</span> Messaging</h2>
-
-    <figure class="shot">
-      <img src="img/04-workspace-messages.png" alt="Messages in a channel">
-      <figcaption>Messages in #general. Every envelope is signed and padded to 1 KB before leaving your device.</figcaption>
-    </figure>
-
-    <h3>Compose</h3>
-    <ul>
-      <li><kbd>Enter</kbd> — send message</li>
-      <li><kbd>Shift</kbd>+<kbd>Enter</kbd> — new line</li>
-      <li>Type <kbd>@</kbd> to mention someone — an autocomplete popup appears</li>
-      <li>Click the 📎 button or drag-and-drop a file to attach (up to 25 MB)</li>
-    </ul>
-
-    <h3>Message actions</h3>
-    <p>Hover any message to reveal its actions at the top right. Not every action is on every message — some are author-only, some depend on context.</p>
-    <ul>
-      <li>😊 — open the reaction picker (<code>👍 ❤️ 😂 😮 😢 🙏 👀 ✅</code>). Click any existing pill to toggle your reaction on/off.</li>
-      <li>💬 — open a thread panel on the right. Replies stay attached to the parent. <kbd>Esc</kbd> closes the panel.</li>
-      <li>📌 — pin / unpin the message. Pinned messages show a subtle tint in the channel, a 📌 next to the timestamp, and are listed in a modal via the channel-header pill. See <a href="#pins">Pinned messages</a>.</li>
-      <li>📨 — forward to another channel. See <a href="#permalinks">Permalinks &amp; forward</a>.</li>
-      <li>✎ — edit (only on your own non-attachment messages). Press <kbd>↑</kbd> in an empty composer as a shortcut to edit your last message in the channel.</li>
-      <li>🗑 — delete (only on your own messages). Leaves a tombstone so peers see the message was removed.</li>
-    </ul>
-
-    <h3>Copy a permalink</h3>
-    <p>Click any message's timestamp to copy a <code>#msg/&lt;ws&gt;/&lt;ch&gt;/&lt;id&gt;</code> deep link. Pasting one into your address bar opens the right workspace, switches channel, scrolls to the message, and flashes it. See <a href="#permalinks">Permalinks &amp; forward</a>.</p>
-
-    <h3>@mentions &amp; groups</h3>
-    <p>Type <kbd>@</kbd> and start typing a name — an autocomplete popup shows matching members and user groups. Mentioning <code>@groupname</code> notifies every member of that group. See <a href="#groups">User groups</a>.</p>
-
-    <h3>Drafts</h3>
-    <p>Unfinished messages are saved per-channel automatically and restored the next time you open that channel — even after a page reload.</p>
-  </section>
-
-  <!-- ─────────────────────────────── DMs ─── -->
-  <section id="dms">
-    <h2><span class="icon">✉️</span> Direct messages</h2>
-
-    <h3>1:1 DMs</h3>
-    <p>Click any member's name in the People sidebar to open a direct message. The channel id is deterministically derived from your two identities — no setup needed.</p>
-
-    <h3>Group DMs</h3>
-    <p>Click <strong>+ Start group DM</strong> at the bottom of the People sidebar (visible when there are 3+ members). Pick two or more people and a group DM channel is created with per-sender encrypted keys.</p>
-
-    <div class="callout info">
-      <span class="icon">ℹ️</span>
-      <div>Group DMs use <strong>per-sender keys</strong>: each participant encrypts their messages under their own AES key (wrapped for every other member). Removing someone from a group DM only retires their key — other members' keys are untouched.</div>
-    </div>
-  </section>
-
-  <!-- ─────────────────────────────── ATTENTION ─── -->
-  <section id="attention">
-    <h2><span class="icon">🔔</span> Staying on top</h2>
-    <p class="lead">Channels you haven't visited fill up while you're away. Mehfil surfaces what you missed with sidebar badges, an inline "New" divider, and optional desktop notifications — and lets you tune the noise per channel.</p>
-
-    <figure class="shot">
-      <img src="img/20-sidebar-badges.png" alt="Sidebar showing unread badges and custom statuses">
-      <figcaption>The sidebar summarises what's new. <code>announcements</code> has one <strong>@mention</strong> (purple badge), <code>design-review</code> has 2 unread (neutral badge) and is muted (🔕). People show custom statuses inline.</figcaption>
-    </figure>
-
-    <h3>Unread state</h3>
-    <ul>
-      <li><strong>Bold channel name + count badge</strong> in the sidebar when messages have arrived since your last visit.</li>
-      <li><strong>Purple <code>@N</code> badge</strong> — one or more of those unread messages mentions you directly.</li>
-      <li><strong>"New" divider</strong> — the first time you open a channel with unread messages, the message list shows a labelled divider above the first one you haven't seen, and the view scrolls there instead of the bottom.</li>
-    </ul>
-
-    <figure class="shot">
-      <img src="img/21-unread-divider.png" alt="Message list with 'New' divider">
-      <figcaption>The "New" divider stays anchored during a visit so new arrivals appear below it without hopping around. When you leave the channel, the marker bumps forward and the divider is gone next time.</figcaption>
-    </figure>
-
-    <h3>Desktop notifications</h3>
-    <p>Open <strong>Settings → Workspace</strong> and click <em>Enable browser notifications</em> the first time. Mehfil asks your browser for permission — no third-party notification service is involved. Notifications only fire while the Mehfil tab is open; there is no push server.</p>
-
-    <figure class="shot">
-      <img src="img/31-notifications-settings.png" alt="Settings → Workspace → Notifications">
-      <figcaption>Per-workspace notification controls. Workspace-wide <strong>Do Not Disturb</strong> silences everything except @mentions; the <strong>Muted channels</strong> list silences specific channels the same way.</figcaption>
-    </figure>
-
-    <ul>
-      <li><strong>Mute a channel</strong> — tick the checkbox in Settings, or run <code>/mute</code> / <code>/unmute</code> in the channel itself, or press <kbd>⌘</kbd>+<kbd>⇧</kbd>+<kbd>M</kbd>. Muted channels show a 🔕 in the sidebar.</li>
-      <li><strong>Workspace-wide DND</strong> — tick <em>Do Not Disturb</em>, or run <code>/dnd</code>, or press <kbd>⌘</kbd>+<kbd>⇧</kbd>+<kbd>D</kbd>.</li>
-      <li><strong>@mentions always break through</strong> mute and DND so urgent pings never silently disappear.</li>
-    </ul>
-
-    <div class="callout info">
-      <span class="icon">ℹ️</span>
-      <div>Mehfil only notifies for messages that arrived <em>live</em>. When you reconnect after being offline, the backlog is quiet — you see the badges but your speakers stay silent.</div>
-    </div>
-  </section>
-
-  <!-- ─────────────────────────────── PINS ─── -->
-  <section id="pins">
-    <h2><span class="icon">📌</span> Pinned messages</h2>
-    <p class="lead">Every channel has a list of pinned messages that's visible to every member. Pin things you'll want to come back to — a spec link, a decision, the Friday standup template.</p>
-
-    <figure class="shot">
-      <img src="img/22-channel-topic-pins.png" alt="Channel with topic and pinned message indicator">
-      <figcaption>The channel header shows the topic (left) and a <strong>📌 1 pinned</strong> pill (right). The pinned message gets a subtle tint and a 📌 next to its timestamp.</figcaption>
-    </figure>
-
-    <ul>
-      <li><strong>Pin</strong> — hover a message and click 📌. Any member can pin.</li>
-      <li><strong>See all pins</strong> — click the pill in the channel header, or press <kbd>⌘</kbd>+<kbd>⇧</kbd>+<kbd>P</kbd>, or type <code>/pins</code>.</li>
-    </ul>
-
-    <figure class="shot">
-      <img src="img/23-pins-modal.png" alt="Pins modal with Jump and Unpin actions">
-      <figcaption>The pins modal lists every pinned message newest-first. <strong>Jump</strong> scrolls to the message and flashes it briefly. <strong>Unpin</strong> removes it for everyone in the channel.</figcaption>
-    </figure>
-
-    <div class="callout info">
-      <span class="icon">ℹ️</span>
-      <div>Pins live in the workspace's Yjs doc, so they sync to every member the same way the channel list does. No new envelope type, and new peers see the up-to-date pin list the moment they join.</div>
-    </div>
-  </section>
-
-  <!-- ─────────────────────────────── QUICK SWITCHER ─── -->
-  <section id="switcher">
-    <h2><span class="icon">⌘K</span> Quick switcher</h2>
-    <p class="lead">Press <kbd>⌘</kbd>+<kbd>K</kbd> (or <kbd>Ctrl</kbd>+<kbd>K</kbd>) anywhere in the app to open a unified palette for jumping between channels, DMs, and people.</p>
-
-    <figure class="shot">
-      <img src="img/26-quick-switcher.png" alt="Quick switcher palette">
-      <figcaption>The switcher filters by substring as you type. Prefix matches rank first. Members without an existing DM show as <em>Start a DM</em> rows.</figcaption>
-    </figure>
-
-    <ul>
-      <li>Type any part of a channel, person, or DM name to filter.</li>
-      <li><kbd>↑</kbd> <kbd>↓</kbd> to navigate, <kbd>Enter</kbd> to jump, <kbd>Esc</kbd> to close.</li>
-      <li>Picking a member without an existing DM starts one — no extra step.</li>
-      <li>A "Search messages for '…'" fallback row at the bottom escapes into the message search (<kbd>⌘</kbd>+<kbd>⇧</kbd>+<kbd>F</kbd>) carrying your query.</li>
-    </ul>
-  </section>
-
-  <!-- ─────────────────────────────── SEARCH ─── -->
-  <section id="search">
-    <h2><span class="icon">🔍</span> Message search</h2>
-    <p>Press <kbd>⌘</kbd>+<kbd>⇧</kbd>+<kbd>F</kbd> (or <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>F</kbd>) to open the message search palette. It searches every message in every workspace you've joined, not just the current one.</p>
-
-    <figure class="shot">
-      <img src="img/07-search.png" alt="Search palette">
-      <figcaption>Results update as you type, grouped by workspace when there are multiple.</figcaption>
-    </figure>
-
-    <h3>Filters</h3>
-    <ul>
-      <li><code>from:alice</code> — messages from a specific person</li>
-      <li><code>in:#design</code> — messages in a specific channel</li>
-      <li>Combine both: <code>from:alice in:#design</code></li>
-    </ul>
-
-    <p>Click any result to jump directly to that message. You can also open the search from the composer with <code>/search &lt;query&gt;</code>.</p>
-  </section>
-
-  <!-- ─────────────────────────────── PERMALINKS + FORWARD ─── -->
-  <section id="permalinks">
-    <h2><span class="icon">🔗</span> Permalinks &amp; forward</h2>
-
-    <h3>Copy a message link</h3>
-    <p>Every message timestamp is clickable. Clicking copies a <code>#msg/&lt;ws&gt;/&lt;ch&gt;/&lt;id&gt;</code> deep link to your clipboard. Paste it in a PR, a note, or another chat — opening it later takes the recipient straight to the message.</p>
-
-    <p>On open, Mehfil opens the target workspace, switches to the channel, scrolls the message into view, and flashes it briefly. The link has no querystring — everything lives in the URL fragment, so no server ever sees which message you're referencing.</p>
-
-    <h3>Forward to another channel</h3>
-    <p>Hover any message and click 📨 to open the forward picker.</p>
-
-    <figure class="shot">
-      <img src="img/28-forward-modal.png" alt="Forward modal with destination list">
-      <figcaption>Pick any channel or DM other than the source. The target composer is prefilled as an attributed markdown blockquote; you review and hit <kbd>Enter</kbd> to actually send — forwarding never auto-sends.</figcaption>
-    </figure>
-  </section>
-
-  <!-- ─────────────────────────────── SLASH COMMANDS ─── -->
-  <section id="slash">
-    <h2><span class="icon">/</span> Slash commands</h2>
-    <p class="lead">Type <code>/</code> at the start of the composer to summon a command picker. Tab-accept the one you want, add any arguments, hit Enter.</p>
-
-    <figure class="shot">
-      <img src="img/24-slash-autocomplete.png" alt="Slash command autocomplete popup">
-      <figcaption>The autocomplete popup above the composer. <kbd>↑</kbd> <kbd>↓</kbd> navigate, <kbd>Tab</kbd> accepts, <kbd>Esc</kbd> dismisses. Unknown commands flash an inline error instead of being sent.</figcaption>
-    </figure>
-
-    <h3>Reference</h3>
-    <p>Open the reference any time with <code>/help</code>.</p>
-
-    <figure class="shot">
-      <img src="img/25-slash-help.png" alt="Slash command reference modal">
-      <figcaption>The <code>/help</code> modal lists every command with its usage and summary. <code>/call</code> and <code>/huddle</code> are aliases.</figcaption>
-    </figure>
-
-    <ul>
-      <li><code>/me &lt;action&gt;</code> — send an italic third-person action</li>
-      <li><code>/shrug [text]</code> — append ¯\_(ツ)_/¯</li>
-      <li><code>/dm @name</code> — jump to (or open) a 1:1 DM</li>
-      <li><code>/goto #name</code> — jump to a channel</li>
-      <li><code>/mute</code> / <code>/unmute</code> — toggle mute on the current channel</li>
-      <li><code>/dnd [on|off]</code> — toggle workspace Do Not Disturb</li>
-      <li><code>/pins</code> — show pinned messages for the current channel</li>
-      <li><code>/invite</code> — open the invite panel</li>
-      <li><code>/call</code> (aka <code>/huddle</code>) — start a huddle</li>
-      <li><code>/search [query]</code> — open message search</li>
-      <li><code>/topic &lt;text&gt;</code> — set the channel topic (owner/admin)</li>
-      <li><code>/help</code> — this reference</li>
-    </ul>
-  </section>
-
-  <!-- ─────────────────────────────── KEYBOARD SHORTCUTS ─── -->
-  <section id="shortcuts">
-    <h2><span class="icon">⌨️</span> Keyboard shortcuts</h2>
-    <p>Press <kbd>?</kbd> when no input is focused, or <kbd>⌘</kbd>+<kbd>/</kbd> anywhere, to see the full list.</p>
-
-    <figure class="shot">
-      <img src="img/27-keyboard-shortcuts.png" alt="Keyboard shortcuts help overlay">
-      <figcaption>The full shortcut reference, grouped by category. ⌘ on macOS, Ctrl on Windows/Linux.</figcaption>
-    </figure>
-
-    <div class="cols">
-      <div>
-        <h3>Navigate</h3>
-        <ul>
-          <li><kbd>⌘K</kbd> — quick switcher</li>
-          <li><kbd>⌘⇧F</kbd> — message search</li>
-          <li><kbd>⌘T</kbd> — back to workspace picker</li>
-          <li><kbd>⌘1</kbd>–<kbd>⌘9</kbd> — recent workspace by position</li>
-        </ul>
-        <h3>Channel</h3>
-        <ul>
-          <li><kbd>⌘⇧P</kbd> — show pinned messages</li>
-          <li><kbd>⌘⇧M</kbd> — mute / unmute current channel</li>
-        </ul>
-      </div>
-      <div>
-        <h3>Workspace</h3>
-        <ul>
-          <li><kbd>⌘,</kbd> — open settings</li>
-          <li><kbd>⌘⇧D</kbd> — toggle Do Not Disturb</li>
-        </ul>
-        <h3>Composer</h3>
-        <ul>
-          <li><kbd>↑</kbd> (empty composer) — edit your last message</li>
-          <li><kbd>Shift</kbd>+<kbd>Enter</kbd> — new line</li>
-          <li><kbd>/help</kbd> — slash command reference</li>
-        </ul>
-        <h3>Misc</h3>
-        <ul>
-          <li><kbd>?</kbd> / <kbd>⌘/</kbd> — this help overlay</li>
-          <li><kbd>Esc</kbd> — close overlays and pickers</li>
-        </ul>
-      </div>
-    </div>
-  </section>
-
-  <!-- ─────────────────────────────── IDENTITY ─── -->
-  <section id="identity">
-    <h2><span class="icon">🔑</span> Your identity</h2>
-    <p>Mehfil generates an <strong>Ed25519 signing key</strong> and an <strong>X25519 ECDH key</strong> the first time you start a workspace. These live in your browser's IndexedDB — not in any cloud.</p>
-
-    <figure class="shot">
-      <img src="img/08-settings-identity.png" alt="Settings — Identity tab">
-      <figcaption>Settings → Identity: your fingerprint and backup status.</figcaption>
-    </figure>
-
-    <h3>Fingerprint</h3>
-    <p>Your fingerprint is a short hex digest of your public key. When you invite someone, <strong>both sides must verify the fingerprint matches</strong> before trusting the connection. This is the TOFU (trust-on-first-use) check that prevents impersonation.</p>
-  </section>
-
-  <!-- ─────────────────────────────── CUSTOM STATUS ─── -->
-  <section id="status">
-    <h2><span class="icon">🎯</span> Custom status</h2>
-    <p class="lead">Let teammates know what you're up to without sending a message. Status is an emoji + short text attached to your presence, broadcast over the same encrypted <code>presence.update</code> envelope your online/away state uses.</p>
-
-    <p>Click your name and avatar in the sidebar footer (bottom left) to open the status picker.</p>
-
-    <figure class="shot">
-      <img src="img/29-custom-status.png" alt="Custom status picker modal">
-      <figcaption>Emoji + text, with preset shortcuts like 📅 In a meeting, 🎯 Focused, 🚗 Commuting. Clicking a preset fills the form — tweak the text before saving if you want to.</figcaption>
-    </figure>
-
-    <ul>
-      <li>Status persists on your identity record and survives a browser reload — you don't have to re-set it every session.</li>
-      <li>Other members see your status under your name in the People sidebar and in their tooltip.</li>
-      <li>Click <strong>Clear status</strong> in the picker to remove it.</li>
-    </ul>
-  </section>
-
-  <!-- ─────────────────────────────── BACKUP ─── -->
-  <section id="backup">
-    <h2><span class="icon">💾</span> Backup &amp; restore</h2>
-    <p>Your identity key never leaves the browser unless <em>you</em> export it. Go to <strong>Settings → Identity → Back up identity</strong>.</p>
-
-    <ul>
-      <li>You'll be asked to set a passphrase. The key is encrypted with PBKDF2 (600,000 rounds) → AES-256-GCM before download.</li>
-      <li>The file is named <code>mehfil-identity.mehfil-key</code> — store it somewhere safe.</li>
-    </ul>
-
-    <h3>Restore from backup</h3>
-    <p>On the landing screen, click <strong>I have a backup file</strong>, choose the file, and enter your passphrase.</p>
-
-    <figure class="shot">
-      <img src="img/13-restore-backup.png" alt="Restore from backup modal">
-      <figcaption>Restore a .mehfil-key file — enter your passphrase to decrypt and import your identity.</figcaption>
-    </figure>
-
-    <div class="callout warn">
-      <span class="icon">⚠️</span>
-      <div>If you lose your identity key <em>and</em> your backup, your messages are permanently unreadable. There is no password reset. Back up early.</div>
-    </div>
-  </section>
-
-  <!-- ─────────────────────────────── DEVICES ─── -->
-  <section id="devices">
-    <h2><span class="icon">📱</span> Multiple devices</h2>
-    <p>One identity, any number of devices. Go to <strong>Settings → Devices</strong>.</p>
-
-    <figure class="shot">
-      <img src="img/10-settings-devices.png" alt="Settings — Devices tab">
-      <figcaption>Settings → Devices: your current device, paired devices, and the Pair a new device button.</figcaption>
-    </figure>
-
-    <h3>Pair a new device</h3>
-    <ol class="steps">
-      <li>On the existing device: Settings → Devices → <strong>+ Pair a new device</strong>. A 6-word pairing code appears (valid 5 minutes). Requires a relay to be configured.</li>
-      <li>On the new device: open Mehfil, click <strong>Add this device to an existing identity</strong> on the landing screen, and enter the 6 words.</li>
-      <li>Both devices show a trust card — verify the short code matches, then confirm.</li>
-      <li>The new device imports your identity and all workspace keys automatically.</li>
-    </ol>
-
-    <h3>Revoking a device</h3>
-    <p>In Settings → Devices, click <strong>Revoke</strong> next to any paired device. You can also revoke your own current device (you'll be shown a "Device revoked" screen and all local keys are wiped). Workspace admins can also revoke any device in the Admin tab.</p>
-
-    <div class="callout info">
-      <span class="icon">ℹ️</span>
-      <div>Device pairing uses ephemeral X25519 ECDH — the key bundle travels encrypted over the relay and the pairing code is single-use.</div>
-    </div>
-  </section>
-
-  <!-- ─────────────────────────────── ADMIN ─── -->
-  <section id="admin">
-    <h2><span class="icon">🛡️</span> Admin controls</h2>
-    <p>Open <strong>Settings → Admin</strong> (visible to owners and admins).</p>
-
-    <figure class="shot">
-      <img src="img/11-settings-admin.png" alt="Settings — Admin tab">
-      <figcaption>Settings → Admin: member list with promote and remove controls.</figcaption>
-    </figure>
-
-    <h3>Role badges</h3>
-    <p>Owners and admins show a coloured role badge in the People sidebar. To propose promoting a member to admin, click the <strong>★</strong> button that appears on their row — the proposal is sent to the Admin tab for other admins to co-sign.</p>
-
-    <h3>Promote by consensus</h3>
-    <p>Promoting a member to admin requires <strong>2 co-signatures</strong> from existing admins/owners. This prevents a single compromised account from silently escalating privileges.</p>
-
-    <ol class="steps">
-      <li>Any admin clicks ★ on a member row (or Promote… in the Admin tab).</li>
-      <li>A pending proposal appears in the Admin tab for all other admins.</li>
-      <li>A second admin clicks <strong>Support</strong>. Once the threshold is reached, click <strong>Activate</strong> to finalise.</li>
-    </ol>
-
-    <h3>Remove a member</h3>
-    <p>Click <strong>Remove</strong> in the Admin tab. This triggers a full workspace + channel rekey so the removed member's keys become useless for future messages.</p>
-
-    <h3>Export &amp; import</h3>
-    <p>In <strong>Settings → Workspace</strong> you can export the entire workspace as an encrypted <code>.workspace</code> file (all messages, channels, members, keys) and import it on another device.</p>
-
-    <figure class="shot">
-      <img src="img/09-settings-workspace.png" alt="Settings — Workspace tab">
-      <figcaption>Settings → Workspace: rename, relay config, notification settings, export, and import.</figcaption>
-    </figure>
-  </section>
-
-  <!-- ─────────────────────────────── ANNOUNCEMENT CHANNELS ─── -->
-  <section id="announce">
-    <h2><span class="icon">📢</span> Announcement channels</h2>
-    <p class="lead">A regular public channel where <em>only owners and admins can post</em>. Everyone else reads. Good for company-wide updates, policy notices, or cross-team broadcasts where replies would be noise.</p>
-
-    <h3>Creating one</h3>
-    <p>In the <strong>+ Create channel</strong> form, tick the <em>Announcement channel</em> box. It's visible to admins only — non-admins don't see the option. Announcement channels can be public or private, just like regular ones.</p>
-
-    <h3>What non-admins see</h3>
-    <figure class="shot">
-      <img src="img/30-announcement-channel.png" alt="Announcement channel with read-only banner">
-      <figcaption>Non-admins see a 📢 icon in the sidebar and a read-only banner where the composer would be. Admins get the normal composer.</figcaption>
-    </figure>
-
-    <div class="callout info">
-      <span class="icon">ℹ️</span>
-      <div><strong>Sender gate + receiver drop.</strong> Mehfil refuses to send on the author's side and drops incoming messages from non-admins on the receive side, with role computed against the live membership — so a demoted admin's in-flight posts stop appearing on peers as soon as the demotion arrives.</div>
-    </div>
-  </section>
-
-  <!-- ─────────────────────────────── USER GROUPS ─── -->
-  <section id="groups">
-    <h2><span class="icon">👥</span> User groups</h2>
-    <p class="lead">Named sets of members. Mention <code>@engineering</code> in a message and every person in the group gets the mention — badge, notification, the works.</p>
-
-    <h3>Managing groups</h3>
-    <p>Open <strong>Settings → Admin → User groups</strong> (admin-only).</p>
-
-    <figure class="shot">
-      <img src="img/32-user-groups-admin.png" alt="User groups admin panel">
-      <figcaption>Create a group with a short name and a member picker. Delete removes the group but keeps the effect of past <code>@groupname</code> mentions — they were already signed into their messages' <code>mentions</code> lists.</figcaption>
-    </figure>
-
-    <h3>Mentioning a group</h3>
-    <p>Type <kbd>@</kbd> and start the group name; the autocomplete surfaces groups alongside members, with the group's size shown (e.g. <em>engineering · group of 3</em>). On send, the group expands to its members' user ids in the signed <code>mentions</code> list — every member is notified.</p>
-
-    <figure class="shot">
-      <img src="img/33-group-mention.png" alt="Message with group mention pill">
-      <figcaption>Group mentions render as an accent-colored pill. The pill has a solid background when the viewer is a member of the group.</figcaption>
-    </figure>
-
-    <div class="callout info">
-      <span class="icon">ℹ️</span>
-      <div>Groups live in the workspace's Yjs doc, so membership syncs automatically via <code>workspace.patch</code>. No new envelope type, no privileged distribution — every member can see the group list and roster.</div>
-    </div>
-  </section>
-
-  <!-- ─────────────────────────────── RELAY ─── -->
-  <section id="relay">
-    <h2><span class="icon">☁️</span> Relay setup</h2>
-    <p>By default Mehfil is peer-to-peer over WebRTC — both people need to be online at the same time. A <strong>relay</strong> adds store-and-forward so messages are delivered even when someone is offline.</p>
-
-    <h3>Deploy in 5 minutes (Cloudflare Workers, free tier)</h3>
-    <pre style="background:#f3f4f6;border:1px solid var(--border);border-radius:8px;padding:16px;font-size:13px;overflow-x:auto;line-height:1.6;margin:14px 0;"><code>git clone https://github.com/NakliTechie/relay-cloudflare
-cd relay-cloudflare
-wrangler kv namespace create MEHFIL_KV   # paste the id into wrangler.toml
-wrangler secret put MEHFIL_TOKEN         # choose a long random token
-wrangler deploy</code></pre>
-
-    <p>Then in Mehfil: <strong>Settings → Workspace → Relays → + Add relay</strong>. Enter the URL and token, click Test connection.</p>
-
-    <div class="callout tip">
-      <span class="icon">💡</span>
-      <div>The relay stores only padded ciphertext — it has no keys and cannot read your messages. Envelopes are automatically deleted after 90 days.</div>
-    </div>
-
-    <p>Full setup guide: <a href="../docs/relay-setup.md">docs/relay-setup.md</a></p>
-  </section>
-
-  <!-- ─────────────────────────────── BRIDGE ─── -->
-  <section id="bridge">
-    <h2><span class="icon">🌐</span> LAN bridge</h2>
-    <p>The <strong>Mehfil Bridge</strong> is a small Go binary that runs on any always-on machine in your office or home. It buffers 24 hours of messages locally with no cloud involved.</p>
-
-    <pre style="background:#f3f4f6;border:1px solid var(--border);border-radius:8px;padding:16px;font-size:13px;overflow-x:auto;line-height:1.6;margin:14px 0;"><code># macOS (Homebrew)
-brew install naklitechie/tap/mehfil-bridge
-mehfil-bridge
-# prints: Bridge fingerprint: a3f8 92c1 5b04 e7d2</code></pre>
-
-    <p>In Mehfil: <strong>Settings → Workspace → LAN Bridge → + Add bridge</strong>, then click <strong>Auto-detect</strong>. Confirm the fingerprint matches your terminal output.</p>
-
-    <div class="callout info">
-      <span class="icon">ℹ️</span>
-      <div>The bridge announces itself via mDNS (<code>_mehfil._tcp.local</code>, port 8765) so Mehfil finds it automatically on the same LAN. The fingerprint is pinned on first connect — if it ever changes unexpectedly, Mehfil refuses to connect.</div>
-    </div>
-
-    <p>Full setup guide including launchd / systemd configs: <a href="../docs/bridge-setup.md">docs/bridge-setup.md</a></p>
-  </section>
-
-  <!-- ─────────────────────────────── HUDDLES ─── -->
-  <section id="huddles">
-    <h2><span class="icon">🎙</span> Huddles</h2>
-    <p class="lead">A huddle is a live audio call inside a workspace. Anyone online can start one and anyone else can jump in — no scheduling, no meeting link, no third-party service. Audio travels directly peer-to-peer, encrypted end-to-end.</p>
-
-    <h3>Starting a huddle</h3>
-    <ol class="steps">
-      <li>Click the <strong>🎙</strong> button in the bottom-left corner of the sidebar (next to the settings gear).</li>
-      <li>Your browser asks for microphone permission — allow it.</li>
-      <li>A <strong>huddle bar</strong> appears above the message composer, showing your avatar. You're live.</li>
-    </ol>
-
-    <div class="callout tip">
-      <span class="icon">💡</span>
-      <div>The 🎙 button turns <span style="color:#22c55e;font-weight:600;">green</span> whenever you're in a huddle. Click it again to leave instantly.</div>
-    </div>
-
-    <h3>Joining someone else's huddle</h3>
-    <p>When another member starts a huddle, you'll see their avatar appear in the huddle bar at the bottom of the screen. Click <strong>🎙</strong> to join. Your browser will ask for mic permission if it hasn't already.</p>
-    <p>Connections form automatically — you don't need to do anything beyond clicking join. Within a couple of seconds, audio is flowing directly between everyone in the call.</p>
-
-    <h3>Controls</h3>
-    <ul>
-      <li><strong>🎤 Mute / unmute</strong> — the mic button in the huddle bar. When muted your avatar dims and no audio is sent. Your connection stays open so you can unmute any time.</li>
-      <li><strong>Leave</strong> — the Leave button closes all your audio connections and removes you from the bar for everyone else.</li>
-    </ul>
-
-    <h3>Speaking indicators</h3>
-    <p>Each participant's avatar shows a <strong>pulsing ring</strong> when they're actively speaking. This is driven by a volume analyser on the incoming audio — no voice-activity algorithm, just raw mic level sampled every 150 ms. It disappears immediately when the person stops talking.</p>
-
-    <h3>How it works under the hood</h3>
-    <p>Huddles use <strong>WebRTC</strong> — the same browser technology used for video calls in Google Meet or Zoom, but here it's audio-only and entirely within Mehfil. When you join, Mehfil broadcasts an encrypted <em>huddle.join</em> envelope to every connected member. Each person already in the call responds with a WebRTC offer — a "here's how to reach me" packet. You exchange answers, then ICE candidates (possible network paths) trickle in until a direct route is found. The result is a mesh: with three people in a call there are three separate audio connections, A↔B, A↔C, B↔C.</p>
-    <p>The signaling (offers, answers, ICE) uses the same encrypted envelope system as messages, so it's protected by your workspace key. The audio itself is encrypted by WebRTC's mandatory DTLS-SRTP — standard in all modern browsers.</p>
-
-    <div class="callout info">
-      <span class="icon">ℹ️</span>
-      <div><strong>No audio ever touches a server.</strong> The relay and bridge are for message delivery only. Huddle audio is always direct, browser-to-browser, over an encrypted peer-to-peer connection.</div>
-    </div>
-
-    <h3>Limitations</h3>
-    <ul>
-      <li><strong>Live only:</strong> huddles are ephemeral — nothing is recorded or stored. If you reload the page, you'll need to rejoin.</li>
-      <li><strong>Online peers only:</strong> because audio is peer-to-peer, you can only hear members who are currently connected. The relay doesn't buffer audio.</li>
-      <li><strong>Restrictive networks:</strong> on very locked-down corporate networks where WebRTC is blocked, the audio connection may not establish. Message delivery (via relay/bridge) is unaffected.</li>
-      <li><strong>Mobile:</strong> works in Chrome on Android. iOS Safari has partial WebRTC audio support — behaviour varies by iOS version. A relay is recommended for mobile users so messages aren't missed while the tab is in the background.</li>
-    </ul>
-  </section>
-
-  <!-- ─────────────────────────────── MOBILE ─── -->
-  <section id="mobile">
-    <h2><span class="icon">📲</span> Using Mehfil on mobile</h2>
-    <p class="lead">Mehfil runs in any modern mobile browser — no app store required. Open <code>index.html</code> from a local server on your network, or visit your GitHub Pages URL from your phone.</p>
-
-    <div class="callout tip">
-      <span class="icon">💡</span>
-      <div>On iOS, tap the Share button in Safari and choose <strong>Add to Home Screen</strong> to pin Mehfil as a standalone app icon. On Android, Chrome shows an "Add to Home screen" banner automatically.</div>
-    </div>
-
-    <h3>Getting the app on your phone</h3>
-    <ol class="steps">
-      <li>Run <code>python3 -m http.server 8103</code> on your laptop (or use the GitHub Pages URL).</li>
-      <li>Find your laptop's local IP address (<code>ifconfig</code> / System Settings → Wi-Fi).</li>
-      <li>On your phone — same Wi-Fi — open <code>http://192.168.x.x:8103</code> in the browser.</li>
-      <li>Optionally: save to home screen for a full-screen app experience.</li>
-    </ol>
-
-    <h3>Joining an existing workspace on mobile</h3>
-    <p>The easiest path is a <strong>6-word pairing code</strong> from the desktop. No URLs to copy-paste between devices.</p>
-    <ol class="steps">
-      <li>On your desktop: Settings → Devices → <strong>+ Pair a new device</strong>. Six words appear.</li>
-      <li>On your phone: tap <strong>Add this device to an existing identity</strong> on the landing screen, type the six words, tap Join.</li>
-      <li>Confirm the trust card matches on both screens. Your identity and all workspace keys transfer automatically.</li>
-    </ol>
-
-    <p>Alternatively, if someone is inviting you fresh: tap <strong>Join by code</strong> on the landing screen and enter the invite code your workspace admin shared.</p>
-
-    <h3>Mobile-specific tips</h3>
-    <ul>
-      <li><strong>Composer:</strong> tap the text area to open the keyboard. Tap Send (or press Return on hardware keyboards with "Return sends" enabled).</li>
-      <li><strong>Sidebar:</strong> on narrow screens the sidebar is hidden by default — tap the <strong>☰</strong> button (top-left) in the guide, or the channel/person name in the header to navigate.</li>
-      <li><strong>File attachments:</strong> tap 📎 to open the system photo picker or file browser. The 25 MB limit applies on mobile too.</li>
-      <li><strong>Reactions, threads, forward, pin:</strong> tap-and-hold a message (or tap it, then tap the action icons that appear) to reach the action row.</li>
-      <li><strong>Slash commands:</strong> work normally — type <code>/</code> in the composer to summon the autocomplete.</li>
-      <li><strong>Quick switcher:</strong> no <kbd>⌘K</kbd> without a hardware keyboard — tap the workspace name or channel header to open navigation.</li>
-      <li><strong>Notifications:</strong> browser-level notifications only fire while Mehfil is the active tab. On iOS Safari you may also need to grant notification permission via the browser settings.</li>
-      <li><strong>WebRTC peer connections:</strong> work normally on mobile Chrome and Safari. If you're on a restrictive network, configure a relay so messages route via the cloud instead.</li>
-    </ul>
-
-    <h3>Limitations on mobile</h3>
-    <ul>
-      <li><strong>Background sync:</strong> iOS Safari aggressively suspends tabs. If you close the browser, you won't receive messages until you reopen it. A relay ensures nothing is lost — messages are stored until your device polls.</li>
-      <li><strong>Push notifications:</strong> not yet supported. The relay buffers messages for up to 90 days; they arrive the next time you open the app.</li>
-      <li><strong>OPFS storage:</strong> file attachments are stored in the browser's Origin Private File System. On iOS this may be cleared if the browser storage is full or the OS evicts it — back up important files externally.</li>
-    </ul>
-
-    <div class="callout info">
-      <span class="icon">ℹ️</span>
-      <div>All encryption (Ed25519 + X25519 + AES-256-GCM) runs via the native Web Crypto API, which is available on all modern mobile browsers. No performance difference vs desktop for key operations.</div>
-    </div>
-  </section>
-
+<section class="grp" id="s0"><h2>Getting started</h2><p class="intro">Open Mehfil and you’re one click from a working, encrypted workspace — no account, no server, no install.</p><div class="grid"><figure class="card" data-search="getting started the landing screen every entry point in one place — start a workspace, join one, add a device, or restore a backup. no signup, no download. 01-landing">
+    <a href="screenshots/01-landing.png" target="_blank"><img loading="lazy" src="screenshots/01-landing.png" alt="The landing screen"></a>
+    <figcaption><h3>The landing screen</h3><p>Every entry point in one place — start a workspace, join one, add a device, or restore a backup. No signup, no download.</p></figcaption>
+  </figure>
+<figure class="card" data-search="getting started how it works the &quot;?&quot; explainer: no accounts, no servers, everything encrypted and stored only on members’ devices. 02-how-it-works">
+    <a href="screenshots/02-how-it-works.png" target="_blank"><img loading="lazy" src="screenshots/02-how-it-works.png" alt="How it works"></a>
+    <figcaption><h3>How it works</h3><p>The &quot;?&quot; explainer: no accounts, no servers, everything encrypted and stored only on members’ devices.</p></figcaption>
+  </figure>
+<figure class="card" data-search="getting started create a workspace name it and go — a fresh identity and root keys are generated locally in the browser, instantly. 04-create-workspace">
+    <a href="screenshots/04-create-workspace.png" target="_blank"><img loading="lazy" src="screenshots/04-create-workspace.png" alt="Create a workspace"></a>
+    <figcaption><h3>Create a workspace</h3><p>Name it and go — a fresh identity and root keys are generated locally in the browser, instantly.</p></figcaption>
+  </figure>
+<figure class="card" data-search="getting started your first workspace the empty state after creating — #general is ready, with gentle prompts to invite someone or send yourself a message. 05-workspace-firstrun">
+    <a href="screenshots/05-workspace-firstrun.png" target="_blank"><img loading="lazy" src="screenshots/05-workspace-firstrun.png" alt="Your first workspace"></a>
+    <figcaption><h3>Your first workspace</h3><p>The empty state after creating — #general is ready, with gentle prompts to invite someone or send yourself a message.</p></figcaption>
+  </figure></div></section>
+<section class="grp" id="s1"><h2>Connect your team — offline</h2><p class="intro">Mehfil’s signature: get a group talking on one WiFi or a phone hotspot with no internet at all. Invite by link or QR; peers self-organize into a mesh that survives the host leaving.</p><div class="grid"><figure class="card" data-search="connect your team — offline invite someone share a link (or qr) and compare the visual fingerprint out-of-band. works fully offline on a shared hotspot — no signaling server. 10-invite-offline">
+    <a href="screenshots/10-invite-offline.png" target="_blank"><img loading="lazy" src="screenshots/10-invite-offline.png" alt="Invite someone"></a>
+    <figcaption><h3>Invite someone</h3><p>Share a link (or QR) and compare the visual fingerprint out-of-band. Works fully offline on a shared hotspot — no signaling server.</p></figcaption>
+  </figure>
+<figure class="card" data-search="connect your team — offline join by scanning (offline) the no-internet path: scan the inviter’s qr (or paste the link) to join a workspace on the same hotspot. one scan wires you into the mesh. 03-join-by-scanning">
+    <a href="screenshots/03-join-by-scanning.png" target="_blank"><img loading="lazy" src="screenshots/03-join-by-scanning.png" alt="Join by scanning (offline)"></a>
+    <figcaption><h3>Join by scanning (offline)</h3><p>The no-internet path: scan the inviter’s QR (or paste the link) to join a workspace on the same hotspot. One scan wires you into the mesh.</p></figcaption>
+  </figure></div></section>
+<section class="grp" id="s2"><h2>Messaging</h2><p class="intro">Channels, threads, reactions, code, slash commands — the daily-driver surface.</p><div class="grid"><figure class="card" data-search="messaging channels &amp; messages the main surface — channels in the sidebar, threaded messages, code blocks, and a rich composer. 06-workspace-populated">
+    <a href="screenshots/06-workspace-populated.png" target="_blank"><img loading="lazy" src="screenshots/06-workspace-populated.png" alt="Channels &amp; messages"></a>
+    <figcaption><h3>Channels &amp; messages</h3><p>The main surface — channels in the sidebar, threaded messages, code blocks, and a rich composer.</p></figcaption>
+  </figure>
+<figure class="card" data-search="messaging reactions &amp; message actions react with any emoji; hover a message for reply, edit, pin, forward, and more. 07-message-reactions">
+    <a href="screenshots/07-message-reactions.png" target="_blank"><img loading="lazy" src="screenshots/07-message-reactions.png" alt="Reactions &amp; message actions"></a>
+    <figcaption><h3>Reactions &amp; message actions</h3><p>React with any emoji; hover a message for reply, edit, pin, forward, and more.</p></figcaption>
+  </figure>
+<figure class="card" data-search="messaging slash commands type / for an autocomplete of workflow shortcuts — /dm, /goto, /poll, /remind, /call, /search, and more. 08-slash-autocomplete">
+    <a href="screenshots/08-slash-autocomplete.png" target="_blank"><img loading="lazy" src="screenshots/08-slash-autocomplete.png" alt="Slash commands"></a>
+    <figcaption><h3>Slash commands</h3><p>Type / for an autocomplete of workflow shortcuts — /dm, /goto, /poll, /remind, /call, /search, and more.</p></figcaption>
+  </figure>
+<figure class="card" data-search="messaging create a channel public, private, announcement, or a collaborative canvas doc — with a topic and optional member picker. 09-create-channel">
+    <a href="screenshots/09-create-channel.png" target="_blank"><img loading="lazy" src="screenshots/09-create-channel.png" alt="Create a channel"></a>
+    <figcaption><h3>Create a channel</h3><p>Public, private, announcement, or a collaborative Canvas doc — with a topic and optional member picker.</p></figcaption>
+  </figure></div></section>
+<section class="grp" id="s3"><h2>Find &amp; navigate</h2><p class="intro">Keyboard-first movement across everything you’ve got.</p><div class="grid"><figure class="card" data-search="find &amp; navigate search full-text search across messages, with from: and in:# filters. local, instant, private. 11-search">
+    <a href="screenshots/11-search.png" target="_blank"><img loading="lazy" src="screenshots/11-search.png" alt="Search"></a>
+    <figcaption><h3>Search</h3><p>Full-text search across messages, with from: and in:# filters. Local, instant, private.</p></figcaption>
+  </figure>
+<figure class="card" data-search="find &amp; navigate ⌘k quick switcher jump to any channel, dm, or member — or fall through to message search — without leaving the keyboard. 12-quick-switcher">
+    <a href="screenshots/12-quick-switcher.png" target="_blank"><img loading="lazy" src="screenshots/12-quick-switcher.png" alt="⌘K quick switcher"></a>
+    <figcaption><h3>⌘K quick switcher</h3><p>Jump to any channel, DM, or member — or fall through to message search — without leaving the keyboard.</p></figcaption>
+  </figure>
+<figure class="card" data-search="find &amp; navigate keyboard shortcuts the full keymap, grouped by navigate / channel / workspace / composer — a single source of truth generated from the app. 13-shortcuts">
+    <a href="screenshots/13-shortcuts.png" target="_blank"><img loading="lazy" src="screenshots/13-shortcuts.png" alt="Keyboard shortcuts"></a>
+    <figcaption><h3>Keyboard shortcuts</h3><p>The full keymap, grouped by Navigate / Channel / Workspace / Composer — a single source of truth generated from the app.</p></figcaption>
+  </figure></div></section>
+<section class="grp" id="s4"><h2>Settings &amp; admin</h2><p class="intro">Identity, devices, transports, and running a workspace.</p><div class="grid"><figure class="card" data-search="settings &amp; admin settings · identity your profile, custom status, and the backup that’s the only way to recover your identity. 14-settings-identity">
+    <a href="screenshots/14-settings-identity.png" target="_blank"><img loading="lazy" src="screenshots/14-settings-identity.png" alt="Settings · Identity"></a>
+    <figcaption><h3>Settings · Identity</h3><p>Your profile, custom status, and the backup that’s the only way to recover your identity.</p></figcaption>
+  </figure>
+<figure class="card" data-search="settings &amp; admin settings · devices pair additional devices to the same identity, and revoke ones you’ve lost. 15-settings-devices">
+    <a href="screenshots/15-settings-devices.png" target="_blank"><img loading="lazy" src="screenshots/15-settings-devices.png" alt="Settings · Devices"></a>
+    <figcaption><h3>Settings · Devices</h3><p>Pair additional devices to the same identity, and revoke ones you’ve lost.</p></figcaption>
+  </figure>
+<figure class="card" data-search="settings &amp; admin settings · workspace notifications and dnd, relay/bridge transports for store-and-forward, and workspace-level options. 16-settings-workspace">
+    <a href="screenshots/16-settings-workspace.png" target="_blank"><img loading="lazy" src="screenshots/16-settings-workspace.png" alt="Settings · Workspace"></a>
+    <figcaption><h3>Settings · Workspace</h3><p>Notifications and DND, relay/bridge transports for store-and-forward, and workspace-level options.</p></figcaption>
+  </figure>
+<figure class="card" data-search="settings &amp; admin settings · admin member management, promote-by-consensus, and named user groups you can @mention. 17-settings-admin">
+    <a href="screenshots/17-settings-admin.png" target="_blank"><img loading="lazy" src="screenshots/17-settings-admin.png" alt="Settings · Admin"></a>
+    <figcaption><h3>Settings · Admin</h3><p>Member management, promote-by-consensus, and named user groups you can @mention.</p></figcaption>
+  </figure></div></section>
+<p id="none">No features match — try another word.</p>
 </main>
-
+<footer>Generated from <code style="font-family:var(--mono)">guide/capture.mjs</code> + <code style="font-family:var(--mono)">guide/build.mjs</code> — don’t hand-edit this file; edit the generator and regenerate. · <a href="../index.html">Open the app</a></footer>
 <script>
-  // ── Mobile nav toggle ──────────────────────────────────────────────────────
-  const navEl      = document.getElementById('nav');
-  const toggleBtn  = document.getElementById('nav-toggle');
-  const overlay    = document.getElementById('nav-overlay');
-
-  function openNav()  { navEl.classList.add('open'); overlay.classList.add('open'); }
-  function closeNav() { navEl.classList.remove('open'); overlay.classList.remove('open'); }
-
-  toggleBtn.addEventListener('click', openNav);
-  overlay.addEventListener('click', closeNav);
-
-  // Close when a nav link is clicked (single-page anchors)
-  navEl.querySelectorAll('a[href^="#"]').forEach(a => a.addEventListener('click', closeNav));
-
-  // ── Scroll-spy ────────────────────────────────────────────────────────────
-  const sections = document.querySelectorAll('section[id]');
-  const navLinks = document.querySelectorAll('nav a[href^="#"]');
-
-  const observer = new IntersectionObserver((entries) => {
-    entries.forEach(entry => {
-      if (entry.isIntersecting) {
-        navLinks.forEach(a => a.classList.remove('active'));
-        const active = document.querySelector(`nav a[href="#${entry.target.id}"]`);
-        if (active) active.classList.add('active');
-      }
-    });
-  }, { rootMargin: '-20% 0px -70% 0px' });
-
-  sections.forEach(s => observer.observe(s));
+  const q=document.getElementById('q'), cards=[...document.querySelectorAll('.card')], grps=[...document.querySelectorAll('.grp')], none=document.getElementById('none');
+  function apply(){ const v=q.value.trim().toLowerCase(); let shown=0;
+    cards.forEach(c=>{ const m=!v||c.dataset.search.includes(v); c.classList.toggle('hidden',!m); if(m)shown++; });
+    grps.forEach(g=>{ g.classList.toggle('empty', ![...g.querySelectorAll('.card')].some(c=>!c.classList.contains('hidden'))); });
+    none.style.display = shown? 'none':'block';
+  }
+  q.addEventListener('input', apply);
+  document.addEventListener('keydown', e=>{ if(e.key==='/' && document.activeElement!==q){ e.preventDefault(); q.focus(); } else if(e.key==='Escape'){ q.value=''; apply(); q.blur(); } });
 </script>
-</body>
-</html>
+</body></html>

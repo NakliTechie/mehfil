@@ -1,5 +1,8 @@
 *
 !.gitignore
 !index.html
-!img/
-!img/*.png
+!capture.mjs
+!build.mjs
+!regenerate.sh
+!screenshots/
+!screenshots/*.png

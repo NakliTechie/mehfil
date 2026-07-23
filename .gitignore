@@ -16,8 +16,11 @@
 !guide/
 !guide/.gitignore
 !guide/index.html
-!guide/img/
-!guide/img/*.png
+!guide/capture.mjs
+!guide/build.mjs
+!guide/regenerate.sh
+!guide/screenshots/
+!guide/screenshots/*.png
 !wrangler.jsonc
 !.assetsignore
 # e2e mesh harness (node_modules stays ignored — not whitelisted)
