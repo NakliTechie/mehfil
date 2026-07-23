@@ -20,7 +20,7 @@
      The primary XSS defence stays escapeHTML() on all rendered content. -->
 <meta http-equiv="Content-Security-Policy" content="
   default-src 'self';
-  script-src 'self' 'sha256-vfVDU8oFcqTkD0oExOyswDEc47NCykKKTmmdfh1aFwA=' 'sha256-ryup/9GePD9DBWqEdHd8MoluL367/pmDD3fbho0d9d8=' 'sha256-SYgnBy2m35CHsPPUEzA5aLA5dyuSfnS4MhgsDuJBWW8=' https://esm.sh https://cdn.jsdelivr.net;
+  script-src 'self' 'sha256-vfVDU8oFcqTkD0oExOyswDEc47NCykKKTmmdfh1aFwA=' 'sha256-ryup/9GePD9DBWqEdHd8MoluL367/pmDD3fbho0d9d8=' 'sha256-P5ykYxHMgbck+1aAbaeCXj2j2cIh+hVId7iWEvFuKf4=' https://esm.sh https://cdn.jsdelivr.net;
   style-src 'self' 'unsafe-inline';
   img-src 'self' data: blob:;
   media-src 'self' blob:;
@@ -10527,12 +10527,39 @@ const EnvelopeDispatch = {
                   id: ch.id,
                   name: sanitizeChannelName(ch.name, !!ch.dm),   // H6 — third entry path
                   topic: ch.topic || "",
-                  private: false, members: ch.members || [],
+                  // M9: keep the flags. They used to be dropped here — every
+                  // channel was projected as public, so a group DM rendered
+                  // with public chrome and an announce channel lost its
+                  // post restriction.
+                  private: !!ch.private,
+                  dm: !!ch.dm,
+                  dm_with: ch.dm_with || null,
+                  announce: !!ch.announce,
+                  canvas: !!ch.canvas && !ch.private,
+                  members: ch.members || [],
                   created_at: ch.created_at || env.ts
                 };
+                // C3: public channels carry the key raw; private channels and
+                // group DMs are sealed to our X25519 key by the inviter, so
+                // unwrap with ECDH against the sender.
+                let rawKey;
+                if (ch.wrapped_key) {
+                  const sender = current.members.find(m => canonUserId(m.id) === canonUserId(env.from));
+                  if (!sender?.x25519_pub) {
+                    console.warn("member.welcome: no sender x25519_pub, cannot unwrap", ch.id);
+                    continue;
+                  }
+                  const myPriv = await Crypto.importX25519Priv(State.identity.x25519_priv_pkcs8);
+                  const theirPub = await Crypto.importX25519Pub(sender.x25519_pub);
+                  const kek = await Crypto.deriveX25519AesKey(myPriv, theirPub);
+                  rawKey = new Uint8Array(await crypto.subtle.decrypt(
+                    { name: "AES-GCM", iv: ch.wrapped_key.iv }, kek, ch.wrapped_key.ct
+                  ));
+                } else {
+                  rawKey = ch.key;
+                }
                 // Import the key FIRST: an unusable key is the one failure
                 // that must not leave a visible channel we can't decrypt.
-                const rawKey = ch.key;
                 current.channelKeys[ch.id] = await Crypto.importAesRaw(rawKey);
                 await idbPut(current.wsDB, "keys", rawKey, "ch:" + ch.id);
                 current.channels.push(chRec);
@@ -10586,10 +10613,32 @@ const EnvelopeDispatch = {
         // can decrypt group DM history without waiting for individual
         // group_dm.sender_key envelopes to replay.
         if (Array.isArray(inner.snapshot.senderKeys)) {
-          for (const { channelId, senderId, raw } of inner.snapshot.senderKeys) {
-            if (!channelId || !senderId || !raw) continue;
-            await idbPut(current.wsDB, "keys", raw, "sk:" + channelId + ":" + senderId);
-            current.channelKeys[channelId + ":" + senderId] = await Crypto.importAesRaw(raw);
+          // C3: these arrive sealed to our X25519 key now (they decrypt other
+          // people's DMs, so they were the worst thing in the old raw
+          // snapshot). `raw` is still accepted so a snapshot built by a peer
+          // that predates this can still be read — remove that arm once the
+          // fleet has turned over.
+          for (const sk of inner.snapshot.senderKeys) {
+            try {
+              const { channelId, senderId, raw, wrapped } = sk || {};
+              if (!channelId || !senderId) continue;
+              let keyRaw = raw;
+              if (wrapped) {
+                const sender = current.members.find(m => canonUserId(m.id) === canonUserId(env.from));
+                if (!sender?.x25519_pub) continue;
+                const myPriv = await Crypto.importX25519Priv(State.identity.x25519_priv_pkcs8);
+                const theirPub = await Crypto.importX25519Pub(sender.x25519_pub);
+                const kek = await Crypto.deriveX25519AesKey(myPriv, theirPub);
+                keyRaw = new Uint8Array(await crypto.subtle.decrypt(
+                  { name: "AES-GCM", iv: wrapped.iv }, kek, wrapped.ct
+                ));
+              }
+              if (!keyRaw) continue;
+              await idbPut(current.wsDB, "keys", keyRaw, "sk:" + channelId + ":" + senderId);
+              current.channelKeys[channelId + ":" + senderId] = await Crypto.importAesRaw(keyRaw);
+            } catch (e) {
+              console.warn("member.welcome: skipping unusable sender key", e);
+            }
           }
         }
         // After welcome, the joiner can finally enter the workspace shell.
@@ -11122,35 +11171,83 @@ const EnvelopeDispatch = {
  *  §22  member.welcome + history replay helpers
  * ------------------------------------------------------------ */
 async function sendWelcome(current, targetUserId, joinNonce) {
-  // Build the snapshot: channels with their raw keys, current members,
-  // and per-sender group DM keys so the joiner can decrypt group DM history.
+  // C3: the snapshot used to carry every channel's RAW key — including
+  // private channels and group DMs the recipient has nothing to do with —
+  // inside an envelope encrypted under the workspace root key. Every member
+  // holds that key, so "private" channels were readable by the whole
+  // workspace, and each new joiner was handed the back catalogue.
+  //
+  // Two changes. Membership decides what goes in at all: a private or DM
+  // channel appears only if the target is actually one of its members. And
+  // what does go in is wrapped to the target's X25519 key rather than left
+  // raw, because the envelope itself is readable by every member — filtering
+  // alone would still leak to everyone else on the wire.
+  //
+  // Public channel keys stay raw: every member is entitled to them by
+  // definition, and wrapping them would buy nothing.
+  const targetId = canonUserId(targetUserId);
+  const targetMember = current.members.find(m => canonUserId(m.id) === targetId);
+  const targetPub = targetMember?.x25519_pub || null;
+  const myX25519Priv = await Crypto.importX25519Priv(State.identity.x25519_priv_pkcs8);
+  let targetKek = null;
+  if (targetPub) {
+    targetKek = await Crypto.deriveX25519AesKey(myX25519Priv, await Crypto.importX25519Pub(targetPub));
+  }
+  const wrapForTarget = async (raw) => {
+    const iv = Crypto.rand(12);
+    const ct = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv }, targetKek, raw));
+    return { iv, ct };
+  };
+  const isMemberOf = (ch) =>
+    Array.isArray(ch.members) && ch.members.some(id => canonUserId(id) === targetId);
+
   const snapshotChannels = [];
   for (const ch of current.channels) {
+    const restricted = !!ch.private || !!ch.dm;
+    if (restricted) {
+      // Not theirs — the channel must not appear in the snapshot at all.
+      // Per spec §5.2 private channels are invisible to non-members, so we
+      // leak neither the key nor the fact that the channel exists.
+      if (!isMemberOf(ch)) continue;
+      // Theirs, but we can't wrap for them (no published X25519 key) — skip
+      // rather than fall back to shipping it raw. They can be re-invited to
+      // the channel once their key is known; a silent leak can't be undone.
+      if (!targetKek) {
+        console.warn("welcome: no x25519_pub for target, omitting restricted channel", ch.id);
+        continue;
+      }
+    }
     const raw = await idbGet(current.wsDB, "keys", "ch:" + ch.id);
     snapshotChannels.push({
       id: ch.id,
       name: ch.name,
       topic: ch.topic,
-      // H6: the receiver needs to know this is a group DM. Its name is
-      // built from member display names ("Ada, Grace"), which the channel
-      // slug rule would mangle — without this flag a late joiner projects
-      // a different name than everyone else.
-      //
-      // NOTE (M9 still open): the receiving side does NOT persist `dm` onto
-      // its channel record, so a joiner renders a group DM with public-
-      // channel chrome. That also means this line is only correct because
-      // the welcome is sent by the owner alone (see the `members[0]` gate in
-      // the member.join handler) — the owner is the one peer guaranteed to
-      // hold `dm: true`. If welcome ever moves off that gate, fix M9 first
-      // or late joiners start slugifying group-DM names again.
+      // M9: carry the flags that decide how the channel behaves and renders.
+      // They used to be dropped, so a joiner projected every channel as a
+      // plain public one — a group DM with public chrome, an announce channel
+      // anyone could post to, a canvas that wasn't one.
+      private: !!ch.private,
       dm: !!ch.dm,
+      dm_with: ch.dm_with || null,
+      announce: !!ch.announce,
+      canvas: !!ch.canvas,
       members: ch.members,
       created_at: ch.created_at,
-      key: raw
+      // C3: raw only for public channels, which every member may read
+      // anyway. Restricted ones are sealed to the target's X25519 key.
+      key: (!!ch.private || !!ch.dm) ? undefined : raw,
+      wrapped_key: (!!ch.private || !!ch.dm) ? await wrapForTarget(raw) : undefined
     });
   }
 
-  // Collect all "sk:" sender keys so the joiner can decrypt group DM history.
+  // Per-sender group DM keys, so the joiner can read group DM history it is
+  // entitled to. C3: these are the most sensitive things in the snapshot —
+  // they decrypt other people's DMs — and they were shipped raw, for every
+  // group DM in the workspace, to every joiner. Same rule as the channels:
+  // only for group DMs the target belongs to, and sealed to their key.
+  const sendableChannelIds = new Set(
+    current.channels.filter(ch => !ch.private && !ch.dm ? false : isMemberOf(ch)).map(ch => ch.id)
+  );
   const senderKeys = await new Promise((res, rej) => {
     const tx  = current.wsDB.transaction("keys", "readonly");
     const req = tx.objectStore("keys").getAllKeys();
@@ -11162,8 +11259,10 @@ async function sendWelcome(current, targetUserId, joinNonce) {
         if (parts.length < 3) continue;
         const channelId = parts[1];
         const senderId  = parts.slice(2).join(":");
+        if (!sendableChannelIds.has(channelId)) continue;   // not their DM
+        if (!targetKek) continue;                            // can't seal it
         const raw = await idbGet(current.wsDB, "keys", k);
-        if (raw) out.push({ channelId, senderId, raw });
+        if (raw) out.push({ channelId, senderId, wrapped: await wrapForTarget(raw) });
       }
       res(out);
     };
