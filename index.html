@@ -20,7 +20,7 @@
      The primary XSS defence stays escapeHTML() on all rendered content. -->
 <meta http-equiv="Content-Security-Policy" content="
   default-src 'self';
-  script-src 'self' 'sha256-vfVDU8oFcqTkD0oExOyswDEc47NCykKKTmmdfh1aFwA=' 'sha256-ryup/9GePD9DBWqEdHd8MoluL367/pmDD3fbho0d9d8=' 'sha256-zqRdZ8mXNDHJ1x3LCw51Ap2Z4I5Dbn0tUXyRcKOfW6o=' https://esm.sh https://cdn.jsdelivr.net;
+  script-src 'self' 'sha256-vfVDU8oFcqTkD0oExOyswDEc47NCykKKTmmdfh1aFwA=' 'sha256-ryup/9GePD9DBWqEdHd8MoluL367/pmDD3fbho0d9d8=' 'sha256-XQ8k9LYz0d34vmgCnyvW2LXeAhLct2p+AdvISJY8Bjc=' https://esm.sh https://cdn.jsdelivr.net;
   style-src 'self' 'unsafe-inline';
   img-src 'self' data: blob:;
   media-src 'self' blob:;
@@ -2239,6 +2239,23 @@ const Envelope = {
    */
   async verify(env) {
     try {
+      // M11: gate the protocol version. An envelope from an incompatible
+      // version isn't something this build can reason about — reject rather
+      // than attempt to verify a shape we don't define.
+      if (env.v !== PROTOCOL_VERSION) return false;
+
+      // M11: the id is SHA-256(from ‖ ts_be64 ‖ nonce)[:16] and is used for
+      // dedup/SeenSet. It isn't covered by the signature, so recompute it and
+      // reject a mismatch — otherwise a peer could pick an id to collide with
+      // (and suppress) a different envelope in the SeenSet.
+      if (typeof env.from !== "string" || typeof env.ts !== "number" || !(env.n instanceof Uint8Array)) return false;
+      const fromB = b64UrlToBytes(env.from);
+      const idIn = new Uint8Array(fromB.length + 8 + env.n.length);
+      idIn.set(fromB, 0);
+      idIn.set(u64BE(env.ts), fromB.length);
+      idIn.set(env.n, fromB.length + 8);
+      if (env.id !== bytesToB64Url((await Crypto.sha256(idIn)).slice(0, 16))) return false;
+
       const signedBytes = MP.encode(stripSig(env));
 
       // Per-device chain of trust:
@@ -2824,6 +2841,11 @@ const Workspace = {
             // Store the per-sender key so future messages in this group DM
             // can be decrypted with the right key.
             const { group_id, sender_id, wrapped_keys } = inner;
+            // M10: a sender may only publish its OWN sender key. The live
+            // dispatch path enforces env.from === sender_id; the replay path
+            // did not, so on reload a forged sender_key (claiming to be another
+            // member's) would be projected. Mirror the check here.
+            if (env.from !== sender_id) break;
             const myUserId2 = bytesToB64Url(State.identity.pubkey);
             const myEntry = wrapped_keys && wrapped_keys[myUserId2];
             if (!myEntry) break;
@@ -10138,6 +10160,19 @@ const EnvelopeDispatch = {
     const current = State.current;
     if (!current || current.meta.id !== workspaceId) {
       console.warn("Envelope for non-open workspace:", workspaceId);
+      return;
+    }
+
+    // H2 (receiver half): the envelope must claim the workspace it arrived on.
+    // Dispatch compared only the transport's workspaceId against current, not
+    // the envelope's own `env.ws`, so a genuine, threshold-valid envelope from
+    // workspace X could be re-wrapped and replayed into workspace Y that shares
+    // members (the cross-workspace promote replay behind C4). This is the
+    // receiver-side close; putting `ws` inside the *signed* payload — so it
+    // can't be re-wrapped at all — is the wire-format half, deferred with H2's
+    // DM-key domain separation (plan/pending.md).
+    if (env.ws !== workspaceId) {
+      console.warn("Dropping envelope whose env.ws != workspace:", env.ws, workspaceId);
       return;
     }
 
