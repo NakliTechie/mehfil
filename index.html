@@ -20,7 +20,7 @@
      The primary XSS defence stays escapeHTML() on all rendered content. -->
 <meta http-equiv="Content-Security-Policy" content="
   default-src 'self';
-  script-src 'self' 'sha256-vfVDU8oFcqTkD0oExOyswDEc47NCykKKTmmdfh1aFwA=' 'sha256-ryup/9GePD9DBWqEdHd8MoluL367/pmDD3fbho0d9d8=' 'sha256-eQEP0fcfx3bUhpk/JR9XghkGgn24MZpKYOoyCqvyjko=' https://esm.sh https://cdn.jsdelivr.net;
+  script-src 'self' 'sha256-vfVDU8oFcqTkD0oExOyswDEc47NCykKKTmmdfh1aFwA=' 'sha256-ryup/9GePD9DBWqEdHd8MoluL367/pmDD3fbho0d9d8=' 'sha256-z9qTt8F6S1CnsbO9JmwlTzFC80zCe6dTohr+oBO3wZk=' https://esm.sh https://cdn.jsdelivr.net;
   style-src 'self' 'unsafe-inline';
   img-src 'self' data: blob:;
   media-src 'self' blob:;
@@ -10794,6 +10794,11 @@ const EnvelopeDispatch = {
             break;
           }
           admBurned.push(gNonce);
+          // Bounded like promote_nonces: evicting an old nonce past 512 makes
+          // that grant replayable, but only in combination with re-adding a
+          // removed member, and after 512 *successful* distinct admissions.
+          // Same weakening class as the promote-nonce ring; raise if it ever
+          // becomes the weak link.
           await idbPut(current.wsDB, "keys", admBurned.slice(-512), "admission_nonces");
 
           await attachFingerprint(newMember);
@@ -11417,7 +11422,10 @@ const EnvelopeDispatch = {
 
         let validSigners = new Set();
         for (const signer of inner.signers) {
-          if (!signer.user_id || !signer.sig) continue;
+          // Guard `signer` itself: a null / non-object entry (a member can put
+          // anything in the signers array) would throw out of dispatch on the
+          // deref below and skip CausalBuffer.advance for this receive.
+          if (!signer || typeof signer !== "object" || !signer.user_id || !signer.sig) continue;
           // C4: a signature is only a *vote* if it belongs to someone who can
           // vote. Previously any Ed25519 keypair counted, so two throwaway
           // keys reached the threshold and self-escalated to admin.
@@ -11431,6 +11439,13 @@ const EnvelopeDispatch = {
           // ADMIN, not any member. Plain-member sock puppets (which a malicious
           // member can mint) must not be able to reach the promote threshold —
           // that was C4's residual escalation path. Resolves H8 (spec: 2-of-N).
+          // NB: this trusts each member's `role` in the local projection. A
+          // member.welcome snapshot is peer-supplied and can seed a fresh
+          // joiner's row with role:"admin" — but welcome is C2-gated (only your
+          // verified inviter, mid-join, for you), so any role inflation is
+          // local to that joiner and bounded by the trust you already placed in
+          // the inviter. Deriving roles purely from verifiable promote ops
+          // would remove even that; noted as a follow-on.
           if (!current.members.some(m => canonUserId(m.id) === signerId && isAdminRole(m.role))) continue;
           // C4: the target can't vote for their own promotion.
           if (signerId === targetId) continue;
