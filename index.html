@@ -20,7 +20,7 @@
      The primary XSS defence stays escapeHTML() on all rendered content. -->
 <meta http-equiv="Content-Security-Policy" content="
   default-src 'self';
-  script-src 'self' 'sha256-vfVDU8oFcqTkD0oExOyswDEc47NCykKKTmmdfh1aFwA=' 'sha256-ryup/9GePD9DBWqEdHd8MoluL367/pmDD3fbho0d9d8=' 'sha256-mO818U+1IKXRgZl8bqMRlzWLCSgmo2aI1OuXYpm94+4=' https://esm.sh https://cdn.jsdelivr.net;
+  script-src 'self' 'sha256-vfVDU8oFcqTkD0oExOyswDEc47NCykKKTmmdfh1aFwA=' 'sha256-ryup/9GePD9DBWqEdHd8MoluL367/pmDD3fbho0d9d8=' 'sha256-yNZDRSP+ggR6lFwPNfRJSqY2C7YLMA4+jM1qqGimT1o=' https://esm.sh https://cdn.jsdelivr.net;
   style-src 'self' 'unsafe-inline';
   img-src 'self' data: blob:;
   media-src 'self' blob:;
@@ -10115,7 +10115,18 @@ const EnvelopeDispatch = {
     // Exempt the join handshake: member.join's sender isn't a member yet (it's
     // the envelope that adds them, gated by the admission grant), and
     // member.welcome is gated by the C2 inviter+nonce check while the joiner
-    // may not yet know the inviter's device.
+    // may not yet know the inviter's device. NOTE: these two are the one path
+    // where a revoked device's envelope can still be persisted and replay on
+    // reload — it's harmless only because the member.join handler is idempotent
+    // for an existing member and member.welcome is bound by the C2 checks. If
+    // either handler's internal guards are ever loosened, revisit this
+    // exemption.
+    //
+    // Scope: this gate covers a *revoked device of a current member*. It does
+    // NOT cover a removed member or an unknown sender — the `sender &&` clause
+    // deliberately lets an envelope whose from isn't a current member through
+    // (its authz is the per-handler checks + the rekey that denies removed
+    // members future keys). Don't mistake this for member-removal enforcement.
     if (env.type !== "member.join" && env.type !== "member.welcome") {
       const sender = current.members.find(m => canonUserId(m.id) === canonUserId(env.from));
       if (sender && !(Array.isArray(sender.devices) && sender.devices.includes(env.dev))) {
