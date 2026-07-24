@@ -28,7 +28,11 @@
 // v4: per-device cert signing (identity-authz). Envelopes now carry a cert and
 // are device-signed — another wire break, so a v3 shell and a v4 shell can't
 // verify each other's envelopes. Same reasoning as v3: force convergence.
-const CACHE_NAME = "mehfil-shell-v4";
+// v5: Batch E+F hardening (bridge arg-swap, padding bug, input caps, verify
+// hardening, leak/dead-code cleanup). NOT a wire break — a v4 and v5 shell
+// interoperate (verified both directions) — so the bump is only to get the
+// fixes to cached users, not to force convergence.
+const CACHE_NAME = "mehfil-shell-v5";
 const PRECACHE = [
   "./",
   "./index.html",

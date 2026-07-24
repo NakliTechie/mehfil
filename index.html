@@ -20,7 +20,7 @@
      The primary XSS defence stays escapeHTML() on all rendered content. -->
 <meta http-equiv="Content-Security-Policy" content="
   default-src 'self';
-  script-src 'self' 'sha256-vfVDU8oFcqTkD0oExOyswDEc47NCykKKTmmdfh1aFwA=' 'sha256-ryup/9GePD9DBWqEdHd8MoluL367/pmDD3fbho0d9d8=' 'sha256-yNZDRSP+ggR6lFwPNfRJSqY2C7YLMA4+jM1qqGimT1o=' https://esm.sh https://cdn.jsdelivr.net;
+  script-src 'self' 'sha256-vfVDU8oFcqTkD0oExOyswDEc47NCykKKTmmdfh1aFwA=' 'sha256-ryup/9GePD9DBWqEdHd8MoluL367/pmDD3fbho0d9d8=' 'sha256-DO4fe1vH2C6i0RG1O0EGHcuMwQOxl1UBMKn4CRDrr0I=' https://esm.sh https://cdn.jsdelivr.net;
   style-src 'self' 'unsafe-inline';
   img-src 'self' data: blob:;
   media-src 'self' blob:;
@@ -1532,21 +1532,36 @@ const MP = (() => {
 
   /* ---- decode ---- */
 
+  // M4: bound untrusted input. Two DoS vectors on a decoder fed peer/relay
+  // bytes: unbounded nesting (decVal → decMap/decArr → decVal → …) blows the
+  // stack, and a large declared length runs `new Array(n)` / a big slice with
+  // n up to 2^32. MP_MAX_DEPTH caps nesting; the per-collection check below
+  // rejects any length that exceeds the bytes actually remaining — a valid
+  // msgpack can never declare more elements/bytes than it carries, so this
+  // costs legitimate envelopes nothing.
+  const MP_MAX_DEPTH = 64;
+  function mpRemaining(st) { return st.b.length - st.p; }
+  function mpBoundLen(st, n) {
+    if (n > mpRemaining(st)) throw new Error("MP decode: declared length exceeds input");
+    return n;
+  }
+
   function decode(bytes) {
     const st = { b: bytes, p: 0 };
-    const v = decVal(st);
+    const v = decVal(st, 0);
     if (st.p !== bytes.length) throw new Error("MP decode: trailing bytes");
     return v;
   }
 
-  function decVal(st) {
+  function decVal(st, depth = 0) {
+    if (depth > MP_MAX_DEPTH) throw new Error("MP decode: max nesting depth exceeded");
     const c = st.b[st.p++];
     // positive fixint
     if (c <= 0x7f) return c;
     // fixmap
-    if (c >= 0x80 && c <= 0x8f) return decMap(st, c & 0x0f);
+    if (c >= 0x80 && c <= 0x8f) return decMap(st, c & 0x0f, depth);
     // fixarray
-    if (c >= 0x90 && c <= 0x9f) return decArr(st, c & 0x0f);
+    if (c >= 0x90 && c <= 0x9f) return decArr(st, c & 0x0f, depth);
     // fixstr
     if (c >= 0xa0 && c <= 0xbf) return decStr(st, c & 0x1f);
     // negative fixint
@@ -1572,37 +1587,41 @@ const MP = (() => {
       case 0xd9: return decStr(st, readU8(st));
       case 0xda: return decStr(st, readU16(st));
       case 0xdb: return decStr(st, readU32(st));
-      case 0xdc: return decArr(st, readU16(st));
-      case 0xdd: return decArr(st, readU32(st));
-      case 0xde: return decMap(st, readU16(st));
-      case 0xdf: return decMap(st, readU32(st));
+      case 0xdc: return decArr(st, readU16(st), depth);
+      case 0xdd: return decArr(st, readU32(st), depth);
+      case 0xde: return decMap(st, readU16(st), depth);
+      case 0xdf: return decMap(st, readU32(st), depth);
       default: throw new Error("MP decode: unknown type 0x" + c.toString(16));
     }
   }
 
   function decStr(st, n) {
+    mpBoundLen(st, n);
     const s = utf8dec.decode(st.b.subarray(st.p, st.p + n));
     st.p += n;
     return s;
   }
   function decBin(st, n) {
+    mpBoundLen(st, n);
     const b = st.b.slice(st.p, st.p + n);
     st.p += n;
     return b;
   }
-  function decArr(st, n) {
+  function decArr(st, n, depth) {
+    mpBoundLen(st, n);   // n elements need ≥ n bytes remaining
     const a = new Array(n);
-    for (let i = 0; i < n; i++) a[i] = decVal(st);
+    for (let i = 0; i < n; i++) a[i] = decVal(st, depth + 1);
     return a;
   }
-  function decMap(st, n) {
+  function decMap(st, n, depth) {
+    mpBoundLen(st, n);   // n entries need ≥ n bytes remaining
     // Use Object.create(null) so there is no prototype to pollute.
     // A msgpack map with key "__proto__" would otherwise change the
     // decoded object's prototype chain via o["__proto__"] = value,
     // allowing a peer to control property lookups on missing own keys.
     const o = Object.create(null);
     for (let i = 0; i < n; i++) {
-      const k = decVal(st);
+      const k = decVal(st, depth + 1);
       if (typeof k !== "string") throw new Error("MP decode: non-string map key");
       // Explicitly block dangerous prototype keys even with null prototype,
       // as a defense-in-depth measure for any downstream JSON.parse paths.
@@ -1610,7 +1629,7 @@ const MP = (() => {
         throw new Error("MP decode: forbidden map key: " + k);
       }
       if (Object.prototype.hasOwnProperty.call(o, k)) throw new Error("MP decode: duplicate map key " + k);
-      o[k] = decVal(st);
+      o[k] = decVal(st, depth + 1);
     }
     return o;
   }
@@ -1683,11 +1702,10 @@ function selfTest() {
     [[], "90"],
     [[1, 2], "920102"],
     [{}, "80"],
-    [{ b: 2, a: 1 }, "82a1610182a162"], // see fix below
+    // Canonical encoding sorts keys: a before b → 82 a161 01 a162 02.
+    [{ b: 2, a: 1 }, "82a16101a16202"],
     [new Uint8Array([1,2,3]), "c403010203"],
   ];
-  // Fix the {b:2,a:1} expected — sorted keys: a then b, so 82 a161 01 a162 02
-  cases[16][1] = "82a16101a16202";
 
   for (const [v, hex] of cases) {
     const got = bytesToHex(MP.encode(v));
@@ -2181,7 +2199,18 @@ const Envelope = {
     //
     //   This is a closed-form calculation, no iteration needed.
     const L0 = MP.encode(env).length;
-    const target = padTarget(L0);
+    let target = padTarget(L0);
+    // H5: the pad-length prefix grows in steps — bin8 (≤255) then bin16 adds a
+    // header byte — so some deltas are unrepresentable. delta=256 is the gap:
+    // there is no padLen that grows the encoding by exactly 256 (bin8 tops out
+    // at +255, bin16 starts at +257). Given padTarget's 1KB/16KB rounding it's
+    // the only reachable gap, and it hit ~1/1024 of message sizes, firing the
+    // assertion below and aborting the send. Nudge target past any gap so delta
+    // is always representable; being 1 byte off the round boundary doesn't hurt
+    // the length obfuscation.
+    const padRepresentable = (d) =>
+      d === 0 || (d >= 1 && d <= 255) || (d >= 257 && d <= 65536) || (d >= 65539);
+    while (target > L0 && !padRepresentable(target - L0)) target += 1;
     if (target > L0) {
       const delta = target - L0;
       let padLen;
@@ -2209,6 +2238,23 @@ const Envelope = {
    */
   async verify(env) {
     try {
+      // M11: gate the protocol version. An envelope from an incompatible
+      // version isn't something this build can reason about — reject rather
+      // than attempt to verify a shape we don't define.
+      if (env.v !== PROTOCOL_VERSION) return false;
+
+      // M11: the id is SHA-256(from ‖ ts_be64 ‖ nonce)[:16] and is used for
+      // dedup/SeenSet. It isn't covered by the signature, so recompute it and
+      // reject a mismatch — otherwise a peer could pick an id to collide with
+      // (and suppress) a different envelope in the SeenSet.
+      if (typeof env.from !== "string" || typeof env.ts !== "number" || !(env.n instanceof Uint8Array)) return false;
+      const fromB = b64UrlToBytes(env.from);
+      const idIn = new Uint8Array(fromB.length + 8 + env.n.length);
+      idIn.set(fromB, 0);
+      idIn.set(u64BE(env.ts), fromB.length);
+      idIn.set(env.n, fromB.length + 8);
+      if (env.id !== bytesToB64Url((await Crypto.sha256(idIn)).slice(0, 16))) return false;
+
       const signedBytes = MP.encode(stripSig(env));
 
       // Per-device chain of trust:
@@ -2307,8 +2353,14 @@ async function idbDelete(db, store, key) {
 // Return [{key, value}] pairs from a store that uses out-of-line keys.
 // Used by exportWorkspace to preserve the keys-store key names.
 async function idbGetAllEntries(db, store) {
-  const keys   = await reqAsPromise(txStore(db, store).getAllKeys());
-  const values = await reqAsPromise(txStore(db, store).getAll());
+  // S13: read keys and values within ONE transaction so they come from the
+  // same consistent snapshot. Two separate transactions could observe the
+  // store at different states and mis-zip keys[i] to values[i].
+  const s = txStore(db, store);
+  const [keys, values] = await Promise.all([
+    reqAsPromise(s.getAllKeys()),
+    reqAsPromise(s.getAll()),
+  ]);
   return keys.map((k, i) => ({ key: k, value: values[i] }));
 }
 
@@ -2794,6 +2846,11 @@ const Workspace = {
             // Store the per-sender key so future messages in this group DM
             // can be decrypted with the right key.
             const { group_id, sender_id, wrapped_keys } = inner;
+            // M10: a sender may only publish its OWN sender key. The live
+            // dispatch path enforces env.from === sender_id; the replay path
+            // did not, so on reload a forged sender_key (claiming to be another
+            // member's) would be projected. Mirror the check here.
+            if (env.from !== sender_id) break;
             const myUserId2 = bytesToB64Url(State.identity.pubkey);
             const myEntry = wrapped_keys && wrapped_keys[myUserId2];
             if (!myEntry) break;
@@ -3684,7 +3741,11 @@ function renderWorkspace() {
     el.onclick = async () => {
       const newChId = el.getAttribute("data-ch");
       if (newChId === State.currentChannel) return;
-      await persistDraft(State.currentChannel, document.getElementById("composer").value);
+      // M15: the composer isn't mounted for every channel (announce channels
+      // the user can't post to, canvas channels), so guard the deref — the
+      // two other composer reads already do. Nothing to persist if absent.
+      const $composerEl = document.getElementById("composer");
+      if ($composerEl) await persistDraft(State.currentChannel, $composerEl.value);
       if (State.currentChannel) {
         markChannelRead(current, State.currentChannel).catch(e => console.warn("markRead:", e));
       }
@@ -4177,10 +4238,17 @@ function renderWorkspace() {
     const msg = current.messages.find(m => m.id === msgId);
     if (!msg || !msg.attachment || !msg.attachment.available) return;
     const a = msg.attachment;
-    const bytes = await BlobStore.get(current.meta.id, a.blob_id, a.key, a.iv);
-    if (!bytes) return;
-    const blob = new Blob([bytes], { type: a.mime });
-    const url = URL.createObjectURL(blob);
+    // M6: render() re-runs on every state change, and this used to mint a new
+    // object URL for the same blob each time, none of them revoked — they
+    // accumulated for the life of the page. Cache one URL per blob_id and reuse
+    // it across renders, so a message with an attachment costs exactly one URL.
+    let url = _attachmentUrlCache.get(a.blob_id);
+    if (!url) {
+      const bytes = await BlobStore.get(current.meta.id, a.blob_id, a.key, a.iv);
+      if (!bytes) return;
+      url = URL.createObjectURL(new Blob([bytes], { type: a.mime }));
+      _attachmentUrlCache.set(a.blob_id, url);
+    }
     if (el.tagName === "IMG") {
       el.src = url;
       // noopener,noreferrer severs window.opener so an SVG (or any image)
@@ -4197,9 +4265,9 @@ function renderWorkspace() {
         link.click();
       };
     }
-    // Note: we deliberately don't revokeObjectURL because the image needs
-    // to stay rendered for the lifetime of the view. These get GC'd when
-    // the page unloads. LRU eviction runs automatically via BlobStore._checkQuota.
+    // The cached URL stays valid for the life of the view (reused across
+    // renders via _attachmentUrlCache); released on page unload. Underlying
+    // blobs are LRU-evicted via BlobStore._checkQuota.
   });
 
   // Message actions (edit / delete / react / thread / pin) — hover-revealed buttons.
@@ -5006,6 +5074,11 @@ function formatBytes(n) {
 // the in-memory message record + re-renders if the workspace view
 // is still active. Idempotent + self-deduplicating.
 const _attachmentCheckInflight = new Set();
+// M6: object URL per attachment blob_id, reused across renders so we don't
+// leak a fresh one every render. Bounded by the number of distinct attachments
+// the user has viewed this session; the underlying blobs are LRU-evicted by
+// BlobStore, and all URLs are released when the page unloads.
+const _attachmentUrlCache = new Map();
 async function maybeCheckAttachmentAvailable(msg) {
   if (!msg.attachment || msg.attachment.available !== null) return;
   if (_attachmentCheckInflight.has(msg.id)) return;
@@ -8109,8 +8182,12 @@ const TrustCard = {
       return {
         shape: this.shapes[fpBytes[o] & 0x03],
         color: this.palette[fpBytes[o + 1] & 0x07],
-        rotate: (fpBytes[o + 2] & 0x03) * 90,
-        variant: fpBytes[o + 3] & 0x01
+        rotate: (fpBytes[o + 2] & 0x03) * 90
+        // S3: `variant` (fpBytes[o+3] & 0x01) was computed here and never read
+        // by render(), so every 4th fingerprint byte contributed nothing to the
+        // trust card. Removed the dead field. (Widening the card to use those
+        // bytes would raise its discriminating power but changes the security
+        // visual for existing users — left for a deliberate human call.)
       };
     });
     const parts = [`<svg xmlns="http://www.w3.org/2000/svg" width="${size}" height="${size}" viewBox="0 0 ${size} ${size}" style="border-radius: 8px; background: var(--bg-sunken);">`];
@@ -9050,8 +9127,8 @@ const PeerMgr = {
 
   /**
    * ACK is point-to-point — only send back to the peer we received
-   * from. Required `excludePeer` is unused here; we send only to the
-   * named peer.
+   * from. (S5: there is no `excludePeer` param on this path; a stale
+   * comment referenced one. We send only to the named peer.)
    */
   async sendAck(workspaceId, envelopeId, peerUserId) {
     const wsPeers = this.peers.get(workspaceId);
@@ -9934,6 +10011,9 @@ const WorkspaceDoc = {
 // length prefix) so the framed packet stays under the limit even at
 // the maximum total_chunks count.
 const CHUNK_SIZE = 14 * 1024;   // 14KB of payload per chunk
+// M5: the most chunks a within-limits blob can legitimately need, plus slack.
+// A peer claiming more than this is rejected before it can size a buffer on it.
+const MAX_BLOB_CHUNKS = Math.ceil(MAX_ATTACHMENT_SIZE / CHUNK_SIZE) + 16;
 const AUTO_FETCH_SIZE_LIMIT = 1024 * 1024;   // auto-fetch images ≤ 1MB
 
 const BlobTransfer = {
@@ -9997,10 +10077,21 @@ const BlobTransfer = {
       return;
     }
     if (state.total === null) {
-      // First chunk — size the buffer.
+      // First chunk sizes the buffer. M5: `total` is peer-supplied, so
+      // `new Array(total)` was an unbounded allocation. A blob is capped at
+      // MAX_ATTACHMENT_SIZE and chunked at CHUNK_SIZE, so anything past that
+      // many chunks is a lie — reject it rather than allocate on it.
+      if (!Number.isInteger(chunk.total) || chunk.total <= 0 || chunk.total > MAX_BLOB_CHUNKS) {
+        console.warn("blob: implausible chunk total, dropping", chunk.total);
+        this._inbound.delete(chunk.blob_id);
+        return;
+      }
       state.total = chunk.total;
       state.chunks = new Array(chunk.total);
     }
+    // M5: seq indexes the buffer, so an out-of-range seq writes a stray sparse
+    // slot (and would never complete). Bound it to [0, total).
+    if (!Number.isInteger(chunk.seq) || chunk.seq < 0 || chunk.seq >= state.total) return;
     if (state.received.has(chunk.seq)) return;   // duplicate, ignore
     state.chunks[chunk.seq] = chunk.data;
     state.received.add(chunk.seq);
@@ -10090,6 +10181,19 @@ const EnvelopeDispatch = {
     const current = State.current;
     if (!current || current.meta.id !== workspaceId) {
       console.warn("Envelope for non-open workspace:", workspaceId);
+      return;
+    }
+
+    // H2 (receiver half): the envelope must claim the workspace it arrived on.
+    // Dispatch compared only the transport's workspaceId against current, not
+    // the envelope's own `env.ws`, so a genuine, threshold-valid envelope from
+    // workspace X could be re-wrapped and replayed into workspace Y that shares
+    // members (the cross-workspace promote replay behind C4). This is the
+    // receiver-side close; putting `ws` inside the *signed* payload — so it
+    // can't be re-wrapped at all — is the wire-format half, deferred with H2's
+    // DM-key domain separation (plan/pending.md).
+    if (env.ws !== workspaceId) {
+      console.warn("Dropping envelope whose env.ws != workspace:", env.ws, workspaceId);
       return;
     }
 
@@ -13317,7 +13421,6 @@ async function sendWorkspacePatch(current, updateBytes) {
  */
 const TypingMgr = {
   _lastSentAt: 0,
-  _localStop: null,     // timer to mark self-stopped (future; unused)
   // Receiver-side projection: Map<channelId, Map<userId, until_ts>>
   _fading: new Map(),
 
@@ -15512,10 +15615,15 @@ async function openDevicePairInitiatorModal(current) {
       if (r.status === 404) return;
       if (!r.ok) throw new Error(`Relay error ${r.status}`);
       const { payload } = await r.json();
-      clearInterval(State.pairingSession.pollTimer);
 
+      // M14: decrypt and validate BEFORE stopping the poll. The interval used
+      // to be cleared here, so a single malformed payload (a decrypt failure,
+      // or garbage written to the relay's pairing slot) killed the pairing
+      // attempt permanently. Now a bad payload throws to the catch below with
+      // the poll still running, and we keep waiting for a valid response.
       const response = await PairingCode.decrypt(pairingAesKey, payload);
       if (response.type !== "device.pair.response") throw new Error("Unexpected response type");
+      clearInterval(State.pairingSession.pollTimer);
 
       const ephem_ed_pub_B = b64ToBytes(response.ephem_ed_pub_B);
       const fpB     = await Crypto.sha256(ephem_ed_pub_B);
@@ -15943,9 +16051,14 @@ class BridgeTransport {
       SeenSet.has(this.workspaceId, env.id).then(seen => {
         if (seen) return;
         SeenSet.add(this.workspaceId, env.id);
-        EnvelopeDispatch.receive(env, this.workspaceId);
-        // Rebroadcast to any connected WebRTC peers (gossip).
-        PeerMgr.sendEnvelope(this.workspaceId, env, null).catch(() => {});
+        // H4: receive is (workspaceId, env) — the args were reversed, so every
+        // bridge envelope was treated as belonging to a non-open workspace and
+        // dropped. Serialize the gossip rebroadcast after receive resolves.
+        // (Gating gossip on *acceptance* is H1/Batch D — receive signals drops
+        // by returning, not throwing, so it isn't gated here.)
+        EnvelopeDispatch.receive(this.workspaceId, env)
+          .catch(e => console.warn("[BridgeTransport] receive:", e))
+          .finally(() => PeerMgr.sendEnvelope(this.workspaceId, env, null).catch(() => {}));
       });
     } catch (e) {
       console.warn("[BridgeTransport] ingest error:", e);
