@@ -20,7 +20,7 @@
      The primary XSS defence stays escapeHTML() on all rendered content. -->
 <meta http-equiv="Content-Security-Policy" content="
   default-src 'self';
-  script-src 'self' 'sha256-vfVDU8oFcqTkD0oExOyswDEc47NCykKKTmmdfh1aFwA=' 'sha256-ryup/9GePD9DBWqEdHd8MoluL367/pmDD3fbho0d9d8=' 'sha256-yu+grEOwE5351dYyY6k4WUFN8OiSyP3M++0owbsBawU=' https://esm.sh https://cdn.jsdelivr.net;
+  script-src 'self' 'sha256-vfVDU8oFcqTkD0oExOyswDEc47NCykKKTmmdfh1aFwA=' 'sha256-ryup/9GePD9DBWqEdHd8MoluL367/pmDD3fbho0d9d8=' 'sha256-mO818U+1IKXRgZl8bqMRlzWLCSgmo2aI1OuXYpm94+4=' https://esm.sh https://cdn.jsdelivr.net;
   style-src 'self' 'unsafe-inline';
   img-src 'self' data: blob:;
   media-src 'self' blob:;
@@ -14286,9 +14286,29 @@ async function sendDeviceRevoke(current, targetDeviceId) {
   PeerMgr.sendEnvelope(meta.id, env).catch(e => console.warn("device.revoke peer:", e));
   RelayMgr.send(meta.id, MP.encode(env)).catch(e => console.warn("device.revoke relay:", e));
   await idbPut(current.wsDB, "keys", meta, "workspace_meta");
-  // Apply locally.
-  me.devices = me.devices.filter(d => d !== targetDeviceId);
-  await idbPut(current.wsDB, "members", me);
+  // Apply locally. The device may belong to ANY member (an admin can revoke
+  // someone else's device), so remove it from whoever actually owns it — not
+  // from `me`. We never receive our own envelope, so this local apply is the
+  // only thing that updates our projection.
+  const owner = current.members.find(m => Array.isArray(m.devices) && m.devices.includes(targetDeviceId)) || me;
+  owner.devices = owner.devices.filter(d => d !== targetDeviceId);
+  await idbPut(current.wsDB, "members", owner);
+
+  // C5: rotate the workspace + channel keys so the revoked device can't
+  // decrypt content sent from here on. Only admins can rekey, and it's the
+  // revoker (not every receiver) who performs it, so it happens exactly once.
+  //
+  // Bound, and stated honestly: this cuts the device off from FUTURE content
+  // only to the extent it doesn't already hold the wrapping key. Today paired
+  // devices share the identity's X25519 key, so revoking one *secondary*
+  // device of a member who stays does NOT stop it reading (it can still
+  // unwrap the new root as that member). What is fully cut off regardless is
+  // SENDING — active-device enforcement drops its envelopes at ingest. Full
+  // read-cutoff needs per-device X25519 wrapping (see plan/pending.md).
+  if (isAdmin(current)) {
+    try { await sendScheduledRekey(current); }
+    catch (e) { console.warn("device.revoke: rekey failed", e); }
+  }
 }
 
 /* ============================================================
