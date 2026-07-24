@@ -20,7 +20,7 @@
      The primary XSS defence stays escapeHTML() on all rendered content. -->
 <meta http-equiv="Content-Security-Policy" content="
   default-src 'self';
-  script-src 'self' 'sha256-vfVDU8oFcqTkD0oExOyswDEc47NCykKKTmmdfh1aFwA=' 'sha256-ryup/9GePD9DBWqEdHd8MoluL367/pmDD3fbho0d9d8=' 'sha256-5gjsqnLC4jrwczpWnY7xRoSvpNaeWEI25F8R6LlrbqM=' https://esm.sh https://cdn.jsdelivr.net;
+  script-src 'self' 'sha256-vfVDU8oFcqTkD0oExOyswDEc47NCykKKTmmdfh1aFwA=' 'sha256-ryup/9GePD9DBWqEdHd8MoluL367/pmDD3fbho0d9d8=' 'sha256-dZ4Oj7MkziEsmjOeTi4lDOnrCIu6YIu0to4BiXR+w7Q=' https://esm.sh https://cdn.jsdelivr.net;
   style-src 'self' 'unsafe-inline';
   img-src 'self' data: blob:;
   media-src 'self' blob:;
@@ -3684,7 +3684,11 @@ function renderWorkspace() {
     el.onclick = async () => {
       const newChId = el.getAttribute("data-ch");
       if (newChId === State.currentChannel) return;
-      await persistDraft(State.currentChannel, document.getElementById("composer").value);
+      // M15: the composer isn't mounted for every channel (announce channels
+      // the user can't post to, canvas channels), so guard the deref — the
+      // two other composer reads already do. Nothing to persist if absent.
+      const $composerEl = document.getElementById("composer");
+      if ($composerEl) await persistDraft(State.currentChannel, $composerEl.value);
       if (State.currentChannel) {
         markChannelRead(current, State.currentChannel).catch(e => console.warn("markRead:", e));
       }
