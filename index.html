@@ -20,7 +20,7 @@
      The primary XSS defence stays escapeHTML() on all rendered content. -->
 <meta http-equiv="Content-Security-Policy" content="
   default-src 'self';
-  script-src 'self' 'sha256-vfVDU8oFcqTkD0oExOyswDEc47NCykKKTmmdfh1aFwA=' 'sha256-ryup/9GePD9DBWqEdHd8MoluL367/pmDD3fbho0d9d8=' 'sha256-SYgnBy2m35CHsPPUEzA5aLA5dyuSfnS4MhgsDuJBWW8=' https://esm.sh https://cdn.jsdelivr.net;
+  script-src 'self' 'sha256-vfVDU8oFcqTkD0oExOyswDEc47NCykKKTmmdfh1aFwA=' 'sha256-ryup/9GePD9DBWqEdHd8MoluL367/pmDD3fbho0d9d8=' 'sha256-yNZDRSP+ggR6lFwPNfRJSqY2C7YLMA4+jM1qqGimT1o=' https://esm.sh https://cdn.jsdelivr.net;
   style-src 'self' 'unsafe-inline';
   img-src 'self' data: blob:;
   media-src 'self' blob:;
@@ -1746,6 +1746,29 @@ const Crypto = {
     return crypto.subtle.importKey("pkcs8", pkcs8, { name: "Ed25519" }, false, ["sign"]);
   },
 
+  // Canonical bytes of a device certificate: the identity key attests that a
+  // subordinate device key (and its device_id) is allowed to sign on its
+  // behalf. Signed by the identity key; verified against it. `identityB64` is
+  // the signer's user_id so a cert can't be lifted onto a different identity.
+  deviceCertBytes(identityB64, deviceId, devicePub, ts) {
+    return MP.encode({ t: "device-cert", id: identityB64, device_id: deviceId, device_pub: devicePub, ts });
+  },
+  // Mint a device keypair and a self-cert signed by the identity key.
+  async genDeviceCert(identityPub, identityPrivPkcs8) {
+    const kp = await Crypto.genIdentity();          // a plain Ed25519 keypair
+    const deviceId = bytesToB64Url(Crypto.rand(8));
+    const ts = Date.now();
+    const identityB64 = bytesToB64Url(identityPub);
+    const signKey = await Crypto.importSignKey(identityPrivPkcs8);
+    const sig = await Crypto.sign(signKey, Crypto.deviceCertBytes(identityB64, deviceId, kp.pubkey, ts));
+    return {
+      device_id: deviceId,
+      device_pub: kp.pubkey,
+      device_privkey_pkcs8: kp.privkey_pkcs8,
+      device_cert: { device_id: deviceId, device_pub: kp.pubkey, ts, sig },
+    };
+  },
+
   async importVerifyKey(rawPub) {
     return crypto.subtle.importKey("raw", rawPub, { name: "Ed25519" }, false, ["verify"]);
   },
@@ -2084,7 +2107,15 @@ const Envelope = {
    *
    * @returns the envelope object (with `sig`, `ct`, `n`, `pad` populated).
    */
-  async build({ workspaceId, channelId, channelKey, signKey, signerPubkey, deviceId, type, inner, vectorClock }) {
+  async build({ workspaceId, channelId, channelKey, signKey, signerPubkey, deviceId, type, inner, vectorClock, deviceSigner }) {
+    // Per-device signing: the envelope is signed by this install's DEVICE key,
+    // and carries a cert (device_cert) that the identity key issued for that
+    // device. `from` stays the identity pubkey (the user_id), so member ids and
+    // vector clocks are unchanged — only the signer and the added cert are new.
+    // Callers still pass the identity `signKey`; it is no longer used to sign
+    // envelopes (it signs the cert once, at device creation). deviceSigner is an
+    // override for tests / pairing; normally it's the current identity's.
+    const ds = deviceSigner || await Identity.deviceSigner(State.identity);
     const ts = Date.now();
     const nonce = Crypto.rand(12);
     const innerBytes = MP.encode(inner);
@@ -2108,7 +2139,8 @@ const Envelope = {
       ws:   workspaceId,
       ch:   channelId,
       from: userIdB64,
-      dev:  deviceId,
+      dev:  ds.deviceId,                 // this install's certified device_id
+      cert: ds.cert,                     // identity's attestation of the device
       ts,
       lc:   vectorClock,                 // [[user_id, counter], ...]
       type,
@@ -2130,7 +2162,7 @@ const Envelope = {
     //
     // Step 3 is mandatory because pad is part of the signed payload.
     let signedBytes = MP.encode(stripSig(env));
-    let sig = await Crypto.sign(signKey, signedBytes);
+    let sig = await Crypto.sign(ds.signKey, signedBytes);   // device key, not identity
     env.sig = sig;
 
     // Pad to target length. Math (derivation in PROTOCOL.md §3):
@@ -2159,7 +2191,7 @@ const Envelope = {
       env.pad = new Uint8Array(padLen);
       // Re-sign over the canonical bytes including the populated pad.
       signedBytes = MP.encode(stripSig(env));
-      env.sig = await Crypto.sign(signKey, signedBytes);
+      env.sig = await Crypto.sign(ds.signKey, signedBytes);   // device key, not identity
       // Assertion: MP.encode(env).length === target.
       // If this ever fires the math above is wrong — fail loud rather than
       // silently ship mis-aligned envelopes.
@@ -2176,18 +2208,40 @@ const Envelope = {
    * Does NOT decrypt — call decrypt() separately.
    */
   async verify(env) {
-    const fromBytes = b64UrlToBytes(env.from);
-    const verifyKey = await Crypto.importVerifyKey(fromBytes);
-    const signedBytes = MP.encode(stripSig(env));
-    const ok = await Crypto.verify(verifyKey, env.sig, signedBytes);
-    if (!ok) return false;
-    if (env.cosigs) {
-      for (const cs of env.cosigs) {
-        const k = await Crypto.importVerifyKey(b64UrlToBytes(cs.from));
-        if (!(await Crypto.verify(k, cs.sig, signedBytes))) return false;
+    try {
+      const signedBytes = MP.encode(stripSig(env));
+
+      // Per-device chain of trust:
+      //   1. the identity key (env.from) certifies a device key (env.cert),
+      //   2. that device key signed this envelope (env.sig),
+      //   3. the cert is for the device that claims to have sent it (env.dev).
+      // Whether that device is still *allowed* to act (revocation) is an authz
+      // question the dispatch layer answers against the member's active-device
+      // list — verify only proves the envelope is internally self-consistent.
+      const cert = env.cert;
+      if (!cert || !(cert.sig instanceof Uint8Array) || !(cert.device_pub instanceof Uint8Array)) return false;
+      if (cert.device_id !== env.dev) return false;
+
+      const identityKey = await Crypto.importVerifyKey(b64UrlToBytes(env.from));
+      const certBytes = Crypto.deviceCertBytes(env.from, cert.device_id, cert.device_pub, cert.ts);
+      if (!(await Crypto.verify(identityKey, cert.sig, certBytes))) return false;
+
+      const deviceKey = await Crypto.importVerifyKey(cert.device_pub);
+      if (!(await Crypto.verify(deviceKey, env.sig, signedBytes))) return false;
+
+      // Cosigs (promote-by-consensus) are signed by each cosigner's IDENTITY
+      // key over the same envelope bytes — a separate mechanism from the
+      // per-device envelope sig, left as-is.
+      if (env.cosigs) {
+        for (const cs of env.cosigs) {
+          const k = await Crypto.importVerifyKey(b64UrlToBytes(cs.from));
+          if (!(await Crypto.verify(k, cs.sig, signedBytes))) return false;
+        }
       }
+      return true;
+    } catch (_) {
+      return false;
     }
-    return true;
   },
 
   /**
@@ -2326,27 +2380,55 @@ const Identity = {
       // encryption key, not an identity replacement. Losing past DMs /
       // private channels on migration is acceptable because 3b adds them
       // for the first time, and any existing data is a dev-only test.
+      let dirty = false;
       if (!rec.x25519_pub || !rec.x25519_priv_pkcs8) {
         const x = await Crypto.genX25519();
         rec.x25519_pub = x.x25519_pub;
         rec.x25519_priv_pkcs8 = x.x25519_priv_pkcs8;
-        await Identity.save(globalDB, rec);
+        dirty = true;
       }
+      // Device-cert migration: a record from before per-device keys has no
+      // device keypair. Mint one now, certified by the identity key. This is
+      // this browser install's device; it stays stable across workspaces.
+      if (!rec.device_privkey_pkcs8 || !rec.device_cert) {
+        const d = await Crypto.genDeviceCert(rec.pubkey, rec.privkey_pkcs8);
+        Object.assign(rec, d);
+        dirty = true;
+      }
+      if (dirty) await Identity.save(globalDB, rec);
       return rec;
     }
     const kp = await Crypto.genIdentity();
     const x  = await Crypto.genX25519();
+    const d  = await Crypto.genDeviceCert(kp.pubkey, kp.privkey_pkcs8);
     rec = {
       pubkey: kp.pubkey,
       privkey_pkcs8: kp.privkey_pkcs8,
       x25519_pub: x.x25519_pub,
       x25519_priv_pkcs8: x.x25519_priv_pkcs8,
+      // This install's device identity: its own keypair, certified by the
+      // identity key. Envelopes are signed by the device key; the cert lets a
+      // verifier confirm the device speaks for this identity.
+      device_id: d.device_id,
+      device_pub: d.device_pub,
+      device_privkey_pkcs8: d.device_privkey_pkcs8,
+      device_cert: d.device_cert,
       created_at: Date.now(),
       backed_up: false,
       backup_dismissed_at: null
     };
     await Identity.save(globalDB, rec);
     return rec;
+  },
+
+  // The device signer for the current identity: the device sign key + the
+  // cert to embed on every envelope. Cached on the record so we don't re-import
+  // the key on every send.
+  async deviceSigner(rec) {
+    if (!rec._deviceSignKey) {
+      rec._deviceSignKey = await Crypto.importSignKey(rec.device_privkey_pkcs8);
+    }
+    return { signKey: rec._deviceSignKey, cert: rec.device_cert, deviceId: rec.device_id };
   },
   async markBackedUp(globalDB) {
     const rec = await Identity.load(globalDB);
@@ -2370,7 +2452,9 @@ const Workspace = {
     if (!name || !name.trim()) throw new Error("Workspace name required");
     const wsId = bytesToB64Url(Crypto.rand(16));
     const chId = bytesToB64Url(Crypto.rand(16));
-    const deviceId = bytesToB64Url(Crypto.rand(8));
+    // This install's certified device id — stable across workspaces, so
+    // env.dev matches the member's active-device list for revocation.
+    const deviceId = State.identity.device_id;
 
     const wsDB = await openWorkspaceDB(wsId);
 
@@ -7725,7 +7809,7 @@ async function beginJoinHandshake() {
 
     // 2. Create local workspace DB and seed state.
     const wsDB = await openWorkspaceDB(p.ws);
-    const deviceId = bytesToB64Url(Crypto.rand(8));
+    const deviceId = State.identity.device_id;   // certified per-install device id
 
     // Store root key and general channel key.
     await idbPut(wsDB, "keys", p.wrk, "root");
@@ -10016,6 +10100,41 @@ const EnvelopeDispatch = {
       return;
     }
 
+    // 1b. Active-device authorization. verify() proved the cert is
+    // internally consistent; this proves the device is still ALLOWED to act —
+    // i.e. it hasn't been revoked out of its owner's active-device list. This
+    // is the enforcement half of C5: a revoked (or stolen) device's cert stays
+    // valid forever, so the only thing that stops it is dropping envelopes
+    // whose env.dev is no longer in the sender's device list.
+    //
+    // Only at LIVE ingest, never on reload replay: a revoked device's past
+    // messages were authored legitimately while it was active, so revocation
+    // must not retroactively erase history — it stops future authority (here)
+    // and future readership (the rekey).
+    //
+    // Exempt the join handshake: member.join's sender isn't a member yet (it's
+    // the envelope that adds them, gated by the admission grant), and
+    // member.welcome is gated by the C2 inviter+nonce check while the joiner
+    // may not yet know the inviter's device. NOTE: these two are the one path
+    // where a revoked device's envelope can still be persisted and replay on
+    // reload — it's harmless only because the member.join handler is idempotent
+    // for an existing member and member.welcome is bound by the C2 checks. If
+    // either handler's internal guards are ever loosened, revisit this
+    // exemption.
+    //
+    // Scope: this gate covers a *revoked device of a current member*. It does
+    // NOT cover a removed member or an unknown sender — the `sender &&` clause
+    // deliberately lets an envelope whose from isn't a current member through
+    // (its authz is the per-handler checks + the rekey that denies removed
+    // members future keys). Don't mistake this for member-removal enforcement.
+    if (env.type !== "member.join" && env.type !== "member.welcome") {
+      const sender = current.members.find(m => canonUserId(m.id) === canonUserId(env.from));
+      if (sender && !(Array.isArray(sender.devices) && sender.devices.includes(env.dev))) {
+        console.warn("Dropping envelope from a revoked/unknown device:", env.from, env.dev);
+        return;
+      }
+    }
+
     // 2. Dedupe + persist — EXCEPT ephemeral types, which skip both
     //    (each heartbeat is intentionally a new envelope and we don't
     //    want to clutter the envelopes store or survive reload).
@@ -10516,6 +10635,36 @@ const EnvelopeDispatch = {
         // one unusable channel key or member row is skipped, never fatal.
         current.pendingJoin = null;
 
+        // C3: resolve the inviter's X25519 key BEFORE the channels loop.
+        //
+        // The channels loop needs it to unwrap restricted channel keys, but
+        // the only inviter row a joiner has at this point is the stub
+        // beginJoinHandshake seeds with `x25519_pub: null` — the real key
+        // arrives in *this* envelope's member list, which used to be applied
+        // afterwards. So the unwrap always failed and every private channel
+        // and group DM silently vanished for every joiner. Read it out of the
+        // snapshot directly rather than depending on the order of two loops.
+        const senderCanon = canonUserId(env.from);
+        const senderX25519 =
+          (Array.isArray(inner.snapshot?.members)
+            ? inner.snapshot.members.find(m => canonUserId(m?.id) === senderCanon)?.x25519_pub
+            : null)
+          || current.members.find(m => canonUserId(m.id) === senderCanon)?.x25519_pub
+          || null;
+        // Derived once — the KEK is the same for every record in the snapshot.
+        let welcomeKek = null;
+        if (senderX25519) {
+          try {
+            welcomeKek = await Crypto.deriveX25519AesKey(
+              await Crypto.importX25519Priv(State.identity.x25519_priv_pkcs8),
+              await Crypto.importX25519Pub(senderX25519)
+            );
+          } catch (e) { console.warn("member.welcome: cannot derive unwrap key", e); }
+        }
+        const unwrapForMe = async (blob) => new Uint8Array(await crypto.subtle.decrypt(
+          { name: "AES-GCM", iv: blob.iv }, welcomeKek, blob.ct
+        ));
+
         // Apply workspace doc snapshot: channels + their keys + members.
         if (Array.isArray(inner.snapshot?.channels)) {
           for (const ch of inner.snapshot.channels) {
@@ -10527,12 +10676,50 @@ const EnvelopeDispatch = {
                   id: ch.id,
                   name: sanitizeChannelName(ch.name, !!ch.dm),   // H6 — third entry path
                   topic: ch.topic || "",
-                  private: false, members: ch.members || [],
+                  // M9: keep the flags. They used to be dropped here — every
+                  // channel was projected as public, so a group DM rendered
+                  // with public chrome and an announce channel lost its
+                  // post restriction.
+                  private: !!ch.private,
+                  dm: !!ch.dm,
+                  dm_with: ch.dm_with || null,
+                  announce: !!ch.announce,
+                  canvas: !!ch.canvas && !ch.private,
+                  members: ch.members || [],
                   created_at: ch.created_at || env.ts
                 };
+                // C3: public channels carry the key raw; private channels and
+                // group DMs are sealed to our X25519 key by the inviter.
+                //
+                // Enforced on this side too, not just the sender's: refuse a
+                // restricted channel we aren't a member of, and refuse a raw
+                // key for one. Otherwise C3 would be sender-enforced only —
+                // a welcome could still hand us a private channel's key with
+                // `key: raw` and we'd install it.
+                const restricted = !!ch.private || !!ch.dm;
+                let rawKey;
+                if (restricted) {
+                  const meCanon = canonUserId(bytesToB64Url(State.identity.pubkey));
+                  const listed = Array.isArray(ch.members)
+                    && ch.members.some(id => canonUserId(id) === meCanon);
+                  if (!listed) {
+                    console.warn("member.welcome: restricted channel we're not a member of, dropping", ch.id);
+                    continue;
+                  }
+                  if (!ch.wrapped_key) {
+                    console.warn("member.welcome: restricted channel sent unsealed, dropping", ch.id);
+                    continue;
+                  }
+                  if (!welcomeKek) {
+                    console.warn("member.welcome: no unwrap key available for", ch.id);
+                    continue;
+                  }
+                  rawKey = await unwrapForMe(ch.wrapped_key);
+                } else {
+                  rawKey = ch.key;
+                }
                 // Import the key FIRST: an unusable key is the one failure
                 // that must not leave a visible channel we can't decrypt.
-                const rawKey = ch.key;
                 current.channelKeys[ch.id] = await Crypto.importAesRaw(rawKey);
                 await idbPut(current.wsDB, "keys", rawKey, "ch:" + ch.id);
                 current.channels.push(chRec);
@@ -10569,11 +10756,18 @@ const EnvelopeDispatch = {
               await attachFingerprint(m);
               current.members.push(m);
               await idbPut(current.wsDB, "members", m);
-            } else if (!existing.x25519_pub && m.x25519_pub) {
-              // Backfill x25519_pub from the welcome snapshot onto a member
-              // we'd seeded earlier (e.g. the inviter during join handshake).
-              existing.x25519_pub = m.x25519_pub;
-              await idbPut(current.wsDB, "members", existing);
+            } else {
+              // Backfill onto a member we seeded earlier (the inviter, seeded
+              // with x25519_pub:null and devices:[] during the handshake).
+              // devices matters now: the active-device gate drops envelopes
+              // whose env.dev isn't in the sender's device list, so a stale
+              // empty list would drop every message from the inviter.
+              let changed = false;
+              if (!existing.x25519_pub && m.x25519_pub) { existing.x25519_pub = m.x25519_pub; changed = true; }
+              if ((!existing.devices || existing.devices.length === 0) && Array.isArray(m.devices) && m.devices.length) {
+                existing.devices = m.devices; changed = true;
+              }
+              if (changed) await idbPut(current.wsDB, "members", existing);
             }
            } catch (e) {
              console.warn("member.welcome: skipping unusable member record", e);
@@ -10585,17 +10779,33 @@ const EnvelopeDispatch = {
         // Import per-sender group DM keys from the snapshot so the joiner
         // can decrypt group DM history without waiting for individual
         // group_dm.sender_key envelopes to replay.
-        if (Array.isArray(inner.snapshot.senderKeys)) {
-          for (const { channelId, senderId, raw } of inner.snapshot.senderKeys) {
-            if (!channelId || !senderId || !raw) continue;
-            await idbPut(current.wsDB, "keys", raw, "sk:" + channelId + ":" + senderId);
-            current.channelKeys[channelId + ":" + senderId] = await Crypto.importAesRaw(raw);
+        if (Array.isArray(inner.snapshot?.senderKeys)) {
+          // C3: these arrive sealed to our X25519 key now (they decrypt other
+          // people's DMs, so they were the worst thing in the old raw
+          // snapshot). `raw` is still accepted so a snapshot built by a peer
+          // that predates this can still be read — remove that arm once the
+          // fleet has turned over.
+          for (const sk of inner.snapshot.senderKeys) {
+            try {
+              const { channelId, senderId, raw, wrapped } = sk || {};
+              if (!channelId || !senderId) continue;
+              let keyRaw = raw;
+              if (wrapped) {
+                if (!welcomeKek) continue;
+                keyRaw = await unwrapForMe(wrapped);
+              }
+              if (!keyRaw) continue;
+              await idbPut(current.wsDB, "keys", keyRaw, "sk:" + channelId + ":" + senderId);
+              current.channelKeys[channelId + ":" + senderId] = await Crypto.importAesRaw(keyRaw);
+            } catch (e) {
+              console.warn("member.welcome: skipping unusable sender key", e);
+            }
           }
         }
         // After welcome, the joiner can finally enter the workspace shell.
         if (State.view === "join-waiting") {
           State.current = current;
-          State.currentChannel = inner.snapshot.channels[0]?.id || current.meta.general_channel_id;
+          State.currentChannel = inner.snapshot?.channels?.[0]?.id || current.meta.general_channel_id;
           setState({ view: "workspace" });
           // Kick off presence heartbeats for the newly-joined workspace.
           PresenceDriver.start(current);
@@ -11122,35 +11332,94 @@ const EnvelopeDispatch = {
  *  §22  member.welcome + history replay helpers
  * ------------------------------------------------------------ */
 async function sendWelcome(current, targetUserId, joinNonce) {
-  // Build the snapshot: channels with their raw keys, current members,
-  // and per-sender group DM keys so the joiner can decrypt group DM history.
+  // C3: the snapshot used to carry every channel's RAW key — including
+  // private channels and group DMs the recipient has nothing to do with —
+  // inside an envelope encrypted under the workspace root key. Every member
+  // holds that key, so "private" channels were readable by the whole
+  // workspace, and each new joiner was handed the back catalogue.
+  //
+  // Two changes. Membership decides what goes in at all: a private or DM
+  // channel appears only if the target is actually one of its members. And
+  // what does go in is wrapped to the target's X25519 key rather than left
+  // raw, because the envelope itself is readable by every member — filtering
+  // alone would still leak to everyone else on the wire.
+  //
+  // Public channel keys stay raw: every member is entitled to them by
+  // definition, and wrapping them would buy nothing.
+  const targetId = canonUserId(targetUserId);
+  const targetMember = current.members.find(m => canonUserId(m.id) === targetId);
+  const targetPub = targetMember?.x25519_pub || null;
+  const myX25519Priv = await Crypto.importX25519Priv(State.identity.x25519_priv_pkcs8);
+  let targetKek = null;
+  if (targetPub) {
+    targetKek = await Crypto.deriveX25519AesKey(myX25519Priv, await Crypto.importX25519Pub(targetPub));
+  }
+  const wrapForTarget = async (raw) => {
+    const iv = Crypto.rand(12);
+    const ct = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv }, targetKek, raw));
+    return { iv, ct };
+  };
+  const isMemberOf = (ch) =>
+    Array.isArray(ch.members) && ch.members.some(id => canonUserId(id) === targetId);
+
   const snapshotChannels = [];
   for (const ch of current.channels) {
+    const restricted = !!ch.private || !!ch.dm;
+    if (restricted) {
+      // Not theirs — the channel must not appear in the snapshot at all.
+      // Per spec §5.2 private channels are invisible to non-members, so we
+      // leak neither the key nor the fact that the channel exists.
+      if (!isMemberOf(ch)) continue;
+      // Theirs, but we can't wrap for them (no published X25519 key) — skip
+      // rather than fall back to shipping it raw. They can be re-invited to
+      // the channel once their key is known; a silent leak can't be undone.
+      if (!targetKek) {
+        console.warn("welcome: no x25519_pub for target, omitting restricted channel", ch.id);
+        continue;
+      }
+    }
     const raw = await idbGet(current.wsDB, "keys", "ch:" + ch.id);
+    // A missing key would make wrapForTarget throw, and this runs inside the
+    // member.join dispatch case — an exception here stalls the OWNER's causal
+    // buffer for this joiner. Skip the channel instead.
+    if (!raw) {
+      console.warn("welcome: no stored key for channel, omitting", ch.id);
+      continue;
+    }
     snapshotChannels.push({
       id: ch.id,
       name: ch.name,
       topic: ch.topic,
-      // H6: the receiver needs to know this is a group DM. Its name is
-      // built from member display names ("Ada, Grace"), which the channel
-      // slug rule would mangle — without this flag a late joiner projects
-      // a different name than everyone else.
-      //
-      // NOTE (M9 still open): the receiving side does NOT persist `dm` onto
-      // its channel record, so a joiner renders a group DM with public-
-      // channel chrome. That also means this line is only correct because
-      // the welcome is sent by the owner alone (see the `members[0]` gate in
-      // the member.join handler) — the owner is the one peer guaranteed to
-      // hold `dm: true`. If welcome ever moves off that gate, fix M9 first
-      // or late joiners start slugifying group-DM names again.
+      // M9: carry the flags that decide how the channel behaves and renders.
+      // They used to be dropped, so a joiner projected every channel as a
+      // plain public one — a group DM with public chrome, an announce channel
+      // anyone could post to, a canvas that wasn't one.
+      private: !!ch.private,
       dm: !!ch.dm,
+      dm_with: ch.dm_with || null,
+      announce: !!ch.announce,
+      canvas: !!ch.canvas,
       members: ch.members,
       created_at: ch.created_at,
-      key: raw
+      // C3: raw only for public channels, which every member may read
+      // anyway. Restricted ones are sealed to the target's X25519 key.
+      key: (!!ch.private || !!ch.dm) ? undefined : raw,
+      wrapped_key: (!!ch.private || !!ch.dm) ? await wrapForTarget(raw) : undefined
     });
   }
 
-  // Collect all "sk:" sender keys so the joiner can decrypt group DM history.
+  // Per-sender group DM keys, so the joiner can read group DM history it is
+  // entitled to. C3: these are the most sensitive things in the snapshot —
+  // they decrypt other people's DMs — and they were shipped raw, for every
+  // group DM in the workspace, to every joiner. Same rule as the channels:
+  // only for group DMs the target belongs to, and sealed to their key.
+  // Written out rather than as a ternary: the previous form parsed correctly
+  // but read as though it excluded private non-DM channels, which it doesn't.
+  // Restricted-and-ours is the rule; `sk:` entries only exist for group DMs
+  // today, so the private ones simply match nothing.
+  const sendableChannelIds = new Set(
+    current.channels.filter(ch => (ch.private || ch.dm) && isMemberOf(ch)).map(ch => ch.id)
+  );
   const senderKeys = await new Promise((res, rej) => {
     const tx  = current.wsDB.transaction("keys", "readonly");
     const req = tx.objectStore("keys").getAllKeys();
@@ -11162,8 +11431,10 @@ async function sendWelcome(current, targetUserId, joinNonce) {
         if (parts.length < 3) continue;
         const channelId = parts[1];
         const senderId  = parts.slice(2).join(":");
+        if (!sendableChannelIds.has(channelId)) continue;   // not their DM
+        if (!targetKek) continue;                            // can't seal it
         const raw = await idbGet(current.wsDB, "keys", k);
-        if (raw) out.push({ channelId, senderId, raw });
+        if (raw) out.push({ channelId, senderId, wrapped: await wrapForTarget(raw) });
       }
       res(out);
     };
@@ -14026,9 +14297,29 @@ async function sendDeviceRevoke(current, targetDeviceId) {
   PeerMgr.sendEnvelope(meta.id, env).catch(e => console.warn("device.revoke peer:", e));
   RelayMgr.send(meta.id, MP.encode(env)).catch(e => console.warn("device.revoke relay:", e));
   await idbPut(current.wsDB, "keys", meta, "workspace_meta");
-  // Apply locally.
-  me.devices = me.devices.filter(d => d !== targetDeviceId);
-  await idbPut(current.wsDB, "members", me);
+  // Apply locally. The device may belong to ANY member (an admin can revoke
+  // someone else's device), so remove it from whoever actually owns it — not
+  // from `me`. We never receive our own envelope, so this local apply is the
+  // only thing that updates our projection.
+  const owner = current.members.find(m => Array.isArray(m.devices) && m.devices.includes(targetDeviceId)) || me;
+  owner.devices = owner.devices.filter(d => d !== targetDeviceId);
+  await idbPut(current.wsDB, "members", owner);
+
+  // C5: rotate the workspace + channel keys so the revoked device can't
+  // decrypt content sent from here on. Only admins can rekey, and it's the
+  // revoker (not every receiver) who performs it, so it happens exactly once.
+  //
+  // Bound, and stated honestly: this cuts the device off from FUTURE content
+  // only to the extent it doesn't already hold the wrapping key. Today paired
+  // devices share the identity's X25519 key, so revoking one *secondary*
+  // device of a member who stays does NOT stop it reading (it can still
+  // unwrap the new root as that member). What is fully cut off regardless is
+  // SENDING — active-device enforcement drops its envelopes at ingest. Full
+  // read-cutoff needs per-device X25519 wrapping (see plan/pending.md).
+  if (isAdmin(current)) {
+    try { await sendScheduledRekey(current); }
+    catch (e) { console.warn("device.revoke: rekey failed", e); }
+  }
 }
 
 /* ============================================================

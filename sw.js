@@ -25,7 +25,10 @@
 // C6 change the wire format, so a user still on the v2 shell and a user on v3
 // cannot complete a join with each other. Leaving them on a stale shell turns
 // a one-session lag into a silent "Waiting…" hang between the two.
-const CACHE_NAME = "mehfil-shell-v3";
+// v4: per-device cert signing (identity-authz). Envelopes now carry a cert and
+// are device-signed — another wire break, so a v3 shell and a v4 shell can't
+// verify each other's envelopes. Same reasoning as v3: force convergence.
+const CACHE_NAME = "mehfil-shell-v4";
 const PRECACHE = [
   "./",
   "./index.html",
