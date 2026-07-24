@@ -20,7 +20,7 @@
      The primary XSS defence stays escapeHTML() on all rendered content. -->
 <meta http-equiv="Content-Security-Policy" content="
   default-src 'self';
-  script-src 'self' 'sha256-vfVDU8oFcqTkD0oExOyswDEc47NCykKKTmmdfh1aFwA=' 'sha256-ryup/9GePD9DBWqEdHd8MoluL367/pmDD3fbho0d9d8=' 'sha256-dZ4Oj7MkziEsmjOeTi4lDOnrCIu6YIu0to4BiXR+w7Q=' https://esm.sh https://cdn.jsdelivr.net;
+  script-src 'self' 'sha256-vfVDU8oFcqTkD0oExOyswDEc47NCykKKTmmdfh1aFwA=' 'sha256-ryup/9GePD9DBWqEdHd8MoluL367/pmDD3fbho0d9d8=' 'sha256-xCbPbr75ty7UCYWTYHvESPgt5Jwv7b6COeb/KvWIHEI=' https://esm.sh https://cdn.jsdelivr.net;
   style-src 'self' 'unsafe-inline';
   img-src 'self' data: blob:;
   media-src 'self' blob:;
@@ -2181,7 +2181,18 @@ const Envelope = {
     //
     //   This is a closed-form calculation, no iteration needed.
     const L0 = MP.encode(env).length;
-    const target = padTarget(L0);
+    let target = padTarget(L0);
+    // H5: the pad-length prefix grows in steps — bin8 (≤255) then bin16 adds a
+    // header byte — so some deltas are unrepresentable. delta=256 is the gap:
+    // there is no padLen that grows the encoding by exactly 256 (bin8 tops out
+    // at +255, bin16 starts at +257). Given padTarget's 1KB/16KB rounding it's
+    // the only reachable gap, and it hit ~1/1024 of message sizes, firing the
+    // assertion below and aborting the send. Nudge target past any gap so delta
+    // is always representable; being 1 byte off the round boundary doesn't hurt
+    // the length obfuscation.
+    const padRepresentable = (d) =>
+      d === 0 || (d >= 1 && d <= 255) || (d >= 257 && d <= 65536) || (d >= 65539);
+    while (target > L0 && !padRepresentable(target - L0)) target += 1;
     if (target > L0) {
       const delta = target - L0;
       let padLen;
