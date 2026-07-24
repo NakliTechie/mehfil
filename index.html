@@ -20,7 +20,7 @@
      The primary XSS defence stays escapeHTML() on all rendered content. -->
 <meta http-equiv="Content-Security-Policy" content="
   default-src 'self';
-  script-src 'self' 'sha256-vfVDU8oFcqTkD0oExOyswDEc47NCykKKTmmdfh1aFwA=' 'sha256-ryup/9GePD9DBWqEdHd8MoluL367/pmDD3fbho0d9d8=' 'sha256-XQ8k9LYz0d34vmgCnyvW2LXeAhLct2p+AdvISJY8Bjc=' https://esm.sh https://cdn.jsdelivr.net;
+  script-src 'self' 'sha256-vfVDU8oFcqTkD0oExOyswDEc47NCykKKTmmdfh1aFwA=' 'sha256-ryup/9GePD9DBWqEdHd8MoluL367/pmDD3fbho0d9d8=' 'sha256-DO4fe1vH2C6i0RG1O0EGHcuMwQOxl1UBMKn4CRDrr0I=' https://esm.sh https://cdn.jsdelivr.net;
   style-src 'self' 'unsafe-inline';
   img-src 'self' data: blob:;
   media-src 'self' blob:;
@@ -1702,11 +1702,10 @@ function selfTest() {
     [[], "90"],
     [[1, 2], "920102"],
     [{}, "80"],
-    [{ b: 2, a: 1 }, "82a1610182a162"], // see fix below
+    // Canonical encoding sorts keys: a before b → 82 a161 01 a162 02.
+    [{ b: 2, a: 1 }, "82a16101a16202"],
     [new Uint8Array([1,2,3]), "c403010203"],
   ];
-  // Fix the {b:2,a:1} expected — sorted keys: a then b, so 82 a161 01 a162 02
-  cases[16][1] = "82a16101a16202";
 
   for (const [v, hex] of cases) {
     const got = bytesToHex(MP.encode(v));
@@ -2354,8 +2353,14 @@ async function idbDelete(db, store, key) {
 // Return [{key, value}] pairs from a store that uses out-of-line keys.
 // Used by exportWorkspace to preserve the keys-store key names.
 async function idbGetAllEntries(db, store) {
-  const keys   = await reqAsPromise(txStore(db, store).getAllKeys());
-  const values = await reqAsPromise(txStore(db, store).getAll());
+  // S13: read keys and values within ONE transaction so they come from the
+  // same consistent snapshot. Two separate transactions could observe the
+  // store at different states and mis-zip keys[i] to values[i].
+  const s = txStore(db, store);
+  const [keys, values] = await Promise.all([
+    reqAsPromise(s.getAllKeys()),
+    reqAsPromise(s.getAll()),
+  ]);
   return keys.map((k, i) => ({ key: k, value: values[i] }));
 }
 
@@ -4233,10 +4238,17 @@ function renderWorkspace() {
     const msg = current.messages.find(m => m.id === msgId);
     if (!msg || !msg.attachment || !msg.attachment.available) return;
     const a = msg.attachment;
-    const bytes = await BlobStore.get(current.meta.id, a.blob_id, a.key, a.iv);
-    if (!bytes) return;
-    const blob = new Blob([bytes], { type: a.mime });
-    const url = URL.createObjectURL(blob);
+    // M6: render() re-runs on every state change, and this used to mint a new
+    // object URL for the same blob each time, none of them revoked — they
+    // accumulated for the life of the page. Cache one URL per blob_id and reuse
+    // it across renders, so a message with an attachment costs exactly one URL.
+    let url = _attachmentUrlCache.get(a.blob_id);
+    if (!url) {
+      const bytes = await BlobStore.get(current.meta.id, a.blob_id, a.key, a.iv);
+      if (!bytes) return;
+      url = URL.createObjectURL(new Blob([bytes], { type: a.mime }));
+      _attachmentUrlCache.set(a.blob_id, url);
+    }
     if (el.tagName === "IMG") {
       el.src = url;
       // noopener,noreferrer severs window.opener so an SVG (or any image)
@@ -4253,9 +4265,9 @@ function renderWorkspace() {
         link.click();
       };
     }
-    // Note: we deliberately don't revokeObjectURL because the image needs
-    // to stay rendered for the lifetime of the view. These get GC'd when
-    // the page unloads. LRU eviction runs automatically via BlobStore._checkQuota.
+    // The cached URL stays valid for the life of the view (reused across
+    // renders via _attachmentUrlCache); released on page unload. Underlying
+    // blobs are LRU-evicted via BlobStore._checkQuota.
   });
 
   // Message actions (edit / delete / react / thread / pin) — hover-revealed buttons.
@@ -5062,6 +5074,11 @@ function formatBytes(n) {
 // the in-memory message record + re-renders if the workspace view
 // is still active. Idempotent + self-deduplicating.
 const _attachmentCheckInflight = new Set();
+// M6: object URL per attachment blob_id, reused across renders so we don't
+// leak a fresh one every render. Bounded by the number of distinct attachments
+// the user has viewed this session; the underlying blobs are LRU-evicted by
+// BlobStore, and all URLs are released when the page unloads.
+const _attachmentUrlCache = new Map();
 async function maybeCheckAttachmentAvailable(msg) {
   if (!msg.attachment || msg.attachment.available !== null) return;
   if (_attachmentCheckInflight.has(msg.id)) return;
@@ -8165,8 +8182,12 @@ const TrustCard = {
       return {
         shape: this.shapes[fpBytes[o] & 0x03],
         color: this.palette[fpBytes[o + 1] & 0x07],
-        rotate: (fpBytes[o + 2] & 0x03) * 90,
-        variant: fpBytes[o + 3] & 0x01
+        rotate: (fpBytes[o + 2] & 0x03) * 90
+        // S3: `variant` (fpBytes[o+3] & 0x01) was computed here and never read
+        // by render(), so every 4th fingerprint byte contributed nothing to the
+        // trust card. Removed the dead field. (Widening the card to use those
+        // bytes would raise its discriminating power but changes the security
+        // visual for existing users — left for a deliberate human call.)
       };
     });
     const parts = [`<svg xmlns="http://www.w3.org/2000/svg" width="${size}" height="${size}" viewBox="0 0 ${size} ${size}" style="border-radius: 8px; background: var(--bg-sunken);">`];
@@ -9106,8 +9127,8 @@ const PeerMgr = {
 
   /**
    * ACK is point-to-point — only send back to the peer we received
-   * from. Required `excludePeer` is unused here; we send only to the
-   * named peer.
+   * from. (S5: there is no `excludePeer` param on this path; a stale
+   * comment referenced one. We send only to the named peer.)
    */
   async sendAck(workspaceId, envelopeId, peerUserId) {
     const wsPeers = this.peers.get(workspaceId);
@@ -13400,7 +13421,6 @@ async function sendWorkspacePatch(current, updateBytes) {
  */
 const TypingMgr = {
   _lastSentAt: 0,
-  _localStop: null,     // timer to mark self-stopped (future; unused)
   // Receiver-side projection: Map<channelId, Map<userId, until_ts>>
   _fading: new Map(),
 
