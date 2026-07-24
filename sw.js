@@ -32,7 +32,11 @@
 // hardening, leak/dead-code cleanup). NOT a wire break — a v4 and v5 shell
 // interoperate (verified both directions) — so the bump is only to get the
 // fixes to cached users, not to force convergence.
-const CACHE_NAME = "mehfil-shell-v5";
+// v6: admission control (grants + admin-only promote). member.join now
+// requires an inviter-signed grant, so a v5 shell and a v6 shell cannot
+// complete a join with each other — a wire break, like v3/v4. Bump forces
+// convergence so the mixed-version window stays short.
+const CACHE_NAME = "mehfil-shell-v6";
 const PRECACHE = [
   "./",
   "./index.html",
