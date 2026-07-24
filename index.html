@@ -20,7 +20,7 @@
      The primary XSS defence stays escapeHTML() on all rendered content. -->
 <meta http-equiv="Content-Security-Policy" content="
   default-src 'self';
-  script-src 'self' 'sha256-vfVDU8oFcqTkD0oExOyswDEc47NCykKKTmmdfh1aFwA=' 'sha256-ryup/9GePD9DBWqEdHd8MoluL367/pmDD3fbho0d9d8=' 'sha256-sVFkuhZCz/c1NALm8w1pAaODYjmIp2zvO6cuZJX5HvM=' https://esm.sh https://cdn.jsdelivr.net;
+  script-src 'self' 'sha256-vfVDU8oFcqTkD0oExOyswDEc47NCykKKTmmdfh1aFwA=' 'sha256-ryup/9GePD9DBWqEdHd8MoluL367/pmDD3fbho0d9d8=' 'sha256-yu+grEOwE5351dYyY6k4WUFN8OiSyP3M++0owbsBawU=' https://esm.sh https://cdn.jsdelivr.net;
   style-src 'self' 'unsafe-inline';
   img-src 'self' data: blob:;
   media-src 'self' blob:;
@@ -10100,6 +10100,30 @@ const EnvelopeDispatch = {
       return;
     }
 
+    // 1b. Active-device authorization. verify() proved the cert is
+    // internally consistent; this proves the device is still ALLOWED to act —
+    // i.e. it hasn't been revoked out of its owner's active-device list. This
+    // is the enforcement half of C5: a revoked (or stolen) device's cert stays
+    // valid forever, so the only thing that stops it is dropping envelopes
+    // whose env.dev is no longer in the sender's device list.
+    //
+    // Only at LIVE ingest, never on reload replay: a revoked device's past
+    // messages were authored legitimately while it was active, so revocation
+    // must not retroactively erase history — it stops future authority (here)
+    // and future readership (the rekey).
+    //
+    // Exempt the join handshake: member.join's sender isn't a member yet (it's
+    // the envelope that adds them, gated by the admission grant), and
+    // member.welcome is gated by the C2 inviter+nonce check while the joiner
+    // may not yet know the inviter's device.
+    if (env.type !== "member.join" && env.type !== "member.welcome") {
+      const sender = current.members.find(m => canonUserId(m.id) === canonUserId(env.from));
+      if (sender && !(Array.isArray(sender.devices) && sender.devices.includes(env.dev))) {
+        console.warn("Dropping envelope from a revoked/unknown device:", env.from, env.dev);
+        return;
+      }
+    }
+
     // 2. Dedupe + persist — EXCEPT ephemeral types, which skip both
     //    (each heartbeat is intentionally a new envelope and we don't
     //    want to clutter the envelopes store or survive reload).
@@ -10721,11 +10745,18 @@ const EnvelopeDispatch = {
               await attachFingerprint(m);
               current.members.push(m);
               await idbPut(current.wsDB, "members", m);
-            } else if (!existing.x25519_pub && m.x25519_pub) {
-              // Backfill x25519_pub from the welcome snapshot onto a member
-              // we'd seeded earlier (e.g. the inviter during join handshake).
-              existing.x25519_pub = m.x25519_pub;
-              await idbPut(current.wsDB, "members", existing);
+            } else {
+              // Backfill onto a member we seeded earlier (the inviter, seeded
+              // with x25519_pub:null and devices:[] during the handshake).
+              // devices matters now: the active-device gate drops envelopes
+              // whose env.dev isn't in the sender's device list, so a stale
+              // empty list would drop every message from the inviter.
+              let changed = false;
+              if (!existing.x25519_pub && m.x25519_pub) { existing.x25519_pub = m.x25519_pub; changed = true; }
+              if ((!existing.devices || existing.devices.length === 0) && Array.isArray(m.devices) && m.devices.length) {
+                existing.devices = m.devices; changed = true;
+              }
+              if (changed) await idbPut(current.wsDB, "members", existing);
             }
            } catch (e) {
              console.warn("member.welcome: skipping unusable member record", e);
