@@ -20,7 +20,7 @@
      The primary XSS defence stays escapeHTML() on all rendered content. -->
 <meta http-equiv="Content-Security-Policy" content="
   default-src 'self';
-  script-src 'self' 'sha256-vfVDU8oFcqTkD0oExOyswDEc47NCykKKTmmdfh1aFwA=' 'sha256-ryup/9GePD9DBWqEdHd8MoluL367/pmDD3fbho0d9d8=' 'sha256-DO4fe1vH2C6i0RG1O0EGHcuMwQOxl1UBMKn4CRDrr0I=' https://esm.sh https://cdn.jsdelivr.net;
+  script-src 'self' 'sha256-vfVDU8oFcqTkD0oExOyswDEc47NCykKKTmmdfh1aFwA=' 'sha256-ryup/9GePD9DBWqEdHd8MoluL367/pmDD3fbho0d9d8=' 'sha256-3DwhRl40XViob0o9XBMFrfSx8tJR89gGKhNY+DtRxIg=' https://esm.sh https://cdn.jsdelivr.net;
   style-src 'self' 'unsafe-inline';
   img-src 'self' data: blob:;
   media-src 'self' blob:;
@@ -2113,6 +2113,7 @@ const PROMOTE_THRESHOLD = 2;
 /* The only roles the projection admits. A member.welcome snapshot is
  * peer-supplied, so its `role` fields are clamped to this set (C2). */
 const MEMBER_ROLES = ["owner", "admin", "member"];
+const isAdminRole = (role) => role === "owner" || role === "admin";
 
 /* Grace on the invite expiry check (C6/M8), so a joiner with a fast clock
  * doesn't reject a still-valid invite and blame the inviter. */
@@ -11308,7 +11309,11 @@ const EnvelopeDispatch = {
           // member rows and cast two votes.
           const signerId = canonUserId(signer.user_id);
           if (!signerId) continue;
-          if (!current.members.some(m => canonUserId(m.id) === signerId)) continue;
+          // Admission decision (2026-07-24): a promote vote counts only from an
+          // ADMIN, not any member. Plain-member sock puppets (which a malicious
+          // member can mint) must not be able to reach the promote threshold —
+          // that was C4's residual escalation path. Resolves H8 (spec: 2-of-N).
+          if (!current.members.some(m => canonUserId(m.id) === signerId && isAdminRole(m.role))) continue;
           // C4: the target can't vote for their own promotion.
           if (signerId === targetId) continue;
           try {
@@ -11320,8 +11325,15 @@ const EnvelopeDispatch = {
           } catch (_) { /* bad sig — ignore */ }
         }
 
-        if (validSigners.size < PROMOTE_THRESHOLD) {
-          console.warn("member.promote: insufficient valid signers (" + validSigners.size + "), dropping");
+        // 2-of-N admins, but bounded by how many admins actually exist so a
+        // sole owner can still bootstrap the first admin: min(2, adminCount).
+        // Target excluded from the count — they can't be one of their own
+        // approvers.
+        const adminCount = current.members.filter(
+          m => isAdminRole(m.role) && canonUserId(m.id) !== targetId).length;
+        const needed = Math.min(PROMOTE_THRESHOLD, Math.max(1, adminCount));
+        if (validSigners.size < needed) {
+          console.warn("member.promote: need " + needed + " admin signer(s), got " + validSigners.size + ", dropping");
           break;
         }
 
@@ -14590,8 +14602,16 @@ async function finalizePromotion(current, proposalId) {
   const promos   = WorkspaceDoc.getPendingPromotions(current.doc);
   const proposal = promos.find(p => p.id === proposalId);
   if (!proposal) throw new Error("Proposal not found.");
-  if (proposal.cosigs.length < PROMOTE_THRESHOLD) {
-    throw new Error("Need at least " + PROMOTE_THRESHOLD + " supporters first.");
+  // Sender-side pre-check mirroring the handler: need min(2, adminCount) admin
+  // supporters, so a sole owner can bootstrap the first admin. The handler is
+  // the authority; this is just so the UI fails early with a clear message.
+  const adminCount = current.members.filter(
+    m => isAdminRole(m.role) && m.id !== proposal.target_id).length;
+  const needed = Math.min(PROMOTE_THRESHOLD, Math.max(1, adminCount));
+  const adminCosigs = proposal.cosigs.filter(
+    s => current.members.some(m => canonUserId(m.id) === canonUserId(s.user_id) && isAdminRole(m.role))).length;
+  if (adminCosigs < needed) {
+    throw new Error("Need " + needed + " admin supporter(s) first.");
   }
 
   const nonce      = b64ToBytes(proposal.nonce_b64);
