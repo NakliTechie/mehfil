@@ -20,7 +20,7 @@
      The primary XSS defence stays escapeHTML() on all rendered content. -->
 <meta http-equiv="Content-Security-Policy" content="
   default-src 'self';
-  script-src 'self' 'sha256-vfVDU8oFcqTkD0oExOyswDEc47NCykKKTmmdfh1aFwA=' 'sha256-ryup/9GePD9DBWqEdHd8MoluL367/pmDD3fbho0d9d8=' 'sha256-f5rksXpjNlUM0jqsL5Rn0TXNNYn/tp6EXO1X1cDOIf4=' https://esm.sh https://cdn.jsdelivr.net;
+  script-src 'self' 'sha256-vfVDU8oFcqTkD0oExOyswDEc47NCykKKTmmdfh1aFwA=' 'sha256-ryup/9GePD9DBWqEdHd8MoluL367/pmDD3fbho0d9d8=' 'sha256-sVFkuhZCz/c1NALm8w1pAaODYjmIp2zvO6cuZJX5HvM=' https://esm.sh https://cdn.jsdelivr.net;
   style-src 'self' 'unsafe-inline';
   img-src 'self' data: blob:;
   media-src 'self' blob:;
@@ -1746,6 +1746,29 @@ const Crypto = {
     return crypto.subtle.importKey("pkcs8", pkcs8, { name: "Ed25519" }, false, ["sign"]);
   },
 
+  // Canonical bytes of a device certificate: the identity key attests that a
+  // subordinate device key (and its device_id) is allowed to sign on its
+  // behalf. Signed by the identity key; verified against it. `identityB64` is
+  // the signer's user_id so a cert can't be lifted onto a different identity.
+  deviceCertBytes(identityB64, deviceId, devicePub, ts) {
+    return MP.encode({ t: "device-cert", id: identityB64, device_id: deviceId, device_pub: devicePub, ts });
+  },
+  // Mint a device keypair and a self-cert signed by the identity key.
+  async genDeviceCert(identityPub, identityPrivPkcs8) {
+    const kp = await Crypto.genIdentity();          // a plain Ed25519 keypair
+    const deviceId = bytesToB64Url(Crypto.rand(8));
+    const ts = Date.now();
+    const identityB64 = bytesToB64Url(identityPub);
+    const signKey = await Crypto.importSignKey(identityPrivPkcs8);
+    const sig = await Crypto.sign(signKey, Crypto.deviceCertBytes(identityB64, deviceId, kp.pubkey, ts));
+    return {
+      device_id: deviceId,
+      device_pub: kp.pubkey,
+      device_privkey_pkcs8: kp.privkey_pkcs8,
+      device_cert: { device_id: deviceId, device_pub: kp.pubkey, ts, sig },
+    };
+  },
+
   async importVerifyKey(rawPub) {
     return crypto.subtle.importKey("raw", rawPub, { name: "Ed25519" }, false, ["verify"]);
   },
@@ -2084,7 +2107,15 @@ const Envelope = {
    *
    * @returns the envelope object (with `sig`, `ct`, `n`, `pad` populated).
    */
-  async build({ workspaceId, channelId, channelKey, signKey, signerPubkey, deviceId, type, inner, vectorClock }) {
+  async build({ workspaceId, channelId, channelKey, signKey, signerPubkey, deviceId, type, inner, vectorClock, deviceSigner }) {
+    // Per-device signing: the envelope is signed by this install's DEVICE key,
+    // and carries a cert (device_cert) that the identity key issued for that
+    // device. `from` stays the identity pubkey (the user_id), so member ids and
+    // vector clocks are unchanged — only the signer and the added cert are new.
+    // Callers still pass the identity `signKey`; it is no longer used to sign
+    // envelopes (it signs the cert once, at device creation). deviceSigner is an
+    // override for tests / pairing; normally it's the current identity's.
+    const ds = deviceSigner || await Identity.deviceSigner(State.identity);
     const ts = Date.now();
     const nonce = Crypto.rand(12);
     const innerBytes = MP.encode(inner);
@@ -2108,7 +2139,8 @@ const Envelope = {
       ws:   workspaceId,
       ch:   channelId,
       from: userIdB64,
-      dev:  deviceId,
+      dev:  ds.deviceId,                 // this install's certified device_id
+      cert: ds.cert,                     // identity's attestation of the device
       ts,
       lc:   vectorClock,                 // [[user_id, counter], ...]
       type,
@@ -2130,7 +2162,7 @@ const Envelope = {
     //
     // Step 3 is mandatory because pad is part of the signed payload.
     let signedBytes = MP.encode(stripSig(env));
-    let sig = await Crypto.sign(signKey, signedBytes);
+    let sig = await Crypto.sign(ds.signKey, signedBytes);   // device key, not identity
     env.sig = sig;
 
     // Pad to target length. Math (derivation in PROTOCOL.md §3):
@@ -2159,7 +2191,7 @@ const Envelope = {
       env.pad = new Uint8Array(padLen);
       // Re-sign over the canonical bytes including the populated pad.
       signedBytes = MP.encode(stripSig(env));
-      env.sig = await Crypto.sign(signKey, signedBytes);
+      env.sig = await Crypto.sign(ds.signKey, signedBytes);   // device key, not identity
       // Assertion: MP.encode(env).length === target.
       // If this ever fires the math above is wrong — fail loud rather than
       // silently ship mis-aligned envelopes.
@@ -2176,18 +2208,40 @@ const Envelope = {
    * Does NOT decrypt — call decrypt() separately.
    */
   async verify(env) {
-    const fromBytes = b64UrlToBytes(env.from);
-    const verifyKey = await Crypto.importVerifyKey(fromBytes);
-    const signedBytes = MP.encode(stripSig(env));
-    const ok = await Crypto.verify(verifyKey, env.sig, signedBytes);
-    if (!ok) return false;
-    if (env.cosigs) {
-      for (const cs of env.cosigs) {
-        const k = await Crypto.importVerifyKey(b64UrlToBytes(cs.from));
-        if (!(await Crypto.verify(k, cs.sig, signedBytes))) return false;
+    try {
+      const signedBytes = MP.encode(stripSig(env));
+
+      // Per-device chain of trust:
+      //   1. the identity key (env.from) certifies a device key (env.cert),
+      //   2. that device key signed this envelope (env.sig),
+      //   3. the cert is for the device that claims to have sent it (env.dev).
+      // Whether that device is still *allowed* to act (revocation) is an authz
+      // question the dispatch layer answers against the member's active-device
+      // list — verify only proves the envelope is internally self-consistent.
+      const cert = env.cert;
+      if (!cert || !(cert.sig instanceof Uint8Array) || !(cert.device_pub instanceof Uint8Array)) return false;
+      if (cert.device_id !== env.dev) return false;
+
+      const identityKey = await Crypto.importVerifyKey(b64UrlToBytes(env.from));
+      const certBytes = Crypto.deviceCertBytes(env.from, cert.device_id, cert.device_pub, cert.ts);
+      if (!(await Crypto.verify(identityKey, cert.sig, certBytes))) return false;
+
+      const deviceKey = await Crypto.importVerifyKey(cert.device_pub);
+      if (!(await Crypto.verify(deviceKey, env.sig, signedBytes))) return false;
+
+      // Cosigs (promote-by-consensus) are signed by each cosigner's IDENTITY
+      // key over the same envelope bytes — a separate mechanism from the
+      // per-device envelope sig, left as-is.
+      if (env.cosigs) {
+        for (const cs of env.cosigs) {
+          const k = await Crypto.importVerifyKey(b64UrlToBytes(cs.from));
+          if (!(await Crypto.verify(k, cs.sig, signedBytes))) return false;
+        }
       }
+      return true;
+    } catch (_) {
+      return false;
     }
-    return true;
   },
 
   /**
@@ -2326,27 +2380,55 @@ const Identity = {
       // encryption key, not an identity replacement. Losing past DMs /
       // private channels on migration is acceptable because 3b adds them
       // for the first time, and any existing data is a dev-only test.
+      let dirty = false;
       if (!rec.x25519_pub || !rec.x25519_priv_pkcs8) {
         const x = await Crypto.genX25519();
         rec.x25519_pub = x.x25519_pub;
         rec.x25519_priv_pkcs8 = x.x25519_priv_pkcs8;
-        await Identity.save(globalDB, rec);
+        dirty = true;
       }
+      // Device-cert migration: a record from before per-device keys has no
+      // device keypair. Mint one now, certified by the identity key. This is
+      // this browser install's device; it stays stable across workspaces.
+      if (!rec.device_privkey_pkcs8 || !rec.device_cert) {
+        const d = await Crypto.genDeviceCert(rec.pubkey, rec.privkey_pkcs8);
+        Object.assign(rec, d);
+        dirty = true;
+      }
+      if (dirty) await Identity.save(globalDB, rec);
       return rec;
     }
     const kp = await Crypto.genIdentity();
     const x  = await Crypto.genX25519();
+    const d  = await Crypto.genDeviceCert(kp.pubkey, kp.privkey_pkcs8);
     rec = {
       pubkey: kp.pubkey,
       privkey_pkcs8: kp.privkey_pkcs8,
       x25519_pub: x.x25519_pub,
       x25519_priv_pkcs8: x.x25519_priv_pkcs8,
+      // This install's device identity: its own keypair, certified by the
+      // identity key. Envelopes are signed by the device key; the cert lets a
+      // verifier confirm the device speaks for this identity.
+      device_id: d.device_id,
+      device_pub: d.device_pub,
+      device_privkey_pkcs8: d.device_privkey_pkcs8,
+      device_cert: d.device_cert,
       created_at: Date.now(),
       backed_up: false,
       backup_dismissed_at: null
     };
     await Identity.save(globalDB, rec);
     return rec;
+  },
+
+  // The device signer for the current identity: the device sign key + the
+  // cert to embed on every envelope. Cached on the record so we don't re-import
+  // the key on every send.
+  async deviceSigner(rec) {
+    if (!rec._deviceSignKey) {
+      rec._deviceSignKey = await Crypto.importSignKey(rec.device_privkey_pkcs8);
+    }
+    return { signKey: rec._deviceSignKey, cert: rec.device_cert, deviceId: rec.device_id };
   },
   async markBackedUp(globalDB) {
     const rec = await Identity.load(globalDB);
@@ -2370,7 +2452,9 @@ const Workspace = {
     if (!name || !name.trim()) throw new Error("Workspace name required");
     const wsId = bytesToB64Url(Crypto.rand(16));
     const chId = bytesToB64Url(Crypto.rand(16));
-    const deviceId = bytesToB64Url(Crypto.rand(8));
+    // This install's certified device id — stable across workspaces, so
+    // env.dev matches the member's active-device list for revocation.
+    const deviceId = State.identity.device_id;
 
     const wsDB = await openWorkspaceDB(wsId);
 
@@ -7725,7 +7809,7 @@ async function beginJoinHandshake() {
 
     // 2. Create local workspace DB and seed state.
     const wsDB = await openWorkspaceDB(p.ws);
-    const deviceId = bytesToB64Url(Crypto.rand(8));
+    const deviceId = State.identity.device_id;   // certified per-install device id
 
     // Store root key and general channel key.
     await idbPut(wsDB, "keys", p.wrk, "root");
