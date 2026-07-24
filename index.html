@@ -20,7 +20,7 @@
      The primary XSS defence stays escapeHTML() on all rendered content. -->
 <meta http-equiv="Content-Security-Policy" content="
   default-src 'self';
-  script-src 'self' 'sha256-vfVDU8oFcqTkD0oExOyswDEc47NCykKKTmmdfh1aFwA=' 'sha256-ryup/9GePD9DBWqEdHd8MoluL367/pmDD3fbho0d9d8=' 'sha256-xCbPbr75ty7UCYWTYHvESPgt5Jwv7b6COeb/KvWIHEI=' https://esm.sh https://cdn.jsdelivr.net;
+  script-src 'self' 'sha256-vfVDU8oFcqTkD0oExOyswDEc47NCykKKTmmdfh1aFwA=' 'sha256-ryup/9GePD9DBWqEdHd8MoluL367/pmDD3fbho0d9d8=' 'sha256-zqRdZ8mXNDHJ1x3LCw51Ap2Z4I5Dbn0tUXyRcKOfW6o=' https://esm.sh https://cdn.jsdelivr.net;
   style-src 'self' 'unsafe-inline';
   img-src 'self' data: blob:;
   media-src 'self' blob:;
@@ -1532,21 +1532,36 @@ const MP = (() => {
 
   /* ---- decode ---- */
 
+  // M4: bound untrusted input. Two DoS vectors on a decoder fed peer/relay
+  // bytes: unbounded nesting (decVal → decMap/decArr → decVal → …) blows the
+  // stack, and a large declared length runs `new Array(n)` / a big slice with
+  // n up to 2^32. MP_MAX_DEPTH caps nesting; the per-collection check below
+  // rejects any length that exceeds the bytes actually remaining — a valid
+  // msgpack can never declare more elements/bytes than it carries, so this
+  // costs legitimate envelopes nothing.
+  const MP_MAX_DEPTH = 64;
+  function mpRemaining(st) { return st.b.length - st.p; }
+  function mpBoundLen(st, n) {
+    if (n > mpRemaining(st)) throw new Error("MP decode: declared length exceeds input");
+    return n;
+  }
+
   function decode(bytes) {
     const st = { b: bytes, p: 0 };
-    const v = decVal(st);
+    const v = decVal(st, 0);
     if (st.p !== bytes.length) throw new Error("MP decode: trailing bytes");
     return v;
   }
 
-  function decVal(st) {
+  function decVal(st, depth = 0) {
+    if (depth > MP_MAX_DEPTH) throw new Error("MP decode: max nesting depth exceeded");
     const c = st.b[st.p++];
     // positive fixint
     if (c <= 0x7f) return c;
     // fixmap
-    if (c >= 0x80 && c <= 0x8f) return decMap(st, c & 0x0f);
+    if (c >= 0x80 && c <= 0x8f) return decMap(st, c & 0x0f, depth);
     // fixarray
-    if (c >= 0x90 && c <= 0x9f) return decArr(st, c & 0x0f);
+    if (c >= 0x90 && c <= 0x9f) return decArr(st, c & 0x0f, depth);
     // fixstr
     if (c >= 0xa0 && c <= 0xbf) return decStr(st, c & 0x1f);
     // negative fixint
@@ -1572,37 +1587,41 @@ const MP = (() => {
       case 0xd9: return decStr(st, readU8(st));
       case 0xda: return decStr(st, readU16(st));
       case 0xdb: return decStr(st, readU32(st));
-      case 0xdc: return decArr(st, readU16(st));
-      case 0xdd: return decArr(st, readU32(st));
-      case 0xde: return decMap(st, readU16(st));
-      case 0xdf: return decMap(st, readU32(st));
+      case 0xdc: return decArr(st, readU16(st), depth);
+      case 0xdd: return decArr(st, readU32(st), depth);
+      case 0xde: return decMap(st, readU16(st), depth);
+      case 0xdf: return decMap(st, readU32(st), depth);
       default: throw new Error("MP decode: unknown type 0x" + c.toString(16));
     }
   }
 
   function decStr(st, n) {
+    mpBoundLen(st, n);
     const s = utf8dec.decode(st.b.subarray(st.p, st.p + n));
     st.p += n;
     return s;
   }
   function decBin(st, n) {
+    mpBoundLen(st, n);
     const b = st.b.slice(st.p, st.p + n);
     st.p += n;
     return b;
   }
-  function decArr(st, n) {
+  function decArr(st, n, depth) {
+    mpBoundLen(st, n);   // n elements need ≥ n bytes remaining
     const a = new Array(n);
-    for (let i = 0; i < n; i++) a[i] = decVal(st);
+    for (let i = 0; i < n; i++) a[i] = decVal(st, depth + 1);
     return a;
   }
-  function decMap(st, n) {
+  function decMap(st, n, depth) {
+    mpBoundLen(st, n);   // n entries need ≥ n bytes remaining
     // Use Object.create(null) so there is no prototype to pollute.
     // A msgpack map with key "__proto__" would otherwise change the
     // decoded object's prototype chain via o["__proto__"] = value,
     // allowing a peer to control property lookups on missing own keys.
     const o = Object.create(null);
     for (let i = 0; i < n; i++) {
-      const k = decVal(st);
+      const k = decVal(st, depth + 1);
       if (typeof k !== "string") throw new Error("MP decode: non-string map key");
       // Explicitly block dangerous prototype keys even with null prototype,
       // as a defense-in-depth measure for any downstream JSON.parse paths.
@@ -1610,7 +1629,7 @@ const MP = (() => {
         throw new Error("MP decode: forbidden map key: " + k);
       }
       if (Object.prototype.hasOwnProperty.call(o, k)) throw new Error("MP decode: duplicate map key " + k);
-      o[k] = decVal(st);
+      o[k] = decVal(st, depth + 1);
     }
     return o;
   }
@@ -9949,6 +9968,9 @@ const WorkspaceDoc = {
 // length prefix) so the framed packet stays under the limit even at
 // the maximum total_chunks count.
 const CHUNK_SIZE = 14 * 1024;   // 14KB of payload per chunk
+// M5: the most chunks a within-limits blob can legitimately need, plus slack.
+// A peer claiming more than this is rejected before it can size a buffer on it.
+const MAX_BLOB_CHUNKS = Math.ceil(MAX_ATTACHMENT_SIZE / CHUNK_SIZE) + 16;
 const AUTO_FETCH_SIZE_LIMIT = 1024 * 1024;   // auto-fetch images ≤ 1MB
 
 const BlobTransfer = {
@@ -10012,10 +10034,21 @@ const BlobTransfer = {
       return;
     }
     if (state.total === null) {
-      // First chunk — size the buffer.
+      // First chunk sizes the buffer. M5: `total` is peer-supplied, so
+      // `new Array(total)` was an unbounded allocation. A blob is capped at
+      // MAX_ATTACHMENT_SIZE and chunked at CHUNK_SIZE, so anything past that
+      // many chunks is a lie — reject it rather than allocate on it.
+      if (!Number.isInteger(chunk.total) || chunk.total <= 0 || chunk.total > MAX_BLOB_CHUNKS) {
+        console.warn("blob: implausible chunk total, dropping", chunk.total);
+        this._inbound.delete(chunk.blob_id);
+        return;
+      }
       state.total = chunk.total;
       state.chunks = new Array(chunk.total);
     }
+    // M5: seq indexes the buffer, so an out-of-range seq writes a stray sparse
+    // slot (and would never complete). Bound it to [0, total).
+    if (!Number.isInteger(chunk.seq) || chunk.seq < 0 || chunk.seq >= state.total) return;
     if (state.received.has(chunk.seq)) return;   // duplicate, ignore
     state.chunks[chunk.seq] = chunk.data;
     state.received.add(chunk.seq);
@@ -15527,10 +15560,15 @@ async function openDevicePairInitiatorModal(current) {
       if (r.status === 404) return;
       if (!r.ok) throw new Error(`Relay error ${r.status}`);
       const { payload } = await r.json();
-      clearInterval(State.pairingSession.pollTimer);
 
+      // M14: decrypt and validate BEFORE stopping the poll. The interval used
+      // to be cleared here, so a single malformed payload (a decrypt failure,
+      // or garbage written to the relay's pairing slot) killed the pairing
+      // attempt permanently. Now a bad payload throws to the catch below with
+      // the poll still running, and we keep waiting for a valid response.
       const response = await PairingCode.decrypt(pairingAesKey, payload);
       if (response.type !== "device.pair.response") throw new Error("Unexpected response type");
+      clearInterval(State.pairingSession.pollTimer);
 
       const ephem_ed_pub_B = b64ToBytes(response.ephem_ed_pub_B);
       const fpB     = await Crypto.sha256(ephem_ed_pub_B);
