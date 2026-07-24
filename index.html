@@ -20,7 +20,7 @@
      The primary XSS defence stays escapeHTML() on all rendered content. -->
 <meta http-equiv="Content-Security-Policy" content="
   default-src 'self';
-  script-src 'self' 'sha256-vfVDU8oFcqTkD0oExOyswDEc47NCykKKTmmdfh1aFwA=' 'sha256-ryup/9GePD9DBWqEdHd8MoluL367/pmDD3fbho0d9d8=' 'sha256-3DwhRl40XViob0o9XBMFrfSx8tJR89gGKhNY+DtRxIg=' https://esm.sh https://cdn.jsdelivr.net;
+  script-src 'self' 'sha256-vfVDU8oFcqTkD0oExOyswDEc47NCykKKTmmdfh1aFwA=' 'sha256-ryup/9GePD9DBWqEdHd8MoluL367/pmDD3fbho0d9d8=' 'sha256-eQEP0fcfx3bUhpk/JR9XghkGgn24MZpKYOoyCqvyjko=' https://esm.sh https://cdn.jsdelivr.net;
   style-src 'self' 'unsafe-inline';
   img-src 'self' data: blob:;
   media-src 'self' blob:;
@@ -2114,6 +2114,45 @@ const PROMOTE_THRESHOLD = 2;
  * peer-supplied, so its `role` fields are clamped to this set (C2). */
 const MEMBER_ROLES = ["owner", "admin", "member"];
 const isAdminRole = (role) => role === "owner" || role === "admin";
+
+/* Admission grants (2026-07-24). `member.join` used to be self-asserted — any
+ * root-key holder could inject one and become a member. Now a joiner's
+ * member.join must carry a grant signed by a CURRENT member (the inviter),
+ * binding the joiner's identity key. The inviter issues it once it learns the
+ * joiner's key from the reply (in PeerMgr.attach), delivers it over the data
+ * channel as a `join.grant` envelope, and the joiner attaches it to
+ * member.join for every peer to verify. Closes non-member / removed-member /
+ * invite-interceptor joins. See plan/history.md. */
+const ADMISSION_GRANT_TTL_MS = 60 * 60 * 1000;   // grants are short-lived
+const ADMISSION_CLOCK_SKEW_MS = 5 * 60 * 1000;
+function admissionGrantBytes(joiner, ws, nonce, ts, issuer) {
+  return MP.encode({ t: "admission", joiner, ws, nonce, ts, issuer });
+}
+async function createAdmissionGrant(joinerUserId, ws) {
+  const nonce = bytesToB64(Crypto.rand(16));
+  const ts = Date.now();
+  const issuer = bytesToB64Url(State.identity.pubkey);
+  const sig = await Crypto.sign(
+    await Crypto.importSignKey(State.identity.privkey_pkcs8),
+    admissionGrantBytes(joinerUserId, ws, nonce, ts, issuer));
+  return { joiner: joinerUserId, ws, nonce, ts, issuer, sig };
+}
+async function verifyAdmissionGrant(grant, joinerUserId, ws, members) {
+  if (!grant || typeof grant.issuer !== "string" || typeof grant.joiner !== "string"
+      || typeof grant.nonce !== "string" || typeof grant.ts !== "number"
+      || !(grant.sig instanceof Uint8Array)) return false;
+  if (canonUserId(grant.joiner) !== canonUserId(joinerUserId)) return false;   // binds THIS joiner
+  if (grant.ws !== ws) return false;
+  const age = Date.now() - grant.ts;
+  if (age > ADMISSION_GRANT_TTL_MS || age < -ADMISSION_CLOCK_SKEW_MS) return false;
+  // The issuer must be a current member — a non-member can't admit anyone.
+  if (!members.some(m => canonUserId(m.id) === canonUserId(grant.issuer))) return false;
+  try {
+    const vk = await Crypto.importVerifyKey(b64UrlToBytes(grant.issuer));
+    return await Crypto.verify(vk, grant.sig,
+      admissionGrantBytes(grant.joiner, grant.ws, grant.nonce, grant.ts, grant.issuer));
+  } catch { return false; }
+}
 
 /* Grace on the invite expiry check (C6/M8), so a joiner with a fast clock
  * doesn't reject a still-valid invite and blame the inviter. */
@@ -7978,10 +8017,14 @@ async function beginJoinHandshake() {
       // started, from the inviter we verified out of band, addressed to us,
       // carrying the nonce we minted. Cleared the moment one is applied, so
       // it is single-use. Anything arriving outside that window is dropped.
-      pendingJoin: {
-        nonce: bytesToB64(Crypto.rand(16)),
-        inviter: canonUserId(p.inviter)
-      }
+      pendingJoin: (() => {
+        const pj = { nonce: bytesToB64(Crypto.rand(16)), inviter: canonUserId(p.inviter) };
+        // The admission grant arrives from the inviter over the data channel
+        // (a join.grant envelope). member.join waits on this so it can carry
+        // the grant; the join.grant handler resolves it.
+        pj.grant = new Promise(res => { pj._resolveGrant = res; });
+        return pj;
+      })()
     };
     State.current = bundle;
     State.currentChannel = p.general_channel_id;
@@ -8006,7 +8049,15 @@ async function beginJoinHandshake() {
     //    send the member.join envelope. member.welcome from inviter will
     //    then transition us into the workspace shell via EnvelopeDispatch.
     transport.opened.then(async () => {
-      await sendMemberJoin(bundle, selfMember);
+      // Wait for the inviter's admission grant (bounded), then send member.join
+      // carrying it. If it never comes (a pre-admission inviter, or a broken
+      // handshake), member.join goes out without one and peers reject it —
+      // which surfaces as the join-stall hint rather than a silent half-join.
+      const grant = await Promise.race([
+        bundle.pendingJoin.grant,
+        new Promise(res => setTimeout(() => res(null), 10_000)),
+      ]);
+      await sendMemberJoin(bundle, selfMember, grant);
     });
 
     setState({ view: "join-waiting" });
@@ -8016,7 +8067,26 @@ async function beginJoinHandshake() {
   }
 }
 
-async function sendMemberJoin(current, selfMember) {
+// Inviter side: sign a grant for `joinerUserId` and push it over the transport
+// once the data channel is open, so the joiner can attach it to member.join.
+async function issueAdmissionGrant(current, transport, joinerUserId) {
+  const grant = await createAdmissionGrant(joinerUserId, current.meta.id);
+  transport.opened.then(async () => {
+    const meta = current.meta;
+    meta.lc_counter = (meta.lc_counter || 0) + 1;
+    const env = await Envelope.build({
+      workspaceId: meta.id, channelId: null, channelKey: current.rootKey,
+      signKey: await Crypto.importSignKey(State.identity.privkey_pkcs8),
+      signerPubkey: State.identity.pubkey, deviceId: meta.device_id,
+      type: "join.grant", inner: { grant },
+      vectorClock: [[bytesToB64Url(State.identity.pubkey), meta.lc_counter]],
+    });
+    // Only the joiner is connected at this point; the grant reaches them.
+    await PeerMgr.sendEnvelope(meta.id, env);
+  }).catch(e => console.warn("grant send:", e));
+}
+
+async function sendMemberJoin(current, selfMember, grant) {
   const signKey = await Crypto.importSignKey(State.identity.privkey_pkcs8);
   const meta = current.meta;
   meta.lc_counter = (meta.lc_counter || 0) + 1;
@@ -8036,6 +8106,9 @@ async function sendMemberJoin(current, selfMember) {
       // the welcome to THIS join request rather than letting any root-key
       // holder push a snapshot at us whenever they like.
       join_nonce: current.pendingJoin?.nonce,
+      // Admission grant, signed by the inviter, binding our identity key.
+      // Peers accept this member.join only if the grant verifies.
+      grant,
       devices: selfMember.devices,
       x25519_pub: State.identity.x25519_pub,  // Slice 3b: joiner publishes
                                               // their X25519 pubkey so the
@@ -8997,6 +9070,21 @@ const PeerMgr = {
       const cur = this.peers.get(workspaceId)?.get(peerUserId);
       if (cur && cur.transport === transport) this.detach(workspaceId, peerUserId);
     }).catch(() => {});
+
+    // Admission grant: if WE are a member and the peer we're attaching is NOT
+    // yet a member, they're joining through us — issue them a signed grant so
+    // their member.join is authenticated to the rest of the workspace. Done
+    // here (not in the UI accept handler) so it also covers the harness/API
+    // join path, which calls attach directly.
+    if (State.current && State.current.meta.id === workspaceId && State.identity) {
+      const cur = State.current;
+      const myId = canonUserId(bytesToB64Url(State.identity.pubkey));
+      const iAmMember = cur.members.some(m => canonUserId(m.id) === myId);
+      const peerIsMember = cur.members.some(m => canonUserId(m.id) === canonUserId(peerUserId));
+      if (iAmMember && !peerIsMember && peerUserId) {
+        issueAdmissionGrant(cur, transport, peerUserId).catch(e => console.warn("grant issue:", e));
+      }
+    }
 
     // Slice 3d.3: re-broadcast our current presence to the newly-attached
     // peer so they see us immediately rather than waiting up to 30s for
@@ -10232,7 +10320,7 @@ const EnvelopeDispatch = {
     // deliberately lets an envelope whose from isn't a current member through
     // (its authz is the per-handler checks + the rekey that denies removed
     // members future keys). Don't mistake this for member-removal enforcement.
-    if (env.type !== "member.join" && env.type !== "member.welcome") {
+    if (env.type !== "member.join" && env.type !== "member.welcome" && env.type !== "join.grant") {
       const sender = current.members.find(m => canonUserId(m.id) === canonUserId(env.from));
       if (sender && !(Array.isArray(sender.devices) && sender.devices.includes(env.dev))) {
         console.warn("Dropping envelope from a revoked/unknown device:", env.from, env.dev);
@@ -10655,6 +10743,17 @@ const EnvelopeDispatch = {
         break;
       }
 
+      case "join.grant": {
+        // Inviter → joiner, over the data channel: the admission grant the
+        // joiner attaches to its member.join. Accept only from the inviter of
+        // the join we're mid-way through, and resolve the waiter.
+        const pj = current.pendingJoin;
+        if (pj && canonUserId(env.from) === pj.inviter && pj._resolveGrant) {
+          pj._resolveGrant(inner.grant || null);
+        }
+        break;
+      }
+
       case "member.join": {
         // A new member has joined. Add to members projection.
         const newMember = {
@@ -10677,7 +10776,26 @@ const EnvelopeDispatch = {
           break;
         }
         newMember.id = joinId;
-        if (!current.members.find(m => canonUserId(m.id) === joinId)) {
+        const jExisting = current.members.find(m => canonUserId(m.id) === joinId);
+        if (!jExisting) {
+          // Admission grant required to ADD a new member: member.join is no
+          // longer self-asserted. The grant must be signed by a current member
+          // (the inviter) and bind this joiner's key. Re-announces from an
+          // existing member (reconnect, device pairing) skip this — they're
+          // not being admitted, and the nonce would already be burned.
+          if (!await verifyAdmissionGrant(inner.grant, env.from, current.meta.id, current.members)) {
+            console.warn("member.join without a valid admission grant, dropping", env.from);
+            break;
+          }
+          const gNonce = inner.grant.nonce;
+          const admBurned = (await idbGet(current.wsDB, "keys", "admission_nonces")) || [];
+          if (admBurned.includes(gNonce)) {
+            console.warn("member.join: admission grant already used, dropping replay", env.from);
+            break;
+          }
+          admBurned.push(gNonce);
+          await idbPut(current.wsDB, "keys", admBurned.slice(-512), "admission_nonces");
+
           await attachFingerprint(newMember);
           current.members.push(newMember);
           await idbPut(current.wsDB, "members", newMember);
