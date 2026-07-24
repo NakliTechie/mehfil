@@ -20,7 +20,7 @@
      The primary XSS defence stays escapeHTML() on all rendered content. -->
 <meta http-equiv="Content-Security-Policy" content="
   default-src 'self';
-  script-src 'self' 'sha256-vfVDU8oFcqTkD0oExOyswDEc47NCykKKTmmdfh1aFwA=' 'sha256-ryup/9GePD9DBWqEdHd8MoluL367/pmDD3fbho0d9d8=' 'sha256-yNZDRSP+ggR6lFwPNfRJSqY2C7YLMA4+jM1qqGimT1o=' https://esm.sh https://cdn.jsdelivr.net;
+  script-src 'self' 'sha256-vfVDU8oFcqTkD0oExOyswDEc47NCykKKTmmdfh1aFwA=' 'sha256-ryup/9GePD9DBWqEdHd8MoluL367/pmDD3fbho0d9d8=' 'sha256-5gjsqnLC4jrwczpWnY7xRoSvpNaeWEI25F8R6LlrbqM=' https://esm.sh https://cdn.jsdelivr.net;
   style-src 'self' 'unsafe-inline';
   img-src 'self' data: blob:;
   media-src 'self' blob:;
@@ -15943,9 +15943,14 @@ class BridgeTransport {
       SeenSet.has(this.workspaceId, env.id).then(seen => {
         if (seen) return;
         SeenSet.add(this.workspaceId, env.id);
-        EnvelopeDispatch.receive(env, this.workspaceId);
-        // Rebroadcast to any connected WebRTC peers (gossip).
-        PeerMgr.sendEnvelope(this.workspaceId, env, null).catch(() => {});
+        // H4: receive is (workspaceId, env) — the args were reversed, so every
+        // bridge envelope was treated as belonging to a non-open workspace and
+        // dropped. Serialize the gossip rebroadcast after receive resolves.
+        // (Gating gossip on *acceptance* is H1/Batch D — receive signals drops
+        // by returning, not throwing, so it isn't gated here.)
+        EnvelopeDispatch.receive(this.workspaceId, env)
+          .catch(e => console.warn("[BridgeTransport] receive:", e))
+          .finally(() => PeerMgr.sendEnvelope(this.workspaceId, env, null).catch(() => {}));
       });
     } catch (e) {
       console.warn("[BridgeTransport] ingest error:", e);
