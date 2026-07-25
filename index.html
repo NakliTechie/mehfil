@@ -20,7 +20,7 @@
      The primary XSS defence stays escapeHTML() on all rendered content. -->
 <meta http-equiv="Content-Security-Policy" content="
   default-src 'self';
-  script-src 'self' 'sha256-vfVDU8oFcqTkD0oExOyswDEc47NCykKKTmmdfh1aFwA=' 'sha256-ryup/9GePD9DBWqEdHd8MoluL367/pmDD3fbho0d9d8=' 'sha256-Kaneyt6rzKU2jeFhCXq1lskedoxayI6A7+S1A1EuNpU=' https://esm.sh https://cdn.jsdelivr.net;
+  script-src 'self' 'sha256-vfVDU8oFcqTkD0oExOyswDEc47NCykKKTmmdfh1aFwA=' 'sha256-ryup/9GePD9DBWqEdHd8MoluL367/pmDD3fbho0d9d8=' 'sha256-IqpZZNj3fnSLAi8f9wE3XhS6PhyiLx21BkXdz0Ogetk=' https://esm.sh https://cdn.jsdelivr.net;
   style-src 'self' 'unsafe-inline';
   img-src 'self' data: blob:;
   media-src 'self' blob:;
@@ -16454,7 +16454,11 @@ const HuddleMgr = (() => {
       workspaceId:  wsId,
       channelId:    null,
       channelKey:   current.rootKey,
-      signKey:      State.identity.signKey,
+      // SB2: this read `State.identity.signKey`, which is assigned nowhere in
+      // the file — so every huddle envelope (join/leave/signal) threw on the
+      // first send and huddles never worked at all, despite being advertised.
+      // Every other signing site imports the key from privkey_pkcs8; match them.
+      signKey:      await Crypto.importSignKey(State.identity.privkey_pkcs8),
       signerPubkey: State.identity.pubkey,
       deviceId:     meta.device_id,
       type,
