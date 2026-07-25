@@ -20,7 +20,7 @@
      The primary XSS defence stays escapeHTML() on all rendered content. -->
 <meta http-equiv="Content-Security-Policy" content="
   default-src 'self';
-  script-src 'self' 'sha256-vfVDU8oFcqTkD0oExOyswDEc47NCykKKTmmdfh1aFwA=' 'sha256-ryup/9GePD9DBWqEdHd8MoluL367/pmDD3fbho0d9d8=' 'sha256-z9qTt8F6S1CnsbO9JmwlTzFC80zCe6dTohr+oBO3wZk=' https://esm.sh https://cdn.jsdelivr.net;
+  script-src 'self' 'sha256-vfVDU8oFcqTkD0oExOyswDEc47NCykKKTmmdfh1aFwA=' 'sha256-ryup/9GePD9DBWqEdHd8MoluL367/pmDD3fbho0d9d8=' 'sha256-TPugTZGOCFKt9Q0yQWKucYQa0m9qPjrAdnxYU1g8R2o=' https://esm.sh https://cdn.jsdelivr.net;
   style-src 'self' 'unsafe-inline';
   img-src 'self' data: blob:;
   media-src 'self' blob:;
@@ -14758,13 +14758,6 @@ async function finalizePromotion(current, proposalId) {
     proposal.cosigs.push(myEntry);
   }
 
-  // Use the drafter's cosig as the primary signer on the envelope,
-  // and the rest as cosigs.
-  const drafterEntry = proposal.cosigs.find(s => s.user_id === proposal.drafter_id) || proposal.cosigs[0];
-  const cosigsForEnv = proposal.cosigs
-    .filter(s => s.user_id !== drafterEntry.user_id)
-    .map(s => ({ from: s.user_id, sig: b64ToBytes(s.sig_b64) }));
-
   const meta = current.meta;
   meta.lc_counter = (meta.lc_counter || 0) + 1;
 
@@ -14794,12 +14787,37 @@ async function finalizePromotion(current, proposalId) {
     },
     vectorClock: [[myUserId, meta.lc_counter]]
   });
-  // Attach cosigs to the envelope for the spec §4.3 transport layer.
-  env.cosigs = cosigsForEnv;
+  // SB3: do NOT put the proposal cosigs on env.cosigs. Those signatures are
+  // over the PROMOTE payload ({type,target,ts,nonce}), but Envelope.verify
+  // checks env.cosigs against the ENVELOPE's canonical bytes — so every peer
+  // rejected this envelope at verify, before dispatch ever saw it. The honest
+  // promote path has been dead since it shipped; only the (now-closed) C4
+  // attack path worked.
+  //
+  // The cosigs are already carried where the handler actually reads them:
+  // inner.signers, verified against the promote payload. env.cosigs was
+  // redundant as well as fatal.
 
   await idbPut(current.wsDB, "envelopes", env);
   await idbPut(current.wsDB, "keys", meta, "workspace_meta");
   PeerMgr.sendEnvelope(meta.id, env).catch(e => console.warn(e));
+
+  // SB3: apply the role locally. A client never receives its own envelopes, so
+  // without this the finalizer is the one peer that never sees the promotion
+  // it just performed. Mirrors the handler: only a current member whose role
+  // is still "member" is promoted, and the promote nonce is burned here too so
+  // a replayed copy can't re-apply it.
+  const promoted = current.members.find(m => canonUserId(m.id) === canonUserId(proposal.target_id));
+  if (promoted && promoted.role === "member") {
+    promoted.role = "admin";
+    await idbPut(current.wsDB, "members", promoted);
+  }
+  const localBurn = (await idbGet(current.wsDB, "keys", "promote_nonces")) || [];
+  const localNonce = bytesToB64(nonce);
+  if (!localBurn.includes(localNonce)) {
+    localBurn.push(localNonce);
+    await idbPut(current.wsDB, "keys", localBurn.slice(-4096), "promote_nonces");
+  }
 
   // Remove from WorkspaceDoc.
   const update = WorkspaceDoc.removePendingPromotion(current.doc, proposalId);
