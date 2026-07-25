@@ -20,7 +20,7 @@
      The primary XSS defence stays escapeHTML() on all rendered content. -->
 <meta http-equiv="Content-Security-Policy" content="
   default-src 'self';
-  script-src 'self' 'sha256-vfVDU8oFcqTkD0oExOyswDEc47NCykKKTmmdfh1aFwA=' 'sha256-ryup/9GePD9DBWqEdHd8MoluL367/pmDD3fbho0d9d8=' 'sha256-IqpZZNj3fnSLAi8f9wE3XhS6PhyiLx21BkXdz0Ogetk=' https://esm.sh https://cdn.jsdelivr.net;
+  script-src 'self' 'sha256-vfVDU8oFcqTkD0oExOyswDEc47NCykKKTmmdfh1aFwA=' 'sha256-ryup/9GePD9DBWqEdHd8MoluL367/pmDD3fbho0d9d8=' 'sha256-0yZpYtM3MfbRWOJqTwDA2lxXGAE5PNz2O8pXGm7t1GQ=' https://esm.sh https://cdn.jsdelivr.net;
   style-src 'self' 'unsafe-inline';
   img-src 'self' data: blob:;
   media-src 'self' blob:;
@@ -2115,6 +2115,25 @@ const PROMOTE_THRESHOLD = 2;
 const MEMBER_ROLES = ["owner", "admin", "member"];
 const isAdminRole = (role) => role === "owner" || role === "admin";
 
+/**
+ * H3: the single authorization predicate for "may this envelope's sender post
+ * this message into this channel". Announce channels are admin-only.
+ *
+ * It exists as one function because the live dispatch and the reload replay
+ * used to disagree: live dropped a non-admin's announce message, replay had no
+ * check at all, so the message reappeared for everyone on the next reload. Two
+ * copies of a rule drift; one doesn't.
+ *
+ * `channels`/`members` are passed in because replay runs against local arrays
+ * before State.current exists.
+ */
+function mayPostToChannel(channels, members, channelId, senderId) {
+  const ch = channels.find(c => c.id === channelId);
+  if (!ch || !ch.announce) return true;
+  const sender = members.find(m => canonUserId(m.id) === canonUserId(senderId));
+  return isAdminRole(sender?.role);
+}
+
 /* Admission grants (2026-07-24). `member.join` used to be self-asserted — any
  * root-key holder could inject one and become a member. Now a joiner's
  * member.join must carry a grant signed by a CURRENT member (the inviter),
@@ -2711,6 +2730,10 @@ const Workspace = {
         const inner = await Envelope.decrypt(env, key);
         switch (env.type) {
           case "message.create": {
+            // H3: apply the same announce authz the live path applies. Without
+            // this, a non-admin's announce-channel message was dropped live but
+            // reconstructed on every reload — so it came back for everyone.
+            if (!mayPostToChannel(channels, members, env.ch, env.from)) break;
             // Security: re-parse mentions at replay time (same reason as
             // live dispatch — don't trust sender-asserted mentions). Groups
             // come from the persisted Yjs doc if available, otherwise an
@@ -10493,15 +10516,11 @@ const EnvelopeDispatch = {
         // senders. Role is computed against our current membership view
         // so a demoted admin's in-flight messages stop appearing on peers
         // as soon as the demotion arrives.
-        {
-          const _ch = current.channels.find(c => c.id === env.ch);
-          if (_ch && _ch.announce) {
-            const sender = current.members.find(m => m.id === env.from);
-            if (!(sender?.role === "owner" || sender?.role === "admin")) {
-              console.warn("announce channel: dropping non-admin message", env.id);
-              break;
-            }
-          }
+        // H3: shared predicate — the replay path applies the same rule, so a
+        // rejected announce message can't come back on reload.
+        if (!mayPostToChannel(current.channels, current.members, env.ch, env.from)) {
+          console.warn("announce channel: dropping non-admin message", env.id);
+          break;
         }
         // Security: re-parse the mentions list against our own members +
         // groups projection. A malicious sender can put arbitrary user ids
