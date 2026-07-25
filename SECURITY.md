@@ -15,6 +15,25 @@ Mehfil does **not** protect against:
 - **Physical access attacks** — identity keys are stored in IndexedDB without an additional passphrase lock (unless the user exports a backup, which is PBKDF2-wrapped).
 - **Metadata analysis on the relay/bridge** — message timing and size are partially visible to a relay operator. The 1 KB envelope padding reduces size leakage but does not eliminate it.
 - **Per-message forward secrecy** — Mehfil does not ratchet keys. If a workspace root key or channel key is later compromised, historical messages encrypted under that key are at risk. Key rotation happens only on member removal (via `workspace.rekey` and `channel.rekey` envelopes).
+- **A malicious admin** — see "Admin authority" below. Admins are trusted by design.
+- **A malicious member creating noise** — an existing member can admit further members (that is the point of "any member can invite"). They cannot escalate anyone to admin; see "Admin authority".
+
+## Admin authority
+
+**Any single admin (or the owner) can remove a member and rotate the workspace key, alone.** This is a deliberate decision, not an oversight.
+
+`MEHFIL-SPEC.md` originally specified 2-of-N admin approval for `member.remove` and `workspace.rekey`. We ship single-admin instead, because:
+
+- Admins are a small, deliberately-chosen, trusted set. A rogue admin is the same class of event as a member leaking the workspace root key — squarely on the "not defended" side of the trust boundary above.
+- 2-of-N adds real operational friction: a two-admin workspace could not remove anyone unless both agreed, including in the case where one admin is the problem.
+- Recovery is social, not cryptographic, and always has been: if an admin turns hostile, the remaining members re-form the workspace under a fresh key and re-invite. Same remedy as a leaked root key.
+
+What **is** enforced cryptographically:
+
+- **Promotion to admin requires 2-of-N admin signatures** (`min(2, adminCount)`, so a sole owner can bootstrap the first admin). Plain members — including sock puppets an existing member might create — cannot reach that threshold. This is the escalation path, and it is closed.
+- **Joining requires an admission grant** signed by a current member and bound to the joiner's identity key, so a non-member holding the root key (an invite interceptor, or a removed member with stale keys) cannot inject themselves into the member list.
+
+The distinction: we defend the boundary between *non-admin and admin*, and between *non-member and member*. We do not defend against an admin you chose to trust.
 
 ## Cryptographic primitives
 

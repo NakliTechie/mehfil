@@ -129,9 +129,9 @@ Some envelope types require multiple signatures to take effect. The `cosigs` fie
 
 | Type | Required co-signers |
 |---|---|
-| `member.promote` | At least 2 distinct members (v1) or admin + 1 (v1.1) |
-| `member.remove` (v1.1 multi-admin) | 2 of N admins |
-| `workspace.rekey` (v1.1) | 2 of N admins |
+| `member.promote` | **2-of-N ADMINS** — `min(2, adminCount)`, target excluded (shipped 2026-07-24). Supersedes the earlier "2 distinct members": any-member signatures let sock puppets self-escalate. |
+| `member.remove` | **1 admin** — deliberate deviation from 2-of-N, decided 2026-07-25. See SECURITY.md "Admin authority". |
+| `workspace.rekey` | **1 admin** — same deviation as `member.remove`. See SECURITY.md "Admin authority". |
 
 **Promote-by-consensus mechanics (v1):**
 
