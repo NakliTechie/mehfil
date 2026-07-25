@@ -20,7 +20,7 @@
      The primary XSS defence stays escapeHTML() on all rendered content. -->
 <meta http-equiv="Content-Security-Policy" content="
   default-src 'self';
-  script-src 'self' 'sha256-vfVDU8oFcqTkD0oExOyswDEc47NCykKKTmmdfh1aFwA=' 'sha256-ryup/9GePD9DBWqEdHd8MoluL367/pmDD3fbho0d9d8=' 'sha256-0yZpYtM3MfbRWOJqTwDA2lxXGAE5PNz2O8pXGm7t1GQ=' https://esm.sh https://cdn.jsdelivr.net;
+  script-src 'self' 'sha256-vfVDU8oFcqTkD0oExOyswDEc47NCykKKTmmdfh1aFwA=' 'sha256-ryup/9GePD9DBWqEdHd8MoluL367/pmDD3fbho0d9d8=' 'sha256-JyMiUrrCKDR0lLzDtQd41xVmEaNx3i+/767KbmP/iss=' https://esm.sh https://cdn.jsdelivr.net;
   style-src 'self' 'unsafe-inline';
   img-src 'self' data: blob:;
   media-src 'self' blob:;
@@ -3467,7 +3467,29 @@ function renderNameInput() {
   $name.focus();
 }
 
+/**
+ * H7: tear down a workspace's transports and timers before we stop being it.
+ *
+ * Switching workspaces used to leave the previous one's peers, relay poller,
+ * bridge poller and timers running. Those kept delivering envelopes that
+ * dispatch then dropped as "non-open workspace" — while their cursors advanced,
+ * so the messages were lost rather than deferred — and the stale pollers went
+ * on burning network for a workspace nobody was looking at.
+ *
+ * Safe to call with an id that has nothing running; every step is a no-op then.
+ */
+function teardownWorkspace(wsId) {
+  if (!wsId) return;
+  try { PeerMgr.detach(wsId); } catch (e) { console.warn("teardown peers:", e); }
+  try { RelayMgr.stop(wsId); } catch (e) { console.warn("teardown relay:", e); }
+  try { BridgeMgr.stop(wsId); } catch (e) { console.warn("teardown bridge:", e); }
+  try { PresenceDriver.stop(); } catch (e) { console.warn("teardown presence:", e); }
+}
+
 async function openWorkspaceById(wsId) {
+  // H7: stop the workspace we're leaving before State.current moves.
+  const prevId = State.current?.meta?.id;
+  if (prevId && prevId !== wsId) teardownWorkspace(prevId);
   const bundle = await Workspace.open(wsId);
   // Update last_opened_at
   const wsRec = await idbGet(State.globalDB, "workspaces", wsId);
@@ -9449,6 +9471,12 @@ const SeenSet = {
   },
 
   async has(workspaceId, envelopeId) {
+    // H7: the seen-set is keyed by the wsDB connection, but this used to read
+    // State.current's DB whatever workspace it was asked about — so a stale
+    // poller for a workspace we've switched away from read and wrote the
+    // CURRENT workspace's seen-set, cross-contaminating both. Answer only for
+    // the workspace we're actually in; anything else is not ours to speak for.
+    if (!workspaceId || State.current?.meta?.id !== workspaceId) return false;
     const wsDB = State.current?.wsDB;
     if (!wsDB) return false;
     const cache = this._cache.get(wsDB);
@@ -9464,6 +9492,8 @@ const SeenSet = {
   async add(workspaceId, envelopeId) {
     const current = State.current;
     if (!current) return;
+    // H7: never record into another workspace's seen-set (see has()).
+    if (!workspaceId || current.meta?.id !== workspaceId) return;
     const wsDB = current.wsDB;
     let cache = this._cache.get(wsDB);
     if (!cache) {
