@@ -20,7 +20,7 @@
      The primary XSS defence stays escapeHTML() on all rendered content. -->
 <meta http-equiv="Content-Security-Policy" content="
   default-src 'self';
-  script-src 'self' 'sha256-vfVDU8oFcqTkD0oExOyswDEc47NCykKKTmmdfh1aFwA=' 'sha256-ryup/9GePD9DBWqEdHd8MoluL367/pmDD3fbho0d9d8=' 'sha256-TPugTZGOCFKt9Q0yQWKucYQa0m9qPjrAdnxYU1g8R2o=' https://esm.sh https://cdn.jsdelivr.net;
+  script-src 'self' 'sha256-vfVDU8oFcqTkD0oExOyswDEc47NCykKKTmmdfh1aFwA=' 'sha256-ryup/9GePD9DBWqEdHd8MoluL367/pmDD3fbho0d9d8=' 'sha256-Kaneyt6rzKU2jeFhCXq1lskedoxayI6A7+S1A1EuNpU=' https://esm.sh https://cdn.jsdelivr.net;
   style-src 'self' 'unsafe-inline';
   img-src 'self' data: blob:;
   media-src 'self' blob:;
@@ -9238,10 +9238,25 @@ const PeerMgr = {
     if (tag === 0x01) {
       const env = MP.decode(payload);
       // Gossip dedupe: drop if we've already seen this envelope.
-      // The seen-set check is the FIRST thing we do — before sig
-      // verification, before persistence — so loops die fast.
       const known = await SeenSet.has(workspaceId, env.id);
       if (known) return;
+
+      // H1: verify BEFORE marking seen, ACKing, or rebroadcasting.
+      //
+      // The seen-set used to be marked first, which handed an attacker two
+      // things. Suppression: send a forged envelope carrying the id of a real
+      // one that hasn't arrived yet, and the id is burned — when the genuine
+      // envelope shows up it is dropped as "already seen", mesh-wide, because
+      // every peer rebroadcast the forgery. Amplification: the forged packet
+      // was ACKed and gossiped to every other peer before anyone checked it.
+      //
+      // The envelope is verified again inside receive(). That double-verify is
+      // deliberate: neither path trusts the other, and an Ed25519 verify is
+      // cheap next to the WebRTC round trip it just arrived on.
+      if (!(await Envelope.verify(env))) {
+        console.warn("Dropping unverified envelope at ingest (not marked seen, not relayed):", env.id);
+        return;
+      }
       await SeenSet.add(workspaceId, env.id);
 
       // Process locally.
