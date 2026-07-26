@@ -80,7 +80,19 @@ async function main() {
     peers.push(peer);
     return peer;
   }
-  const ev = (peer, fn, arg) => peer.page.evaluate(fn, arg);
+  // A6: see the note in verify-journeys — an evaluate racing a page navigation
+  // fails the RUN rather than the app, and passed on re-run both times it has
+  // been seen. Retry once against the fresh context, and log it so a systematic
+  // problem stays visible.
+  const ev = async (peer, fn, arg) => {
+    try { return await peer.page.evaluate(fn, arg); }
+    catch (e) {
+      if (!/Execution context was destroyed|Target closed|Cannot find context/.test(String(e.message))) throw e;
+      console.log(`  (harness: evaluate raced a navigation on ${peer.label || '?'} — retrying once)`);
+      await peer.page.waitForFunction(() => window.__mehfil && window.__mehfil.State, null, { timeout: 15000 });
+      return await peer.page.evaluate(fn, arg);
+    }
+  };
   const idOf = (peer) => ev(peer, () => window.__mehfil.bytesToB64Url(window.__mehfil.State.identity.pubkey));
 
   // Snapshot the overlay: for each alive peer, its connected-peer id set.

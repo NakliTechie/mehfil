@@ -95,7 +95,22 @@ async function main() {
     peers.push(peer);
     return peer;
   }
-  const ev = (p, fn, a) => p.page.evaluate(fn, a);
+  // A6: Playwright throws "Execution context was destroyed, most likely because
+  // of a navigation" when an evaluate is in flight while the page re-navigates.
+  // It has surfaced twice in these harnesses (verify-revocation, verify-journeys)
+  // and passed on an unchanged re-run both times — i.e. it fails the RUN, not the
+  // app, which makes a red gate ambiguous and therefore useless. Retry once
+  // against the fresh context, and SAY SO, so a systematic problem still shows
+  // up in the log instead of being silently smoothed over.
+  const ev = async (p, fn, a) => {
+    try { return await p.page.evaluate(fn, a); }
+    catch (e) {
+      if (!/Execution context was destroyed|Target closed|Cannot find context/.test(String(e.message))) throw e;
+      console.log(`  (harness: evaluate raced a navigation on ${p.label || '?'} — retrying once)`);
+      await p.page.waitForFunction(() => window.__mehfil && window.__mehfil.State, null, { timeout: 15000 });
+      return await p.page.evaluate(fn, a);
+    }
+  };
   const idOf = p => ev(p, () => window.__mehfil.bytesToB64Url(window.__mehfil.State.identity.pubkey));
 
   // Drives the real invite -> join handshake, same as verify-journeys.

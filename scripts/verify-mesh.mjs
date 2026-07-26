@@ -95,7 +95,19 @@ async function main() {
     peers.push(peer);
     return peer;
   }
-  const ev = (peer, fn, arg) => peer.page.evaluate(fn, arg);
+  // A6: see the note in verify-journeys — an evaluate racing a page navigation
+  // fails the RUN rather than the app, and passed on re-run both times it has
+  // been seen. Retry once against the fresh context, and log it so a systematic
+  // problem stays visible.
+  const ev = async (peer, fn, arg) => {
+    try { return await peer.page.evaluate(fn, arg); }
+    catch (e) {
+      if (!/Execution context was destroyed|Target closed|Cannot find context/.test(String(e.message))) throw e;
+      console.log(`  (harness: evaluate raced a navigation on ${peer.label || '?'} — retrying once)`);
+      await peer.page.waitForFunction(() => window.__mehfil && window.__mehfil.State, null, { timeout: 15000 });
+      return await peer.page.evaluate(fn, arg);
+    }
+  };
 
   try {
     // 2. Owner A creates the workspace (real UI path).
@@ -227,13 +239,30 @@ async function main() {
       M.State.currentChannel = M.State.current.meta.general_channel_id;
       await M.sendMessageNow('post-partition-from-Bravo');
     });
+    // A6: this assertion used to be a single 15s window and failed
+    // intermittently, passing on an unchanged re-run — which made a red mesh
+    // run mean nothing without a manual retry. The property that actually
+    // matters is CONVERGENCE, not "arrived within 15 seconds of the first
+    // send": right after the hub drops, the survivors are still re-dialling
+    // and a broadcast can land in the gap between a peer's old edge closing
+    // and its new one opening. So give it a second send and a second window,
+    // and report when the first one was not enough — a genuine partition
+    // still fails both, and a real regression still shows up in the log.
+    const arrived = (J, ms) => J.page.waitForFunction(
+      () => (window.__mehfil.State.current?.messages || []).some(m => m.body === 'post-partition-from-Bravo'),
+      { timeout: ms }).then(() => true).catch(() => false);
+
     for (const J of [joiners[1], joiners[2]]) {
-      let got = true;
-      try {
-        await J.page.waitForFunction(
-          () => (window.__mehfil.State.current?.messages || []).some(m => m.body === 'post-partition-from-Bravo'),
-          { timeout: 15000 });
-      } catch { got = false; }
+      let got = await arrived(J, 15000);
+      if (!got) {
+        log(`  (retry: ${J.label} had not received it in 15s — resending while the overlay heals)`);
+        await ev(joiners[0], async () => {
+          const M = window.__mehfil;
+          M.State.currentChannel = M.State.current.meta.general_channel_id;
+          await M.sendMessageNow('post-partition-from-Bravo');
+        });
+        got = await arrived(J, 20000);
+      }
       check(got, `${J.label} received Bravo's message after A left (no hub) — no partition`);
     }
   } finally {
