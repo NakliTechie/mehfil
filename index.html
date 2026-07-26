@@ -20,7 +20,7 @@
      The primary XSS defence stays escapeHTML() on all rendered content. -->
 <meta http-equiv="Content-Security-Policy" content="
   default-src 'self';
-  script-src 'self' 'sha256-vfVDU8oFcqTkD0oExOyswDEc47NCykKKTmmdfh1aFwA=' 'sha256-ryup/9GePD9DBWqEdHd8MoluL367/pmDD3fbho0d9d8=' 'sha256-XEeyeNCMtm5KGlT1B4cvALEZE+h6uIQ3ZBbT+eD3TFY=' https://esm.sh https://cdn.jsdelivr.net;
+  script-src 'self' 'sha256-vfVDU8oFcqTkD0oExOyswDEc47NCykKKTmmdfh1aFwA=' 'sha256-ryup/9GePD9DBWqEdHd8MoluL367/pmDD3fbho0d9d8=' 'sha256-ZO4ByITF8r+CGxzhN2XkPG/zTHR38DwbpfpItpDO1UQ=' https://esm.sh https://cdn.jsdelivr.net;
   style-src 'self' 'unsafe-inline';
   img-src 'self' data: blob:;
   media-src 'self' blob:;
@@ -15473,6 +15473,21 @@ class RelayTransport {
     const wsId = this.workspaceId;
     const known = await SeenSet.has(wsId, env.id);
     if (known) return;
+
+    // H1, relay half: verify BEFORE marking seen, dispatching or rebroadcasting.
+    //
+    // H1 closed this on the WebRTC path but not here, and until Batch D the
+    // relay carried no traffic so it did not matter. It does now. The attack is
+    // the same one: PUT a forged envelope carrying the id of a genuine envelope
+    // that has not been delivered yet, and that id is burned — every peer that
+    // polls the relay marks it seen and gossips it onward, so when the real
+    // envelope arrives it is dropped as a duplicate, mesh-wide. The relay is a
+    // better position for it than a data channel: the attacker needs only the
+    // relay URL and token, not a WebRTC session with anybody.
+    if (!(await Envelope.verify(env))) {
+      console.warn("Relay: dropping unverified envelope at ingest (not marked seen, not relayed):", env.id);
+      return;
+    }
     await SeenSet.add(wsId, env.id);
 
     // Dispatch locally — updates state, persists to IDB, re-renders.
@@ -16454,12 +16469,19 @@ class BridgeTransport {
       const env   = MP.decode(bytes);
       if (!env?.id) return;
       if (await SeenSet.has(this.workspaceId, env.id)) return;
+      // H1, bridge half: verify BEFORE marking seen, dispatching or
+      // rebroadcasting — same reasoning as the relay path above. On a LAN the
+      // bridge is the easier target of the two: anyone who can reach the
+      // bridge's port can PUT, and the fingerprint pinning authenticates the
+      // bridge to us, not the envelope's author to anybody.
+      if (!(await Envelope.verify(env))) {
+        console.warn("[BridgeTransport] dropping unverified envelope at ingest (not marked seen, not relayed):", env.id);
+        return;
+      }
       await SeenSet.add(this.workspaceId, env.id);
       // H4: receive is (workspaceId, env) — the args were reversed, so every
       // bridge envelope was treated as belonging to a non-open workspace and
       // dropped. Serialize the gossip rebroadcast after receive resolves.
-      // (Gating gossip on *acceptance* is H1/Batch D — receive signals drops
-      // by returning, not throwing, so it isn't gated here.)
       try {
         await EnvelopeDispatch.receive(this.workspaceId, env);
       } catch (e) {
