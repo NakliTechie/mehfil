@@ -40,7 +40,16 @@
 // suppression, H3 announce authz on replay, H7 workspace teardown). NOT a wire
 // break — v6 and v7 envelopes verify both directions — so the bump is only to
 // get the fixes to cached users, not to force convergence.
-const CACHE_NAME = "mehfil-shell-v7";
+// v8: Batch D (store-and-forward correctness). M2/M13 — envelopes now reach the
+// relay/bridge with no WebRTC peer attached, so store-and-forward actually runs
+// when you are offline; M3 — durable per-transport read cursor, so a backlog
+// that accumulated while the tab was closed is delivered on reopen; M1 — blob
+// chunks go to the peer that requested them. NOT a wire break: the envelope
+// format is unchanged and a v7 and v8 shell interoperate in both directions.
+// The bump matters more than usual anyway — until BOTH ends run v8, the sender
+// may push to the relay while the receiver still fast-forwards past it, so the
+// fix only takes effect once each side has converged.
+const CACHE_NAME = "mehfil-shell-v8";
 const PRECACHE = [
   "./",
   "./index.html",

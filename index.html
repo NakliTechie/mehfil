@@ -20,7 +20,7 @@
      The primary XSS defence stays escapeHTML() on all rendered content. -->
 <meta http-equiv="Content-Security-Policy" content="
   default-src 'self';
-  script-src 'self' 'sha256-vfVDU8oFcqTkD0oExOyswDEc47NCykKKTmmdfh1aFwA=' 'sha256-ryup/9GePD9DBWqEdHd8MoluL367/pmDD3fbho0d9d8=' 'sha256-JyMiUrrCKDR0lLzDtQd41xVmEaNx3i+/767KbmP/iss=' https://esm.sh https://cdn.jsdelivr.net;
+  script-src 'self' 'sha256-vfVDU8oFcqTkD0oExOyswDEc47NCykKKTmmdfh1aFwA=' 'sha256-ryup/9GePD9DBWqEdHd8MoluL367/pmDD3fbho0d9d8=' 'sha256-XEeyeNCMtm5KGlT1B4cvALEZE+h6uIQ3ZBbT+eD3TFY=' https://esm.sh https://cdn.jsdelivr.net;
   style-src 'self' 'unsafe-inline';
   img-src 'self' data: blob:;
   media-src 'self' blob:;
@@ -5312,10 +5312,26 @@ async function sendMessageNow(body, opts = {}) {
     delivery: peerAttached ? "sent" : "stored"
   });
 
-  // Broadcast to any connected peer.
-  if (peerAttached) {
-    PeerMgr.sendEnvelope(current.meta.id, env).catch(e => console.warn(e));
-  }
+  // M2, second gate: this used to be `if (peerAttached)`, so with nobody
+  // online the envelope was written to disk and never handed to a transport at
+  // all — not even a configured relay. The message then sat as "stored" until
+  // a direct WebRTC peer appeared and `flushStoredMessages` pushed it, which
+  // is peer-only store-and-forward: it cannot deliver to someone who is not
+  // online at the same time as you. Fixing `sendEnvelope` alone would not have
+  // helped here, because this call site was never reached.
+  //
+  // Always hand off. `sendEnvelope` fans to peers if there are any and to the
+  // relay/bridge either way.
+  //
+  // The delivery receipt deliberately does NOT follow the relay. An earlier
+  // version of this fix promoted "stored" → "sent" whenever a transport was
+  // configured, which was wrong twice over: the pushes are fire-and-forget with
+  // no retry queue, so an unreachable relay still reported delivery; and
+  // `flushStoredMessages` only re-sends messages still marked "stored", so
+  // promoting here silently disabled the retry that fires when a peer finally
+  // attaches — a regression on the pre-fix behaviour. "stored" stays until a
+  // peer acks. A pessimistic receipt is the right kind of wrong for delivery.
+  PeerMgr.sendEnvelope(current.meta.id, env).catch(e => console.warn(e));
 
   // Trigger the backup nag the first time.
   const isFirstMessage = !State.identity.backed_up &&
@@ -9220,10 +9236,23 @@ const PeerMgr = {
    * optionally excluding one source peer (used by the gossip
    * rebroadcast path to avoid sending an envelope back to where
    * we just received it from).
+   *
+   * M2/M13: this used to `return false` when no WebRTC peer was attached —
+   * before the relay/bridge push below. Store-and-forward therefore ran only
+   * when you already had a live peer, i.e. exactly when you did not need it.
+   * Send a message with nobody online and it reached the relay never; the
+   * same for `member.remove` and `workspace.rekey` (M13), so a removed member
+   * who was offline at removal time was never told, and offline members never
+   * got the new keys. Peers, relay and bridge are now three independent fan-out
+   * targets: having none of the first no longer suppresses the other two.
+   *
+   * `originTransport` ("relay" | "bridge" | null) names the store-and-forward
+   * transport an envelope arrived on, so we don't immediately PUT it back to
+   * the same one. Cross-forwarding is deliberate — a peer reachable only via
+   * the bridge and a peer reachable only via the relay talk through us.
    */
-  async sendEnvelope(workspaceId, env, excludePeerId) {
-    const wsPeers = this.peers.get(workspaceId);
-    if (!wsPeers || wsPeers.size === 0) return false;
+  async sendEnvelope(workspaceId, env, excludePeerId, originTransport) {
+    const wsPeers = this.peers.get(workspaceId) || new Map();
     // Slice 4a: mark the envelope as seen BEFORE broadcasting so any
     // rebroadcast hop that loops back to us is dropped by the seen-set
     // check in handlePacket. This applies to BOTH locally-originated
@@ -9252,11 +9281,31 @@ const PeerMgr = {
     // §37: also push to bridge if one is configured.
     // Non-ephemeral only — presence and typing heartbeats are per-device
     // and make no sense forwarded via store-and-forward transports.
+    let queued = false;
     if (!EPHEMERAL_TYPES.has(env.type)) {
-      RelayMgr.send(workspaceId, body).catch(e => console.warn("relay push:", e));
-      BridgeMgr.send(workspaceId, body).catch(e => console.warn("bridge push:", e));
+      // Only a transport that is actually CONNECTED counts. "connecting",
+      // "offline" and "error" all mean the push below is a no-op or will fail:
+      // RelayMgr.send early-returns on error/closed and BridgeTransport.send
+      // no-ops until the fingerprint is verified. Counting those as queued
+      // would report delivery for an envelope nothing accepted.
+      // Attempt both regardless — a "connecting" transport may still accept the
+      // PUT — but only a connected one counts toward the return value.
+      if (originTransport !== "relay") {
+        if (RelayMgr.status(workspaceId) === "connected") queued = true;
+        RelayMgr.send(workspaceId, body).catch(e => console.warn("relay push:", e));
+      }
+      if (originTransport !== "bridge") {
+        if (BridgeMgr.status(workspaceId) === "connected") queued = true;
+        BridgeMgr.send(workspaceId, body).catch(e => console.warn("bridge push:", e));
+      }
     }
-    return sentAny;
+    // True means "at least one transport that is up took this" — a direct peer
+    // OR a connected relay/bridge. Deliberately NOT used to drive the delivery
+    // receipt: these pushes are fire-and-forget with no retry queue, so a
+    // transient PUT failure would leave a message marked delivered that nothing
+    // carried. `delivery` stays pessimistic and `flushStoredMessages` keeps its
+    // job. See the note in sendMessageNow.
+    return sentAny || queued;
   },
 
   /**
@@ -9398,19 +9447,19 @@ const PeerMgr = {
     const framed = new Uint8Array(1 + body.length);
     framed[0] = 0x04;
     framed.set(body, 1);
-    if (peerUserId) {
-      // Targeted send to the requester
-      const p = wsPeers.get(peerUserId);
-      if (!p) return false;
-      try { p.transport.send(framed); return true; }
-      catch (e) { console.warn("blob.chunk send failed:", e); return false; }
+    // M1: chunks are point-to-point — they go to the peer that asked, or
+    // nowhere. The old "no peer named? send to the first peer in the Map"
+    // fallback silently misrouted every transfer in a 3+ peer mesh; dropping
+    // is the honest failure, since a chunk sent to the wrong peer is not a
+    // partial success but a lost transfer plus noise on someone else's link.
+    if (!peerUserId) {
+      console.warn("blob.chunk: no requester peer id — refusing to guess a recipient");
+      return false;
     }
-    // Fallback (legacy): send to first peer found
-    for (const p of wsPeers.values()) {
-      try { p.transport.send(framed); return true; }
-      catch (e) { console.warn("blob.chunk send failed:", e); return false; }
-    }
-    return false;
+    const p = wsPeers.get(peerUserId);
+    if (!p) return false;
+    try { p.transport.send(framed); return true; }
+    catch (e) { console.warn("blob.chunk send failed:", e); return false; }
   }
 };
 
@@ -10204,8 +10253,17 @@ const BlobTransfer = {
    * OPFS, chunk the ciphertext, send each chunk back as a blob.chunk
    * packet. If we don't have the blob, drop silently — later slices
    * (Slice 4 gossip) may forward the request to other peers.
+   *
+   * M1: `requesterPeerId` is who asked. It used to be dropped on the floor —
+   * `handlePacket` knew the source peer but `serveRequest` took only two
+   * arguments, so every chunk went out on `sendBlobChunk`'s no-peer-named
+   * fallback: "send to the first peer in the Map". With two peers that is the
+   * requester half the time and the wrong peer the other half; with three or
+   * more it is almost always wrong. The requester waits forever and an
+   * uninvolved peer gets chunks it never asked for and silently drops them
+   * (`receiveChunk` has no in-flight state for them). Send to the requester.
    */
-  async serveRequest(workspaceId, blobId) {
+  async serveRequest(workspaceId, blobId, requesterPeerId) {
     const ct = await BlobStore.getCiphertext(workspaceId, blobId);
     if (!ct) return;   // we don't have it; silent drop
     const total = Math.ceil(ct.length / CHUNK_SIZE);
@@ -10215,7 +10273,7 @@ const BlobTransfer = {
       const slice = ct.subarray(start, end);
       // slice is a view into the larger buffer; the msgpack encoder
       // will serialize it as-is. We don't need to copy.
-      const ok = await PeerMgr.sendBlobChunk(workspaceId, blobId, seq, total, slice);
+      const ok = await PeerMgr.sendBlobChunk(workspaceId, blobId, seq, total, slice, requesterPeerId);
       if (!ok) return;   // transport broke, abort
     }
   },
@@ -14569,8 +14627,12 @@ async function sendDeviceAdd(current, newDeviceId) {
     vectorClock:  [[myUserId, meta.lc_counter]]
   });
   await idbPut(current.wsDB, "envelopes", env);
+  // The explicit RelayMgr.send that used to sit here was a workaround for M2 —
+  // sendEnvelope bailed before the relay push when no peer was attached, and
+  // device.add has to reach the relay for pairing to work. sendEnvelope now
+  // fans to the relay itself, so keeping this would just PUT every device.add
+  // twice.
   PeerMgr.sendEnvelope(meta.id, env).catch(e => console.warn("device.add peer:", e));
-  RelayMgr.send(meta.id, MP.encode(env)).catch(e => console.warn("device.add relay:", e));
   await idbPut(current.wsDB, "keys", meta, "workspace_meta");
   // Apply locally so the Devices tab reflects the change immediately.
   const me = current.members.find(m => m.id === myUserId);
@@ -14606,8 +14668,8 @@ async function sendDeviceRevoke(current, targetDeviceId) {
     vectorClock:  [[myUserId, meta.lc_counter]]
   });
   await idbPut(current.wsDB, "envelopes", env);
+  // Same as device.add above — sendEnvelope reaches the relay on its own now.
   PeerMgr.sendEnvelope(meta.id, env).catch(e => console.warn("device.revoke peer:", e));
-  RelayMgr.send(meta.id, MP.encode(env)).catch(e => console.warn("device.revoke relay:", e));
   await idbPut(current.wsDB, "keys", meta, "workspace_meta");
   // Apply locally. The device may belong to ANY member (an admin can revoke
   // someone else's device), so remove it from whoever actually owns it — not
@@ -15234,6 +15296,51 @@ function formatRelative(ts) {
  * ------------------------------------------------------------ */
 
 /**
+ * M3 — durable per-transport read cursor.
+ *
+ * Both store-and-forward transports used to call `fetchCursor()` on every
+ * start, which asks the relay/bridge "where are you now?" and jumps there.
+ * That is right exactly once — the first time you ever attach — and wrong
+ * every time after: everything queued while the tab was closed sits *behind*
+ * the latest cursor, so it was skipped, permanently. Store-and-forward
+ * delivered only what arrived while you were already watching, which is what
+ * the direct peer path is for.
+ *
+ * The cursor now lives in the workspace's `cursors` store (created in Slice 0
+ * and unused until now) and survives reload. `fetchCursor()` is the fallback
+ * for a transport we have never read from, not the default.
+ *
+ * Keyed by transport *and* URL so re-pointing a workspace at a different relay
+ * starts fresh rather than resuming from a sequence number that means
+ * something else there.
+ *
+ * The stored value is a RECORD, not a bare string: `{ seq }`. "We have
+ * attached before and read nothing yet" and "we have never attached" are
+ * different states, and an empty-string cursor cannot tell them apart. A relay
+ * is empty at exactly the moment a fresh workspace configures it — so storing
+ * only a non-empty seq would leave that workspace fast-forwarding forever, and
+ * the very first backlog it ever accumulates would be the one it skips.
+ */
+const TransportCursor = {
+  /** Returns { attached: boolean, seq: string }. */
+  async load(wsDB, key) {
+    if (!wsDB) return { attached: false, seq: "" };
+    try {
+      const rec = await idbGet(wsDB, "cursors", key);
+      if (!rec) return { attached: false, seq: "" };
+      // Tolerate the bare-string shape in case anything wrote one.
+      if (typeof rec === "string") return { attached: true, seq: rec };
+      return { attached: true, seq: rec.seq || "" };
+    } catch (e) { console.warn("cursor load:", e); return { attached: false, seq: "" }; }
+  },
+  async save(wsDB, key, seq) {
+    if (!wsDB) return;
+    try { await idbPut(wsDB, "cursors", { seq: seq || "" }, key); }
+    catch (e) { console.warn("cursor save:", e); }
+  }
+};
+
+/**
  * RelayTransport — manages polling and pushing for one workspace + relay.
  *
  * Config: { url, token, workspaceId }
@@ -15241,10 +15348,12 @@ function formatRelative(ts) {
  * token — Bearer token for Authorization header (may be empty for open relay)
  */
 class RelayTransport {
-  constructor({ url, token, workspaceId }) {
+  constructor({ url, token, workspaceId, wsDB }) {
     this.url         = url.replace(/\/$/, "");
     this.token       = token || "";
     this.workspaceId = workspaceId;
+    this.wsDB        = wsDB || null;
+    this.cursorKey   = "relay:" + this.url;
     this.cursor      = "";
     this.pollTimer   = null;
     this.status      = "connecting";
@@ -15280,9 +15389,29 @@ class RelayTransport {
 
   /** Start polling. Call once after construction. */
   async start() {
-    try { await this.fetchCursor(); } catch (e) {
-      console.warn("Relay cursor fetch failed:", e.message);
-      this.status = "offline";
+    // M3: resume from where we actually stopped reading. Only fast-forward to
+    // the relay's head when we have no stored cursor at all — that is a first
+    // attach, where the backlog is history we were never part of. Every later
+    // start reads forward from our own cursor, which is what makes a message
+    // sent while this tab was closed arrive when it reopens.
+    const saved = await TransportCursor.load(this.wsDB, this.cursorKey);
+    if (saved.attached) {
+      this.cursor = saved.seq;
+      this.status = "connected";
+    } else {
+      try { await this.fetchCursor(); } catch (e) {
+        console.warn("Relay cursor fetch failed:", e.message);
+        this.status = "offline";
+      }
+      // Record the attachment even when the relay was empty (cursor ""), so
+      // the next start resumes from the beginning instead of calling itself a
+      // first attach again and fast-forwarding past the first real backlog.
+      // Gated on a genuinely successful read: an offline/errored fetch must
+      // stay a non-attach so the next start retries the fast-forward rather
+      // than resuming from a cursor we never actually established.
+      if (this.status === "connected") {
+        await TransportCursor.save(this.wsDB, this.cursorKey, this.cursor);
+      }
     }
     this._schedulePoll(0);
   }
@@ -15316,6 +15445,10 @@ class RelayTransport {
             console.warn("Relay ingest error:", e);
           }
         }
+        // M3: persist once per batch, not per item — the batch is already
+        // applied, and a crash mid-batch replays at most 100 envelopes that
+        // the SeenSet will drop anyway. Re-reading is cheap; skipping is not.
+        if (items.length > 0) await TransportCursor.save(this.wsDB, this.cursorKey, this.cursor);
       } else if (resp.status === 401) {
         this.status = "error";
         return; // stop polling — credentials are wrong
@@ -15347,8 +15480,10 @@ class RelayTransport {
 
     // Rebroadcast to any connected WebRTC peers. Ephemeral envelopes
     // (presence, typing) are not rebroadcast — relay versions are stale.
+    // "relay" marks the origin so M2's fan-out doesn't PUT it straight back
+    // to the relay we just read it from; the bridge still gets it.
     if (!EPHEMERAL_TYPES.has(env.type)) {
-      await PeerMgr.sendEnvelope(wsId, env);
+      await PeerMgr.sendEnvelope(wsId, env, undefined, "relay");
     }
   }
 
@@ -15396,7 +15531,10 @@ const RelayMgr = {
     if (relays.length === 0) return;
 
     const cfg = relays[0]; // use first relay (multi-relay is a future feature)
-    const t   = new RelayTransport({ url: cfg.url, token: cfg.token, workspaceId: wsId });
+    // wsDB is passed explicitly rather than resolved from State.current: this
+    // runs during workspace open, and not every open path has assigned
+    // State.current by the time the transports start.
+    const t   = new RelayTransport({ url: cfg.url, token: cfg.token, workspaceId: wsId, wsDB: current.wsDB });
     this._transports.set(wsId, t);
     t.start().catch(e => console.warn("Relay start error:", e));
   },
@@ -16188,10 +16326,12 @@ function openDevicePairJoinerModal() {
  *   onFpMismatch — (expected, got) => void — called when stored fp doesn't match
  */
 class BridgeTransport {
-  constructor({ url, pinnedFp, workspaceId, onFpConfirm, onFpMismatch }) {
+  constructor({ url, pinnedFp, workspaceId, wsDB, onFpConfirm, onFpMismatch }) {
     this.url          = url.replace(/\/$/, "");
     this.pinnedFp     = pinnedFp || null;
     this.workspaceId  = workspaceId;
+    this.wsDB         = wsDB || null;
+    this.cursorKey    = "bridge:" + this.url;
     this.onFpConfirm  = onFpConfirm;
     this.onFpMismatch = onFpMismatch;
     this.cursor       = "";
@@ -16228,13 +16368,15 @@ class BridgeTransport {
     return true;
   }
 
+  /** Returns true if the bridge actually answered (an empty cursor counts). */
   async fetchCursor() {
     try {
       const resp = await fetch(this._wsUrl("/cursor"), { signal: AbortSignal.timeout(5000) });
-      if (!resp.ok) return;
+      if (!resp.ok) return false;
       const json = await resp.json();
       this.cursor = json.cursor || "";
-    } catch (_) { /* best-effort */ }
+      return true;
+    } catch (_) { return false; /* best-effort */ }
   }
 
   async start() {
@@ -16243,7 +16385,19 @@ class BridgeTransport {
       const ok = await this._verifyFp();
       if (!ok) return;
       this._fpVerified = true;
-      await this.fetchCursor();
+      // M3: same durable-cursor rule as the relay — fast-forward only on a
+      // first-ever attach to this bridge, otherwise resume from our cursor so
+      // the LAN backlog collected while this tab was closed is delivered.
+      const saved = await TransportCursor.load(this.wsDB, this.cursorKey);
+      if (saved.attached) {
+        this.cursor = saved.seq;
+      } else {
+        // fetchCursor is best-effort (it swallows its own errors), so record
+        // the attach only if it actually produced a cursor or the bridge told
+        // us it was empty. Same empty-store reasoning as the relay.
+        const ok = await this.fetchCursor();
+        if (ok) await TransportCursor.save(this.wsDB, this.cursorKey, this.cursor);
+      }
       this.status = "connected";
       this._poll();
     } catch (e) {
@@ -16263,8 +16417,18 @@ class BridgeTransport {
       const items = await resp.json();
       this.status = "connected";
       if (items.length > 0) {
-        for (const item of items) this._ingest(item);
-        this.cursor = items[items.length - 1].seq;
+        // Await each ingest and advance per item. `_ingest` used to be fired
+        // without awaiting while the cursor jumped straight to the last seq —
+        // harmless when the cursor was in-memory only, but now that it is
+        // persisted, closing the tab between the save and the still-pending
+        // apply would put those envelopes permanently behind the cursor. They
+        // would never be re-fetched. Advance only past what has landed.
+        for (const item of items) {
+          if (this._closed) return;
+          try { await this._ingest(item); } catch (e) { console.warn("[BridgeTransport] ingest:", e); }
+          this.cursor = item.seq;
+        }
+        await TransportCursor.save(this.wsDB, this.cursorKey, this.cursor);
       }
     } catch (e) {
       if (!this._closed) {
@@ -16277,24 +16441,31 @@ class BridgeTransport {
     }
   }
 
-  _ingest({ data }) {
+  /**
+   * Apply one bridge item. Now genuinely awaitable — it used to kick off a
+   * floating promise chain and return immediately, which the caller could not
+   * wait on. The durable cursor makes that difference load-bearing: the caller
+   * must not advance past an envelope that has not been applied yet.
+   */
+  async _ingest({ data }) {
     if (!data) return;
     try {
       const bytes = b64ToBytes(data);
       const env   = MP.decode(bytes);
       if (!env?.id) return;
-      SeenSet.has(this.workspaceId, env.id).then(seen => {
-        if (seen) return;
-        SeenSet.add(this.workspaceId, env.id);
-        // H4: receive is (workspaceId, env) — the args were reversed, so every
-        // bridge envelope was treated as belonging to a non-open workspace and
-        // dropped. Serialize the gossip rebroadcast after receive resolves.
-        // (Gating gossip on *acceptance* is H1/Batch D — receive signals drops
-        // by returning, not throwing, so it isn't gated here.)
-        EnvelopeDispatch.receive(this.workspaceId, env)
-          .catch(e => console.warn("[BridgeTransport] receive:", e))
-          .finally(() => PeerMgr.sendEnvelope(this.workspaceId, env, null).catch(() => {}));
-      });
+      if (await SeenSet.has(this.workspaceId, env.id)) return;
+      await SeenSet.add(this.workspaceId, env.id);
+      // H4: receive is (workspaceId, env) — the args were reversed, so every
+      // bridge envelope was treated as belonging to a non-open workspace and
+      // dropped. Serialize the gossip rebroadcast after receive resolves.
+      // (Gating gossip on *acceptance* is H1/Batch D — receive signals drops
+      // by returning, not throwing, so it isn't gated here.)
+      try {
+        await EnvelopeDispatch.receive(this.workspaceId, env);
+      } catch (e) {
+        console.warn("[BridgeTransport] receive:", e);
+      }
+      await PeerMgr.sendEnvelope(this.workspaceId, env, null, "bridge").catch(() => {});
     } catch (e) {
       console.warn("[BridgeTransport] ingest error:", e);
     }
@@ -16339,6 +16510,7 @@ const BridgeMgr = {
       url:       cfg.url,
       pinnedFp:  cfg.fp || null,
       workspaceId: wsId,
+      wsDB:      current.wsDB,
       onFpConfirm: async (fp) => new Promise(resolve => {
         openBridgeFpConfirmModal(fp,
           async () => {
@@ -16885,7 +17057,7 @@ if (/[?&]debug=1/.test(location.search)) {
     memberTier, composePlaceholder, renderTierEscalationBanner,
     flushStoredMessages,
     // Slice 7
-    RelayTransport, RelayMgr,
+    RelayTransport, RelayMgr, TransportCursor,
     PairingCode, openPairingCodeSendModal, openPairingCodeJoinModal,
     joinWorkspaceFromBundle,
     // Invite / join entry points — exposed so the e2e mesh harness
