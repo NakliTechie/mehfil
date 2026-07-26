@@ -36,7 +36,11 @@
 // requires an inviter-signed grant, so a v5 shell and a v6 shell cannot
 // complete a join with each other — a wire break, like v3/v4. Bump forces
 // convergence so the mixed-version window stays short.
-const CACHE_NAME = "mehfil-shell-v6";
+// v7: Batch C/D fixes (SB3 promote-by-consensus, H1 forged-envelope
+// suppression, H3 announce authz on replay, H7 workspace teardown). NOT a wire
+// break — v6 and v7 envelopes verify both directions — so the bump is only to
+// get the fixes to cached users, not to force convergence.
+const CACHE_NAME = "mehfil-shell-v7";
 const PRECACHE = [
   "./",
   "./index.html",
