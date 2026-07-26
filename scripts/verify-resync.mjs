@@ -205,6 +205,81 @@ async function main() {
     check(r4.bystanderGot === 0, `an uninvolved peer received nothing (${r4.bystanderGot}) — no mesh-wide flood`);
     check(r4.lastRoundServed === 0, `the rate limit eventually refuses (last request served ${r4.lastRoundServed})`);
 
+    log('[5] M7 — a malformed payload is dropped instead of throwing through dispatch');
+    // What this DEMONSTRATES: on the pre-fix build a malformed payload throws
+    // out of EnvelopeDispatch.receive (via parseMentions); with the gate it is
+    // dropped cleanly. That is the measured difference.
+    //
+    // What it does NOT demonstrate, despite being the reason the throw matters:
+    // that the throw permanently mutes the sender. The mechanism is real —
+    // `CausalBuffer.advance` runs after `handle`, so a throw skips it and the
+    // sender's later counters can strand — but the negative control shows the
+    // follow-up arriving on the unfixed build too, so this scenario does not
+    // reproduce the mute. The follow-up assertion is kept as a regression
+    // guard, not as evidence of a mute being fixed. Claiming otherwise would
+    // be citing a mechanism as if it were a measurement.
+    const r5 = await page.evaluate(async (s) => {
+      const M = window.__mehfil, cur = M.State.current, meta = cur.meta;
+      const out = {};
+      // The unit checks need the validator to exist; the end-to-end half below
+      // must run either way, because "does a malformed payload mute the
+      // sender?" is the question the negative control has to answer on a build
+      // that has no validator at all.
+      const V = M.validateInnerPayload;
+      out.hasValidator = typeof V === 'function';
+      if (out.hasValidator) {
+        out.rejectsNumberName = V('member.join', { profile: { name: 42 } }) === false;
+        out.rejectsObjectBody = V('message.create', { body: { evil: 1 } }) === false;
+        out.rejectsHugeBody = V('message.create', { body: 'x'.repeat(20000) }) === false;
+        out.rejectsNonObject = V('message.create', 'not an object') === false;
+        out.acceptsNormal = V('message.create', { body: 'hello', ts: 1 }) === true;
+        out.acceptsUnknownType = V('some.future.type', { anything: true }) === true;
+      }
+      out.initialsSurvivesNumber = (() => { try { return M.initials(42) === '?'; } catch { return false; } })();
+
+      // End to end: a real member sends a malformed envelope, then a good one.
+      const other = await M.Crypto.genIdentity();
+      const ox = await M.Crypto.genX25519();
+      const cert = await M.Crypto.genDeviceCert(other.pubkey, other.privkey_pkcs8);
+      const oid = M.bytesToB64Url(other.pubkey);
+      cur.members.push({ id: oid, name: 'Noisy', role: 'member', devices: [cert.device_id], joined_at: Date.now(), x25519_pub: ox.x25519_pub });
+      const ds = { signKey: await M.Crypto.importSignKey(cert.device_privkey_pkcs8), cert: cert.device_cert, deviceId: cert.device_id };
+      const idKey = await M.Crypto.importSignKey(other.privkey_pkcs8);
+      const mk = (inner, counter) => M.Envelope.build({
+        workspaceId: meta.id, channelId: meta.general_channel_id,
+        channelKey: cur.channelKeys[meta.general_channel_id],
+        signKey: idKey, signerPubkey: other.pubkey, deviceId: cert.device_id, deviceSigner: ds,
+        type: 'message.create', inner, vectorClock: [[oid, counter]]
+      });
+      // Catch rather than propagate: on a build without the gate this THROWS
+      // out of receive, and that throw is the whole finding — hwm never
+      // advances, so the sender is muted from here on. Record it as a result
+      // so both builds produce comparable output instead of one aborting.
+      try {
+        await M.EnvelopeDispatch.receive(meta.id, await mk({ body: { not: 'a string' }, ts: Date.now() }, 1));
+        out.receiveThrew = false;
+      } catch (e) { out.receiveThrew = true; out.receiveErr = e.message; }
+      try {
+        await M.EnvelopeDispatch.receive(meta.id, await mk({ body: 'a perfectly good follow-up', ts: Date.now() }, 2));
+      } catch (e) { out.followUpErr = e.message; }
+      out.malformedDropped = !(cur.messages || []).some(m => m.body && typeof m.body !== 'string');
+      out.followUpDelivered = (cur.messages || []).some(m => m.body === 'a perfectly good follow-up');
+      return out;
+    }, setup);
+    check(r5.hasValidator, 'the payload validator exists');
+    if (r5.hasValidator) {
+      check(r5.rejectsNumberName, 'a non-string profile.name is rejected');
+      check(r5.rejectsObjectBody, 'an object where a body string belongs is rejected');
+      check(r5.rejectsHugeBody, 'an oversized body is rejected');
+      check(r5.rejectsNonObject, 'a non-object payload is rejected');
+      check(r5.acceptsNormal, 'a normal payload is accepted');
+      check(r5.acceptsUnknownType, 'an unknown envelope type is NOT rejected (new features keep working)');
+    }
+    check(r5.initialsSurvivesNumber, 'initials() no longer throws on a non-string');
+    check(r5.receiveThrew === false, `dispatch did not throw on the malformed payload${r5.receiveThrew ? ' — threw: ' + r5.receiveErr : ''}`);
+    check(r5.malformedDropped, 'the malformed message never entered the projection');
+    check(r5.followUpDelivered, "the sender's next message still arrives (regression guard; also true pre-fix)");
+
     log('\n=== console errors ===');
     log('  ' + (errs.length ? errs.join(' | ') : '(none)'));
   } catch (e) {

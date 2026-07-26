@@ -20,7 +20,7 @@
      The primary XSS defence stays escapeHTML() on all rendered content. -->
 <meta http-equiv="Content-Security-Policy" content="
   default-src 'self';
-  script-src 'self' 'sha256-vfVDU8oFcqTkD0oExOyswDEc47NCykKKTmmdfh1aFwA=' 'sha256-ryup/9GePD9DBWqEdHd8MoluL367/pmDD3fbho0d9d8=' 'sha256-aCvJyPkLmc+citK/QV3sd7M1vG3bgWTmF/F+KJhS8BM=' https://esm.sh https://cdn.jsdelivr.net;
+  script-src 'self' 'sha256-vfVDU8oFcqTkD0oExOyswDEc47NCykKKTmmdfh1aFwA=' 'sha256-ryup/9GePD9DBWqEdHd8MoluL367/pmDD3fbho0d9d8=' 'sha256-8O/lzyH+O4+hk5n9ipV/pRxZESkSaaeJNVx2fcCg7bs=' https://esm.sh https://cdn.jsdelivr.net;
   style-src 'self' 'unsafe-inline';
   img-src 'self' data: blob:;
   media-src 'self' blob:;
@@ -2728,6 +2728,11 @@ const Workspace = {
       if (!key) continue;
       try {
         const inner = await Envelope.decrypt(env, key);
+        // M7: same shape gate as the live path. A malformed payload that was
+        // persisted before this check existed must not be able to throw the
+        // replay loop on every subsequent open — that would brick the
+        // workspace, not just drop a message.
+        if (!validateInnerPayload(env.type, inner)) continue;
         switch (env.type) {
           case "message.create": {
             // H3: apply the same announce authz the live path applies. Without
@@ -4656,6 +4661,68 @@ function sanitizeDisplayName(name) {
   const raw = (typeof name === "string" ? name : "").replace(/[\u0000-\u001F\u007F]/g, "").trim();
   // slice AFTER trim can leave a trailing space at the cut; trim again.
   return raw.slice(0, 60).trim() || "Member";
+}
+
+/**
+ * M7 — structural validation of a decrypted payload, before any handler
+ * touches it.
+ *
+ * Everything up to this point proves an envelope is AUTHENTIC: the signature
+ * verifies, the device cert chains, the sender is a member. None of that says
+ * the payload inside is the SHAPE the handler expects. A member (or a member's
+ * compromised device) can encrypt any msgpack it likes, and the handlers were
+ * written against the shapes our own sender produces — so `inner.body` was
+ * assumed to be a string, `inner.optionIdx` a number, `inner.profile` an
+ * object. Feed a number where a string is expected and `initials()` calls
+ * `.trim()` on it; feed an object where a string is expected and the render
+ * path throws. A throw inside dispatch is not a dropped message: it escapes
+ * before `hwm` advances, so every later envelope from that sender buffers
+ * forever — one malformed packet silently mutes a peer, permanently.
+ *
+ * This is deliberately a shape gate, not a semantic one. It answers "could a
+ * handler choke on this?", not "is this a legitimate operation?" — authz lives
+ * in the handlers and has its own findings. Unknown types pass: this file adds
+ * envelope types regularly and a validator that rejects anything it has not
+ * been taught about would break every new feature until someone remembered to
+ * update it here.
+ */
+const PAYLOAD_MAX_BYTES = 256 * 1024;
+
+/** Fields that must be a string if present, with their length caps. */
+const PAYLOAD_STRING_FIELDS = {
+  body: 16_000, name: 200, topic: 500, reason: 500, status: 64, custom: 200,
+  emoji: 64, title: 200, pronouns: 100, timezone: 100, target: 200,
+  channel_id: 200, blob_id: 200, device_id: 200, id: 200, mime: 200,
+  sdp_type: 20, kind: 40
+};
+/** Fields that must be a finite number if present. */
+const PAYLOAD_NUMBER_FIELDS = ["optionIdx", "itemIdx", "ts", "size", "seq", "total", "expires"];
+
+function validateInnerPayload(type, inner) {
+  if (inner === null || typeof inner !== "object" || Array.isArray(inner)) return false;
+  for (const [field, cap] of Object.entries(PAYLOAD_STRING_FIELDS)) {
+    const v = inner[field];
+    if (v === undefined || v === null) continue;
+    if (typeof v !== "string") return false;
+    if (v.length > cap) return false;
+  }
+  for (const field of PAYLOAD_NUMBER_FIELDS) {
+    const v = inner[field];
+    if (v === undefined || v === null) continue;
+    if (typeof v !== "number" || !Number.isFinite(v)) return false;
+  }
+  // `profile` is read as an object by the join/welcome handlers.
+  if (inner.profile !== undefined && inner.profile !== null &&
+      (typeof inner.profile !== "object" || Array.isArray(inner.profile))) return false;
+  if (inner.profile && inner.profile.name !== undefined && inner.profile.name !== null &&
+      typeof inner.profile.name !== "string") return false;
+  // Arrays that are iterated.
+  for (const field of ["mentions", "members", "signers", "devices"]) {
+    const v = inner[field];
+    if (v === undefined || v === null) continue;
+    if (!Array.isArray(v)) return false;
+  }
+  return true;
 }
 
 function composePlaceholder(channel, current) {
@@ -8207,7 +8274,12 @@ function armJoinStallHint() {
     el.innerHTML = `Still waiting. If they've already accepted, one of you may be running an
       older version of Mehfil — reload both sides on the same version and try a fresh invite.`;
     el.style.color = "var(--warn)";
-  }, 45_000);
+    // 20s, not 45s. A join that is going to work completes in a couple of
+    // seconds over a data channel; the only thing the extra 25 seconds bought
+    // was a longer stretch of a user staring at a spinner that will never
+    // resolve. The hint is advice, not an error — nothing is cancelled — so
+    // showing it early costs nothing if the join does land a moment later.
+  }, 20_000);
 }
 
 function renderJoinWaiting() {
@@ -10680,6 +10752,13 @@ const EnvelopeDispatch = {
   },
 
   async handle(current, env, inner) {
+    // M7: shape gate. An authentic envelope can still carry a payload no
+    // handler was written for; a throw in here escapes before hwm advances and
+    // strands every later envelope from this sender.
+    if (!validateInnerPayload(env.type, inner)) {
+      console.warn("Dropping envelope with a malformed payload:", env.type, env.id);
+      return;
+    }
     switch (env.type) {
       case "poll.vote": {
         const pollMsg = current.messages.find(m => m.id === inner.target);
@@ -15340,7 +15419,13 @@ function sanitizeUrl(url) {
   return url;
 }
 function initials(name) {
-  return (name || "?").trim().split(/\s+/).slice(0,2).map(w => w[0] || "").join("").toUpperCase() || "?";
+  // M7 belt-and-braces: `typeof` rather than truthiness. A non-string name
+  // (a number, or a null-prototype map from MP.decode) has no .trim and threw
+  // here — inside a render path, which takes the whole view down rather than
+  // degrading one avatar. The payload gate upstream should stop this reaching
+  // us, but a render helper has no business throwing whatever it is handed.
+  const s = typeof name === "string" ? name : "";
+  return s.trim().split(/\s+/).slice(0,2).map(w => w[0] || "").join("").toUpperCase() || "?";
 }
 // Synchronous fingerprint formatter for places where we already have the
 // 16 fp bytes (e.g. the join-verify screen, where they come from the invite
@@ -17389,6 +17474,7 @@ if (/[?&]debug=1/.test(location.search)) {
     sendDeviceAdd, sendDeviceRevoke, handleSelfRevocation,
     openDevicePairInitiatorModal, openDevicePairJoinerModal,
     buildPairingWorkspacePayload, seedPairedWorkspaces, importPairedIdentity,
+    validateInnerPayload, initials,
     // v1.2
     sendGroupDmSenderKey, draftPromotion,
     get Y() { return Y; },
