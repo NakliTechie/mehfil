@@ -20,7 +20,7 @@
      The primary XSS defence stays escapeHTML() on all rendered content. -->
 <meta http-equiv="Content-Security-Policy" content="
   default-src 'self';
-  script-src 'self' 'sha256-vfVDU8oFcqTkD0oExOyswDEc47NCykKKTmmdfh1aFwA=' 'sha256-ryup/9GePD9DBWqEdHd8MoluL367/pmDD3fbho0d9d8=' 'sha256-KPPhEHn2lCIqbM7b0BSW9werfzSZEN9ZCrZy5pFkDQc=' https://esm.sh https://cdn.jsdelivr.net;
+  script-src 'self' 'sha256-vfVDU8oFcqTkD0oExOyswDEc47NCykKKTmmdfh1aFwA=' 'sha256-ryup/9GePD9DBWqEdHd8MoluL367/pmDD3fbho0d9d8=' 'sha256-aCvJyPkLmc+citK/QV3sd7M1vG3bgWTmF/F+KJhS8BM=' https://esm.sh https://cdn.jsdelivr.net;
   style-src 'self' 'unsafe-inline';
   img-src 'self' data: blob:;
   media-src 'self' blob:;
@@ -3484,6 +3484,10 @@ function teardownWorkspace(wsId) {
   try { RelayMgr.stop(wsId); } catch (e) { console.warn("teardown relay:", e); }
   try { BridgeMgr.stop(wsId); } catch (e) { console.warn("teardown bridge:", e); }
   try { PresenceDriver.stop(); } catch (e) { console.warn("teardown presence:", e); }
+  // Resync request budgets are per-peer and only meaningful while we are in a
+  // workspace with those peers. Leaving them behind would carry one
+  // workspace's throttling into the next.
+  try { ResyncResponder._rate.clear(); } catch (e) { console.warn("teardown resync rate:", e); }
 }
 
 async function openWorkspaceById(wsId) {
@@ -9309,6 +9313,27 @@ const PeerMgr = {
   },
 
   /**
+   * Send one envelope to ONE peer. Used by the resync responder, which answers
+   * a specific requester and must not broadcast: fanning a resync response to
+   * the whole mesh both undoes the responder's channel-membership filter and
+   * turns a single request into an amplifier.
+   *
+   * Deliberately does not touch the SeenSet (the envelope is one we already
+   * hold and marked long ago) and does not push to relay/bridge (this is a
+   * reply to one peer, not new traffic for everyone).
+   */
+  async sendEnvelopeTo(workspaceId, env, peerUserId) {
+    const p = this.peers.get(workspaceId)?.get(peerUserId);
+    if (!p) return false;
+    const body = MP.encode(env);
+    const framed = new Uint8Array(1 + body.length);
+    framed[0] = 0x01;
+    framed.set(body, 1);
+    try { p.transport.send(framed); return true; }
+    catch (e) { console.warn("targeted send failed for peer", peerUserId, e); return false; }
+  },
+
+  /**
    * ACK is point-to-point — only send back to the peer we received
    * from. (S5: there is no `excludePeer` param on this path; a stale
    * comment referenced one. We send only to the named peer.)
@@ -9842,24 +9867,86 @@ const GapTracker = {
  *  the requester drops any envelope they already have, and
  *  applies the rest via the regular dispatch pipeline.
  *
- *  Note: we send to ALL peers, not just the requester. Other
- *  peers in the mesh may also be missing these envelopes — the
- *  rebroadcast doubles as opportunistic gossip. Their seen-set
- *  drops anything they already have.
+ *  M12 — this block used to describe two things the code did not do.
  *
- *  Privacy: we only re-send envelopes for channels the requester
- *  is in. We approximate this by checking that the envelope's
- *  channel id is one we ourselves can decrypt (i.e. we have the
- *  channel key) — but this is a weak check. A peer that's a
- *  member of channel X but not channel Y could request a counter
- *  range and indirectly observe whether the target sends to Y.
- *  Slice 5+ should add a per-channel resync ACL.
+ *  It claimed "we only re-send envelopes for channels the requester is in,
+ *  approximated by checking we can decrypt the channel ourselves". There was
+ *  no channel check of any kind: the filter was `env.from === target` plus a
+ *  counter range, so any member could ask for any member's entire history
+ *  across every channel, including private channels and DMs they were never
+ *  part of. The ciphertext is useless without the channel key, but the
+ *  metadata is not — who talks to whom, how often, in which private channel,
+ *  at what times. That is most of what a private channel is for.
+ *
+ *  It also said "we send to ALL peers, not just the requester… the rebroadcast
+ *  doubles as opportunistic gossip". That made the ACL meaningless even once
+ *  written, and turned one small request into a mesh-wide flood — a free
+ *  amplifier for anyone who wanted one.
+ *
+ *  Now: the requester must be a current member; envelopes are filtered against
+ *  the requester's actual membership of the envelope's channel; responses go
+ *  to the requester alone; and both the request rate and the response size are
+ *  bounded. Genuine gossip repair still happens — the requester rebroadcasts
+ *  what it accepts through the normal path.
  * ------------------------------------------------------------ */
+
+/** Max envelopes served for a single resync request. */
+const RESYNC_MAX_ENVELOPES = 200;
+/** Requests allowed per peer per window. */
+const RESYNC_MAX_REQUESTS = 5;
+const RESYNC_WINDOW_MS = 30_000;
 const ResyncResponder = {
+  /** peerUserId → { count, windowStart } */
+  _rate: new Map(),
+
+  /** True if this peer is within its request budget (and books the request). */
+  _allow(peerUserId) {
+    const now = Date.now();
+    const rec = this._rate.get(peerUserId);
+    if (!rec || now - rec.windowStart > RESYNC_WINDOW_MS) {
+      this._rate.set(peerUserId, { count: 1, windowStart: now });
+      return true;
+    }
+    if (rec.count >= RESYNC_MAX_REQUESTS) return false;
+    rec.count++;
+    return true;
+  },
+
+  /**
+   * May `requesterId` read envelopes sent to this channel?
+   *
+   * Public channels: any current member. Private channels, DMs and group DMs:
+   * only listed members. A channel we have no record of is refused rather than
+   * allowed — we cannot show it is safe to share, so we don't.
+   */
+  _mayRead(current, channelId, requesterId) {
+    // Workspace-level envelopes (ch === null) are encrypted to the root key,
+    // which every member holds. Nothing is revealed that membership doesn't.
+    if (!channelId) return true;
+    const ch = current.channels.find(c => c.id === channelId);
+    if (!ch) return false;
+    if (!ch.private && !ch.dm) return true;
+    const members = ch.members || [];
+    return members.some(id => canonUserId(id) === canonUserId(requesterId));
+  },
+
   async serve(workspaceId, req, requesterPeerId) {
     const current = State.current;
     if (!current || current.meta.id !== workspaceId) return;
     if (!req || !req.target || typeof req.from !== "number" || typeof req.to !== "number") return;
+    if (!requesterPeerId) return;
+
+    // The requester has to be someone we recognise. A resync request is a read
+    // of our stored history; a non-member has no claim on it.
+    const isMember = current.members.some(m => canonUserId(m.id) === canonUserId(requesterPeerId));
+    if (!isMember) {
+      console.warn("resync: refusing request from non-member", requesterPeerId);
+      return;
+    }
+    if (!this._allow(requesterPeerId)) {
+      console.warn("resync: rate limit hit for", requesterPeerId);
+      return;
+    }
 
     // Walk the envelopes store. For small stores this is fine;
     // for larger ones we'd want to use the `from` index added in
@@ -9870,6 +9957,8 @@ const ResyncResponder = {
       // Skip ephemeral types — they should never be in the store
       // anyway, but defense in depth.
       if (EPHEMERAL_TYPES.has(env.type)) return false;
+      // M12: the membership filter this file has always claimed to have.
+      if (!this._mayRead(current, env.ch, requesterPeerId)) return false;
       // Find sender's counter in lc.
       const senderEntry = (env.lc || []).find(e => Array.isArray(e) && e[0] === env.from);
       if (!senderEntry) return false;
@@ -9877,13 +9966,31 @@ const ResyncResponder = {
       return counter >= req.from && counter <= req.to;
     });
 
-    // Re-broadcast each match. PeerMgr.sendEnvelope handles
-    // SeenSet marking and avoids reflecting back to ourselves.
+    // Serve the OLDEST first. `idbGetAll` returns envelope-id order, which is
+    // random, so slicing it directly would hand back an arbitrary 200 of the
+    // range — and a requester with a gap larger than the cap could keep asking
+    // and keep getting a different arbitrary slice, never closing the gap.
+    // Ascending by counter means each request advances the requester's hwm and
+    // the next one starts further along.
+    const counterOf = (env) => {
+      const e = (env.lc || []).find(x => Array.isArray(x) && x[0] === env.from);
+      return e ? e[1] : 0;
+    };
+    matches.sort((a, b) => counterOf(a) - counterOf(b));
+    if (matches.length > RESYNC_MAX_ENVELOPES) {
+      console.warn(`resync: serving ${RESYNC_MAX_ENVELOPES} of ${matches.length} matches to ${requesterPeerId} — ask again for the rest`);
+      matches.length = RESYNC_MAX_ENVELOPES;
+    }
+
+    // Answer the requester, not the whole mesh. Broadcasting here would undo
+    // the filter above (everyone gets the envelope regardless of channel
+    // membership) and turn one request into a flood. If other peers are also
+    // missing these, the requester's own rebroadcast on accept covers it.
     for (const env of matches) {
       try {
-        await PeerMgr.sendEnvelope(workspaceId, env);
+        await PeerMgr.sendEnvelopeTo(workspaceId, env, requesterPeerId);
       } catch (e) {
-        console.warn("resync re-broadcast failed for", env.id, e);
+        console.warn("resync re-send failed for", env.id, e);
       }
     }
   }
