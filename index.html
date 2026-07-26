@@ -20,7 +20,7 @@
      The primary XSS defence stays escapeHTML() on all rendered content. -->
 <meta http-equiv="Content-Security-Policy" content="
   default-src 'self';
-  script-src 'self' 'sha256-vfVDU8oFcqTkD0oExOyswDEc47NCykKKTmmdfh1aFwA=' 'sha256-ryup/9GePD9DBWqEdHd8MoluL367/pmDD3fbho0d9d8=' 'sha256-z9qTt8F6S1CnsbO9JmwlTzFC80zCe6dTohr+oBO3wZk=' https://esm.sh https://cdn.jsdelivr.net;
+  script-src 'self' 'sha256-vfVDU8oFcqTkD0oExOyswDEc47NCykKKTmmdfh1aFwA=' 'sha256-ryup/9GePD9DBWqEdHd8MoluL367/pmDD3fbho0d9d8=' 'sha256-JyMiUrrCKDR0lLzDtQd41xVmEaNx3i+/767KbmP/iss=' https://esm.sh https://cdn.jsdelivr.net;
   style-src 'self' 'unsafe-inline';
   img-src 'self' data: blob:;
   media-src 'self' blob:;
@@ -2115,6 +2115,25 @@ const PROMOTE_THRESHOLD = 2;
 const MEMBER_ROLES = ["owner", "admin", "member"];
 const isAdminRole = (role) => role === "owner" || role === "admin";
 
+/**
+ * H3: the single authorization predicate for "may this envelope's sender post
+ * this message into this channel". Announce channels are admin-only.
+ *
+ * It exists as one function because the live dispatch and the reload replay
+ * used to disagree: live dropped a non-admin's announce message, replay had no
+ * check at all, so the message reappeared for everyone on the next reload. Two
+ * copies of a rule drift; one doesn't.
+ *
+ * `channels`/`members` are passed in because replay runs against local arrays
+ * before State.current exists.
+ */
+function mayPostToChannel(channels, members, channelId, senderId) {
+  const ch = channels.find(c => c.id === channelId);
+  if (!ch || !ch.announce) return true;
+  const sender = members.find(m => canonUserId(m.id) === canonUserId(senderId));
+  return isAdminRole(sender?.role);
+}
+
 /* Admission grants (2026-07-24). `member.join` used to be self-asserted — any
  * root-key holder could inject one and become a member. Now a joiner's
  * member.join must carry a grant signed by a CURRENT member (the inviter),
@@ -2711,6 +2730,10 @@ const Workspace = {
         const inner = await Envelope.decrypt(env, key);
         switch (env.type) {
           case "message.create": {
+            // H3: apply the same announce authz the live path applies. Without
+            // this, a non-admin's announce-channel message was dropped live but
+            // reconstructed on every reload — so it came back for everyone.
+            if (!mayPostToChannel(channels, members, env.ch, env.from)) break;
             // Security: re-parse mentions at replay time (same reason as
             // live dispatch — don't trust sender-asserted mentions). Groups
             // come from the persisted Yjs doc if available, otherwise an
@@ -3444,7 +3467,29 @@ function renderNameInput() {
   $name.focus();
 }
 
+/**
+ * H7: tear down a workspace's transports and timers before we stop being it.
+ *
+ * Switching workspaces used to leave the previous one's peers, relay poller,
+ * bridge poller and timers running. Those kept delivering envelopes that
+ * dispatch then dropped as "non-open workspace" — while their cursors advanced,
+ * so the messages were lost rather than deferred — and the stale pollers went
+ * on burning network for a workspace nobody was looking at.
+ *
+ * Safe to call with an id that has nothing running; every step is a no-op then.
+ */
+function teardownWorkspace(wsId) {
+  if (!wsId) return;
+  try { PeerMgr.detach(wsId); } catch (e) { console.warn("teardown peers:", e); }
+  try { RelayMgr.stop(wsId); } catch (e) { console.warn("teardown relay:", e); }
+  try { BridgeMgr.stop(wsId); } catch (e) { console.warn("teardown bridge:", e); }
+  try { PresenceDriver.stop(); } catch (e) { console.warn("teardown presence:", e); }
+}
+
 async function openWorkspaceById(wsId) {
+  // H7: stop the workspace we're leaving before State.current moves.
+  const prevId = State.current?.meta?.id;
+  if (prevId && prevId !== wsId) teardownWorkspace(prevId);
   const bundle = await Workspace.open(wsId);
   // Update last_opened_at
   const wsRec = await idbGet(State.globalDB, "workspaces", wsId);
@@ -9238,10 +9283,25 @@ const PeerMgr = {
     if (tag === 0x01) {
       const env = MP.decode(payload);
       // Gossip dedupe: drop if we've already seen this envelope.
-      // The seen-set check is the FIRST thing we do — before sig
-      // verification, before persistence — so loops die fast.
       const known = await SeenSet.has(workspaceId, env.id);
       if (known) return;
+
+      // H1: verify BEFORE marking seen, ACKing, or rebroadcasting.
+      //
+      // The seen-set used to be marked first, which handed an attacker two
+      // things. Suppression: send a forged envelope carrying the id of a real
+      // one that hasn't arrived yet, and the id is burned — when the genuine
+      // envelope shows up it is dropped as "already seen", mesh-wide, because
+      // every peer rebroadcast the forgery. Amplification: the forged packet
+      // was ACKed and gossiped to every other peer before anyone checked it.
+      //
+      // The envelope is verified again inside receive(). That double-verify is
+      // deliberate: neither path trusts the other, and an Ed25519 verify is
+      // cheap next to the WebRTC round trip it just arrived on.
+      if (!(await Envelope.verify(env))) {
+        console.warn("Dropping unverified envelope at ingest (not marked seen, not relayed):", env.id);
+        return;
+      }
       await SeenSet.add(workspaceId, env.id);
 
       // Process locally.
@@ -9411,6 +9471,12 @@ const SeenSet = {
   },
 
   async has(workspaceId, envelopeId) {
+    // H7: the seen-set is keyed by the wsDB connection, but this used to read
+    // State.current's DB whatever workspace it was asked about — so a stale
+    // poller for a workspace we've switched away from read and wrote the
+    // CURRENT workspace's seen-set, cross-contaminating both. Answer only for
+    // the workspace we're actually in; anything else is not ours to speak for.
+    if (!workspaceId || State.current?.meta?.id !== workspaceId) return false;
     const wsDB = State.current?.wsDB;
     if (!wsDB) return false;
     const cache = this._cache.get(wsDB);
@@ -9426,6 +9492,8 @@ const SeenSet = {
   async add(workspaceId, envelopeId) {
     const current = State.current;
     if (!current) return;
+    // H7: never record into another workspace's seen-set (see has()).
+    if (!workspaceId || current.meta?.id !== workspaceId) return;
     const wsDB = current.wsDB;
     let cache = this._cache.get(wsDB);
     if (!cache) {
@@ -10478,15 +10546,11 @@ const EnvelopeDispatch = {
         // senders. Role is computed against our current membership view
         // so a demoted admin's in-flight messages stop appearing on peers
         // as soon as the demotion arrives.
-        {
-          const _ch = current.channels.find(c => c.id === env.ch);
-          if (_ch && _ch.announce) {
-            const sender = current.members.find(m => m.id === env.from);
-            if (!(sender?.role === "owner" || sender?.role === "admin")) {
-              console.warn("announce channel: dropping non-admin message", env.id);
-              break;
-            }
-          }
+        // H3: shared predicate — the replay path applies the same rule, so a
+        // rejected announce message can't come back on reload.
+        if (!mayPostToChannel(current.channels, current.members, env.ch, env.from)) {
+          console.warn("announce channel: dropping non-admin message", env.id);
+          break;
         }
         // Security: re-parse the mentions list against our own members +
         // groups projection. A malicious sender can put arbitrary user ids
@@ -14758,13 +14822,6 @@ async function finalizePromotion(current, proposalId) {
     proposal.cosigs.push(myEntry);
   }
 
-  // Use the drafter's cosig as the primary signer on the envelope,
-  // and the rest as cosigs.
-  const drafterEntry = proposal.cosigs.find(s => s.user_id === proposal.drafter_id) || proposal.cosigs[0];
-  const cosigsForEnv = proposal.cosigs
-    .filter(s => s.user_id !== drafterEntry.user_id)
-    .map(s => ({ from: s.user_id, sig: b64ToBytes(s.sig_b64) }));
-
   const meta = current.meta;
   meta.lc_counter = (meta.lc_counter || 0) + 1;
 
@@ -14794,12 +14851,37 @@ async function finalizePromotion(current, proposalId) {
     },
     vectorClock: [[myUserId, meta.lc_counter]]
   });
-  // Attach cosigs to the envelope for the spec §4.3 transport layer.
-  env.cosigs = cosigsForEnv;
+  // SB3: do NOT put the proposal cosigs on env.cosigs. Those signatures are
+  // over the PROMOTE payload ({type,target,ts,nonce}), but Envelope.verify
+  // checks env.cosigs against the ENVELOPE's canonical bytes — so every peer
+  // rejected this envelope at verify, before dispatch ever saw it. The honest
+  // promote path has been dead since it shipped; only the (now-closed) C4
+  // attack path worked.
+  //
+  // The cosigs are already carried where the handler actually reads them:
+  // inner.signers, verified against the promote payload. env.cosigs was
+  // redundant as well as fatal.
 
   await idbPut(current.wsDB, "envelopes", env);
   await idbPut(current.wsDB, "keys", meta, "workspace_meta");
   PeerMgr.sendEnvelope(meta.id, env).catch(e => console.warn(e));
+
+  // SB3: apply the role locally. A client never receives its own envelopes, so
+  // without this the finalizer is the one peer that never sees the promotion
+  // it just performed. Mirrors the handler: only a current member whose role
+  // is still "member" is promoted, and the promote nonce is burned here too so
+  // a replayed copy can't re-apply it.
+  const promoted = current.members.find(m => canonUserId(m.id) === canonUserId(proposal.target_id));
+  if (promoted && promoted.role === "member") {
+    promoted.role = "admin";
+    await idbPut(current.wsDB, "members", promoted);
+  }
+  const localBurn = (await idbGet(current.wsDB, "keys", "promote_nonces")) || [];
+  const localNonce = bytesToB64(nonce);
+  if (!localBurn.includes(localNonce)) {
+    localBurn.push(localNonce);
+    await idbPut(current.wsDB, "keys", localBurn.slice(-4096), "promote_nonces");
+  }
 
   // Remove from WorkspaceDoc.
   const update = WorkspaceDoc.removePendingPromotion(current.doc, proposalId);
@@ -16421,7 +16503,11 @@ const HuddleMgr = (() => {
       workspaceId:  wsId,
       channelId:    null,
       channelKey:   current.rootKey,
-      signKey:      State.identity.signKey,
+      // SB2: this read `State.identity.signKey`, which is assigned nowhere in
+      // the file — so every huddle envelope (join/leave/signal) threw on the
+      // first send and huddles never worked at all, despite being advertised.
+      // Every other signing site imports the key from privkey_pkcs8; match them.
+      signKey:      await Crypto.importSignKey(State.identity.privkey_pkcs8),
       signerPubkey: State.identity.pubkey,
       deviceId:     meta.device_id,
       type,
