@@ -159,7 +159,11 @@ async function main() {
       const msg = S.current.messages.find(m => /Welcome/.test(m.body));
       if (msg) await M.sendReactionAdd(S.current, msg.id, '🎉');
     });
-    await sleep(500); await shot(page, '07-message-reactions');
+    // Wait for the pill itself, not a guess. At a fixed 500ms it had not
+    // rendered yet, so this shot was byte-identical to a later one and the
+    // "Reactions" screen showed no reaction — caught by comparing checksums.
+    await page.waitForFunction(() => /🎉/.test(document.getElementById('app')?.innerHTML || ''), { timeout: 8000 }).catch(() => {});
+    await sleep(300); await shot(page, '07-message-reactions');
 
     // slash autocomplete
     await page.evaluate(() => { const c = document.getElementById('composer'); if (c) { c.focus(); } });

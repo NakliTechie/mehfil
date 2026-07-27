@@ -20,7 +20,7 @@
      The primary XSS defence stays escapeHTML() on all rendered content. -->
 <meta http-equiv="Content-Security-Policy" content="
   default-src 'self';
-  script-src 'self' 'sha256-vfVDU8oFcqTkD0oExOyswDEc47NCykKKTmmdfh1aFwA=' 'sha256-ryup/9GePD9DBWqEdHd8MoluL367/pmDD3fbho0d9d8=' 'sha256-k5+N4xV92gcGWGfXPo0SEOeO7BjH+h1fXlofYxnErT4=' https://esm.sh https://cdn.jsdelivr.net;
+  script-src 'self' 'sha256-vfVDU8oFcqTkD0oExOyswDEc47NCykKKTmmdfh1aFwA=' 'sha256-ryup/9GePD9DBWqEdHd8MoluL367/pmDD3fbho0d9d8=' 'sha256-4yNpJtI/bDJ5zFohZ/IOw0oU0D0ThBWODeot2P92q/A=' https://esm.sh https://cdn.jsdelivr.net;
   style-src 'self' 'unsafe-inline';
   img-src 'self' data: blob:;
   media-src 'self' blob:;
@@ -2893,6 +2893,11 @@ const Workspace = {
               announce: announceReplay,
               canvas: !!inner.canvas && !inner.private,
               members: inner.members || [],
+              // F2: who created it. A private channel's key goes to everyone in
+              // `members` — AND to whoever generated it, who need not be listed.
+              // Removal-time rotation has to know that, or a member who created
+              // a channel excluding themselves keeps reading it after removal.
+              created_by: env.from,
               created_at: env.ts
             };
             channels.push(chRec);
@@ -11042,6 +11047,7 @@ const EnvelopeDispatch = {
           announce: announceVerified,
           canvas: !!inner.canvas && !inner.private,  // Slice CV1 — public-only
           members: inner.members || [],
+          created_by: env.from,   // F2 — see the replay path
           created_at: env.ts
         };
         current.channels.push(chRec);
@@ -12189,7 +12195,9 @@ async function sendChannelCreate(current, name, topic, { isPrivate = false, isDm
     private: isPrivate, dm: isDm, dm_with: null,
     announce: !!isAnnounce,
     canvas: !!isCanvas,   // Slice CV1
-    members: chosenMembers, created_at: env.ts
+    members: chosenMembers,
+    created_by: bytesToB64Url(State.identity.pubkey),   // F2 — see the replay path
+    created_at: env.ts
   };
   current.channels.push(chRec);
   await idbPut(current.wsDB, "channels", chRec);
@@ -14777,8 +14785,28 @@ async function sendMemberRemove(current, removedUserId) {
   // removed member keeps read access for the length of the coalescing window,
   // which is a security-timing decision and not one to make unattended. See
   // plan/pending.md.
-  const removedWasIn = (ch) =>
-    !ch.private || (ch.members || []).some(id => canonUserId(id) === canonUserId(removedUserId));
+  // "Could the removed member possibly hold this channel's key?"
+  //
+  // They hold it if they were given it — which means being in `ch.members`,
+  // since that is what `wrapped_keys` is built from — OR if they generated it,
+  // which the creator does regardless of whether they list themselves.
+  //
+  // That second case is not hypothetical: the channel.create handler accepts a
+  // private channel whose `members` omits the sender, so a member on a modified
+  // client can plant a channel they are not listed in, keep the key, and — if
+  // the rotation trusted `members` alone — keep reading it after removal. The
+  // optimisation would then have made removal *weaker* than before it. Found by
+  // the checker, not by me.
+  //
+  // Channels created before `created_by` existed have no creator recorded. Those
+  // rotate, unconditionally: an unknown creator is not evidence of safety. The
+  // saving applies to channels created from here on, and grows as they turn over.
+  const removedWasIn = (ch) => {
+    if (!ch.private) return true;                       // public: they had the key
+    if (!ch.created_by) return true;                    // unknown creator: assume the worst
+    if (canonUserId(ch.created_by) === canonUserId(removedUserId)) return true;
+    return (ch.members || []).some(id => canonUserId(id) === canonUserId(removedUserId));
+  };
 
   let skippedChannels = 0;
   for (const ch of current.channels) {

@@ -319,6 +319,37 @@ async function main() {
     check(r6.before.outCh === r6.after.outCh,
       'the private channel they were NEVER in did NOT rotate — that is the saving, and it cuts off nobody');
 
+    // The attack the optimisation opens if it trusts ch.members alone: the
+    // channel.create handler accepts a private channel whose members list omits
+    // the sender, and the sender generated the key, so they hold it. If removal
+    // skipped that channel they would keep reading it — making removal WEAKER
+    // than before the optimisation. Rotation must key on the creator too.
+    const r6b = await page.evaluate(async (s) => {
+      const M = window.__mehfil, cur = M.State.current;
+      const victimId = s.insider;
+      // A channel the victim CREATED but is not listed in.
+      const planted = {
+        id: 'planted-' + M.bytesToB64Url(M.Crypto.rand(6)),
+        name: 'backdoor', topic: '', private: true, dm: false, dm_with: null,
+        announce: false, canvas: false,
+        members: [M.bytesToB64Url(M.State.identity.pubkey)],  // victim omitted
+        created_by: victimId,                                  // but they made it
+        created_at: Date.now()
+      };
+      cur.channels.push(planted);
+      await M.idbPut(cur.wsDB, 'channels', planted);
+      const raw = M.Crypto.rand(32);
+      await M.idbPut(cur.wsDB, 'keys', raw, 'ch:' + planted.id);
+      cur.channelKeys[planted.id] = await M.Crypto.importAesRaw(raw);
+      const before = M.bytesToB64(await M.idbGet(cur.wsDB, 'keys', 'ch:' + planted.id));
+      await M.sendMemberRemove(cur, victimId);
+      await new Promise(r => setTimeout(r, 800));
+      const after = M.bytesToB64(await M.idbGet(cur.wsDB, 'keys', 'ch:' + planted.id));
+      return { rotated: before !== after };
+    }, setup);
+    check(r6b.rotated === true,
+      'a private channel the removed member CREATED but is not listed in still rotates — members[] alone is attacker-controllable');
+
     log('\n=== console errors ===');
     log('  ' + (errs.length ? errs.join(' | ') : '(none)'));
   } catch (e) {
