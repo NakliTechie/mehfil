@@ -20,7 +20,7 @@
      The primary XSS defence stays escapeHTML() on all rendered content. -->
 <meta http-equiv="Content-Security-Policy" content="
   default-src 'self';
-  script-src 'self' 'sha256-vfVDU8oFcqTkD0oExOyswDEc47NCykKKTmmdfh1aFwA=' 'sha256-ryup/9GePD9DBWqEdHd8MoluL367/pmDD3fbho0d9d8=' 'sha256-8O/lzyH+O4+hk5n9ipV/pRxZESkSaaeJNVx2fcCg7bs=' https://esm.sh https://cdn.jsdelivr.net;
+  script-src 'self' 'sha256-vfVDU8oFcqTkD0oExOyswDEc47NCykKKTmmdfh1aFwA=' 'sha256-ryup/9GePD9DBWqEdHd8MoluL367/pmDD3fbho0d9d8=' 'sha256-OLgRb8v6gU4AVmudcPDNpMIXK7o2MdvMaPBsKn/EDQ8=' https://esm.sh https://cdn.jsdelivr.net;
   style-src 'self' 'unsafe-inline';
   img-src 'self' data: blob:;
   media-src 'self' blob:;
@@ -11115,9 +11115,32 @@ const EnvelopeDispatch = {
           current.meta.member_count = current.members.length;
           await idbPut(current.wsDB, "keys", current.meta, "workspace_meta");
         }
-        // If we're the existing member (not the joiner), respond with welcome.
-        const imInviter = current.members[0].id === bytesToB64Url(State.identity.pubkey);
-        if (imInviter && env.from !== current.members[0].id) {
+        // W-J2: exactly one member answers a join, and it is the one who
+        // actually admitted the joiner.
+        //
+        // This used to be `members[0]` — whoever happened to sit first in the
+        // array, which is insertion order, which after a replay is envelope
+        // order. In a star built by the owner that is the owner by luck. It
+        // stops being the owner the moment a non-owner invites someone, and
+        // then either nobody answers the join (the joiner hangs on "Waiting…"
+        // with a live connection) or the wrong member answers with a snapshot
+        // built from a projection the joiner has no reason to trust.
+        //
+        // The admission grant already names the right member: `grant.issuer`
+        // is whoever signed the joiner in, and C2 makes the joiner accept a
+        // welcome only from the inviter it verified out of band — which is
+        // that same member. So responding on issuer is both correct and the
+        // only choice that produces exactly one responder.
+        //
+        // Fallback for a grantless join (a pre-v6 peer): the owner answers,
+        // by role rather than by array position. Still deterministic, still
+        // one responder, and no longer a coincidence.
+        const myUserId2 = canonUserId(bytesToB64Url(State.identity.pubkey));
+        const issuerId = inner.grant && typeof inner.grant.issuer === "string"
+          ? canonUserId(inner.grant.issuer)
+          : canonUserId((current.members.find(m => m.role === "owner") || current.members[0] || {}).id || "");
+        const shouldWelcome = issuerId === myUserId2 && canonUserId(env.from) !== myUserId2;
+        if (shouldWelcome) {
           await sendWelcome(current, env.from, inner.join_nonce);
           // And replay historic envelopes so the joiner sees prior messages.
           await replayHistory(current, env.from);
