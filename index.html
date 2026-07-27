@@ -20,7 +20,7 @@
      The primary XSS defence stays escapeHTML() on all rendered content. -->
 <meta http-equiv="Content-Security-Policy" content="
   default-src 'self';
-  script-src 'self' 'sha256-vfVDU8oFcqTkD0oExOyswDEc47NCykKKTmmdfh1aFwA=' 'sha256-ryup/9GePD9DBWqEdHd8MoluL367/pmDD3fbho0d9d8=' 'sha256-OLgRb8v6gU4AVmudcPDNpMIXK7o2MdvMaPBsKn/EDQ8=' https://esm.sh https://cdn.jsdelivr.net;
+  script-src 'self' 'sha256-vfVDU8oFcqTkD0oExOyswDEc47NCykKKTmmdfh1aFwA=' 'sha256-ryup/9GePD9DBWqEdHd8MoluL367/pmDD3fbho0d9d8=' 'sha256-QrzQB4lXSIHMtZIFzY7Tw6/EXpahYwB+ONaJURVhlbM=' https://esm.sh https://cdn.jsdelivr.net;
   style-src 'self' 'unsafe-inline';
   img-src 'self' data: blob:;
   media-src 'self' blob:;
@@ -16253,6 +16253,74 @@ async function importPairedIdentity(globalDB, bundle, newDeviceId) {
   return rec;
 }
 
+/**
+ * Announce a newly-paired device to a workspace that is NOT the open one.
+ *
+ * A3 made pairing transfer a usable projection for every workspace, but the
+ * announcement stayed where it always was: `sendDeviceAdd` on the *current*
+ * workspace only. So a paired device could read its other workspaces and every
+ * envelope it sent in them was rejected by peers' active-device checks — it was
+ * never added to the member's device list there. Readable but mute, which is a
+ * worse failure than plainly not having the workspace, because nothing says so.
+ *
+ * Deliberately does NOT start that workspace's transports. Starting a poller for
+ * a workspace that is not `State.current` is exactly the H7 bug: ingest drops the
+ * envelopes (they belong to a non-open workspace) while the cursor advances past
+ * them, so they are lost rather than deferred. Instead a one-shot RelayTransport
+ * is constructed and `send()` called without `start()` — a PUT with no polling.
+ *
+ * The bridge is skipped: `BridgeTransport.send` refuses until `_fpVerified`, which
+ * only `start()` sets, and starting it means polling. A bridge-only workspace
+ * therefore still needs its announcement to travel by peer when next opened —
+ * recorded as a limit rather than papered over.
+ */
+async function announceDeviceToWorkspace(wsId, newDeviceId) {
+  const wsDB = await openWorkspaceDB(wsId);
+  try {
+    const meta = await idbGet(wsDB, "keys", "workspace_meta");
+    const rootRaw = await idbGet(wsDB, "keys", "root");
+    if (!meta || !rootRaw) return false;
+    const myUserId = bytesToB64Url(State.identity.pubkey);
+    const rootKey = await Crypto.importAesRaw(rootRaw);
+    const signKey = await Crypto.importSignKey(State.identity.privkey_pkcs8);
+    const ds = await Identity.deviceSigner(State.identity);
+
+    meta.lc_counter = (meta.lc_counter || 0) + 1;
+    const env = await Envelope.build({
+      workspaceId: meta.id, channelId: null,
+      channelKey: rootKey, signKey,
+      signerPubkey: State.identity.pubkey,
+      deviceId: meta.device_id, deviceSigner: ds,
+      type: "device.add",
+      inner: { device_id: newDeviceId, ts: Date.now() },
+      vectorClock: [[myUserId, meta.lc_counter]]
+    });
+    await idbPut(wsDB, "envelopes", env);
+    await idbPut(wsDB, "keys", meta, "workspace_meta");
+
+    // Apply to our own member row here too, so this workspace's projection is
+    // correct on next open even if the envelope never reaches anyone.
+    const members = await idbGetAll(wsDB, "members");
+    const me = members.find(m => canonUserId(m.id) === canonUserId(myUserId));
+    if (me && Array.isArray(me.devices) && !me.devices.includes(newDeviceId)) {
+      me.devices.push(newDeviceId);
+      await idbPut(wsDB, "members", me);
+    }
+
+    // One-shot PUT to this workspace's relay. No start(), so no poller.
+    const cfg = (meta.relays || [])[0];
+    if (!cfg) return false;
+    const t = new RelayTransport({ url: cfg.url, token: cfg.token, workspaceId: meta.id, wsDB });
+    try { await t.send(MP.encode(env)); return true; }
+    finally { t.close(); }
+  } catch (e) {
+    console.warn("device announce failed for workspace", wsId, e);
+    return false;
+  } finally {
+    wsDB.close();
+  }
+}
+
 async function seedPairedWorkspaces(bundle) {
   const myUserId = bytesToB64Url(bundle.ed_pub);
   const seeded = [];
@@ -16503,6 +16571,13 @@ async function openDevicePairInitiatorModal(current) {
           if (!kr.ok) throw new Error(`Relay returned ${kr.status}`);
 
           await sendDeviceAdd(current, response.new_device_id);
+          // …and to every OTHER workspace we just handed over. Without this the
+          // paired device can read them and everything it sends there is
+          // rejected, because it is not in the member's device list there.
+          for (const ws of wsPayloads) {
+            if (ws.id === current.meta.id) continue;
+            await announceDeviceToWorkspace(ws.id, response.new_device_id);
+          }
           State.pairingSession = null;
 
           $card.innerHTML = `
@@ -17497,6 +17572,7 @@ if (/[?&]debug=1/.test(location.search)) {
     sendDeviceAdd, sendDeviceRevoke, handleSelfRevocation,
     openDevicePairInitiatorModal, openDevicePairJoinerModal,
     buildPairingWorkspacePayload, seedPairedWorkspaces, importPairedIdentity,
+    announceDeviceToWorkspace,
     validateInnerPayload, initials,
     // v1.2
     sendGroupDmSenderKey, draftPromotion,
