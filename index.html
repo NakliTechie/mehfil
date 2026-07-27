@@ -20,7 +20,7 @@
      The primary XSS defence stays escapeHTML() on all rendered content. -->
 <meta http-equiv="Content-Security-Policy" content="
   default-src 'self';
-  script-src 'self' 'sha256-vfVDU8oFcqTkD0oExOyswDEc47NCykKKTmmdfh1aFwA=' 'sha256-ryup/9GePD9DBWqEdHd8MoluL367/pmDD3fbho0d9d8=' 'sha256-XEeyeNCMtm5KGlT1B4cvALEZE+h6uIQ3ZBbT+eD3TFY=' https://esm.sh https://cdn.jsdelivr.net;
+  script-src 'self' 'sha256-vfVDU8oFcqTkD0oExOyswDEc47NCykKKTmmdfh1aFwA=' 'sha256-ryup/9GePD9DBWqEdHd8MoluL367/pmDD3fbho0d9d8=' 'sha256-8O/lzyH+O4+hk5n9ipV/pRxZESkSaaeJNVx2fcCg7bs=' https://esm.sh https://cdn.jsdelivr.net;
   style-src 'self' 'unsafe-inline';
   img-src 'self' data: blob:;
   media-src 'self' blob:;
@@ -2728,6 +2728,11 @@ const Workspace = {
       if (!key) continue;
       try {
         const inner = await Envelope.decrypt(env, key);
+        // M7: same shape gate as the live path. A malformed payload that was
+        // persisted before this check existed must not be able to throw the
+        // replay loop on every subsequent open — that would brick the
+        // workspace, not just drop a message.
+        if (!validateInnerPayload(env.type, inner)) continue;
         switch (env.type) {
           case "message.create": {
             // H3: apply the same announce authz the live path applies. Without
@@ -3484,6 +3489,10 @@ function teardownWorkspace(wsId) {
   try { RelayMgr.stop(wsId); } catch (e) { console.warn("teardown relay:", e); }
   try { BridgeMgr.stop(wsId); } catch (e) { console.warn("teardown bridge:", e); }
   try { PresenceDriver.stop(); } catch (e) { console.warn("teardown presence:", e); }
+  // Resync request budgets are per-peer and only meaningful while we are in a
+  // workspace with those peers. Leaving them behind would carry one
+  // workspace's throttling into the next.
+  try { ResyncResponder._rate.clear(); } catch (e) { console.warn("teardown resync rate:", e); }
 }
 
 async function openWorkspaceById(wsId) {
@@ -4652,6 +4661,68 @@ function sanitizeDisplayName(name) {
   const raw = (typeof name === "string" ? name : "").replace(/[\u0000-\u001F\u007F]/g, "").trim();
   // slice AFTER trim can leave a trailing space at the cut; trim again.
   return raw.slice(0, 60).trim() || "Member";
+}
+
+/**
+ * M7 — structural validation of a decrypted payload, before any handler
+ * touches it.
+ *
+ * Everything up to this point proves an envelope is AUTHENTIC: the signature
+ * verifies, the device cert chains, the sender is a member. None of that says
+ * the payload inside is the SHAPE the handler expects. A member (or a member's
+ * compromised device) can encrypt any msgpack it likes, and the handlers were
+ * written against the shapes our own sender produces — so `inner.body` was
+ * assumed to be a string, `inner.optionIdx` a number, `inner.profile` an
+ * object. Feed a number where a string is expected and `initials()` calls
+ * `.trim()` on it; feed an object where a string is expected and the render
+ * path throws. A throw inside dispatch is not a dropped message: it escapes
+ * before `hwm` advances, so every later envelope from that sender buffers
+ * forever — one malformed packet silently mutes a peer, permanently.
+ *
+ * This is deliberately a shape gate, not a semantic one. It answers "could a
+ * handler choke on this?", not "is this a legitimate operation?" — authz lives
+ * in the handlers and has its own findings. Unknown types pass: this file adds
+ * envelope types regularly and a validator that rejects anything it has not
+ * been taught about would break every new feature until someone remembered to
+ * update it here.
+ */
+const PAYLOAD_MAX_BYTES = 256 * 1024;
+
+/** Fields that must be a string if present, with their length caps. */
+const PAYLOAD_STRING_FIELDS = {
+  body: 16_000, name: 200, topic: 500, reason: 500, status: 64, custom: 200,
+  emoji: 64, title: 200, pronouns: 100, timezone: 100, target: 200,
+  channel_id: 200, blob_id: 200, device_id: 200, id: 200, mime: 200,
+  sdp_type: 20, kind: 40
+};
+/** Fields that must be a finite number if present. */
+const PAYLOAD_NUMBER_FIELDS = ["optionIdx", "itemIdx", "ts", "size", "seq", "total", "expires"];
+
+function validateInnerPayload(type, inner) {
+  if (inner === null || typeof inner !== "object" || Array.isArray(inner)) return false;
+  for (const [field, cap] of Object.entries(PAYLOAD_STRING_FIELDS)) {
+    const v = inner[field];
+    if (v === undefined || v === null) continue;
+    if (typeof v !== "string") return false;
+    if (v.length > cap) return false;
+  }
+  for (const field of PAYLOAD_NUMBER_FIELDS) {
+    const v = inner[field];
+    if (v === undefined || v === null) continue;
+    if (typeof v !== "number" || !Number.isFinite(v)) return false;
+  }
+  // `profile` is read as an object by the join/welcome handlers.
+  if (inner.profile !== undefined && inner.profile !== null &&
+      (typeof inner.profile !== "object" || Array.isArray(inner.profile))) return false;
+  if (inner.profile && inner.profile.name !== undefined && inner.profile.name !== null &&
+      typeof inner.profile.name !== "string") return false;
+  // Arrays that are iterated.
+  for (const field of ["mentions", "members", "signers", "devices"]) {
+    const v = inner[field];
+    if (v === undefined || v === null) continue;
+    if (!Array.isArray(v)) return false;
+  }
+  return true;
 }
 
 function composePlaceholder(channel, current) {
@@ -8203,7 +8274,12 @@ function armJoinStallHint() {
     el.innerHTML = `Still waiting. If they've already accepted, one of you may be running an
       older version of Mehfil — reload both sides on the same version and try a fresh invite.`;
     el.style.color = "var(--warn)";
-  }, 45_000);
+    // 20s, not 45s. A join that is going to work completes in a couple of
+    // seconds over a data channel; the only thing the extra 25 seconds bought
+    // was a longer stretch of a user staring at a spinner that will never
+    // resolve. The hint is advice, not an error — nothing is cancelled — so
+    // showing it early costs nothing if the join does land a moment later.
+  }, 20_000);
 }
 
 function renderJoinWaiting() {
@@ -9309,6 +9385,27 @@ const PeerMgr = {
   },
 
   /**
+   * Send one envelope to ONE peer. Used by the resync responder, which answers
+   * a specific requester and must not broadcast: fanning a resync response to
+   * the whole mesh both undoes the responder's channel-membership filter and
+   * turns a single request into an amplifier.
+   *
+   * Deliberately does not touch the SeenSet (the envelope is one we already
+   * hold and marked long ago) and does not push to relay/bridge (this is a
+   * reply to one peer, not new traffic for everyone).
+   */
+  async sendEnvelopeTo(workspaceId, env, peerUserId) {
+    const p = this.peers.get(workspaceId)?.get(peerUserId);
+    if (!p) return false;
+    const body = MP.encode(env);
+    const framed = new Uint8Array(1 + body.length);
+    framed[0] = 0x01;
+    framed.set(body, 1);
+    try { p.transport.send(framed); return true; }
+    catch (e) { console.warn("targeted send failed for peer", peerUserId, e); return false; }
+  },
+
+  /**
    * ACK is point-to-point — only send back to the peer we received
    * from. (S5: there is no `excludePeer` param on this path; a stale
    * comment referenced one. We send only to the named peer.)
@@ -9842,24 +9939,86 @@ const GapTracker = {
  *  the requester drops any envelope they already have, and
  *  applies the rest via the regular dispatch pipeline.
  *
- *  Note: we send to ALL peers, not just the requester. Other
- *  peers in the mesh may also be missing these envelopes — the
- *  rebroadcast doubles as opportunistic gossip. Their seen-set
- *  drops anything they already have.
+ *  M12 — this block used to describe two things the code did not do.
  *
- *  Privacy: we only re-send envelopes for channels the requester
- *  is in. We approximate this by checking that the envelope's
- *  channel id is one we ourselves can decrypt (i.e. we have the
- *  channel key) — but this is a weak check. A peer that's a
- *  member of channel X but not channel Y could request a counter
- *  range and indirectly observe whether the target sends to Y.
- *  Slice 5+ should add a per-channel resync ACL.
+ *  It claimed "we only re-send envelopes for channels the requester is in,
+ *  approximated by checking we can decrypt the channel ourselves". There was
+ *  no channel check of any kind: the filter was `env.from === target` plus a
+ *  counter range, so any member could ask for any member's entire history
+ *  across every channel, including private channels and DMs they were never
+ *  part of. The ciphertext is useless without the channel key, but the
+ *  metadata is not — who talks to whom, how often, in which private channel,
+ *  at what times. That is most of what a private channel is for.
+ *
+ *  It also said "we send to ALL peers, not just the requester… the rebroadcast
+ *  doubles as opportunistic gossip". That made the ACL meaningless even once
+ *  written, and turned one small request into a mesh-wide flood — a free
+ *  amplifier for anyone who wanted one.
+ *
+ *  Now: the requester must be a current member; envelopes are filtered against
+ *  the requester's actual membership of the envelope's channel; responses go
+ *  to the requester alone; and both the request rate and the response size are
+ *  bounded. Genuine gossip repair still happens — the requester rebroadcasts
+ *  what it accepts through the normal path.
  * ------------------------------------------------------------ */
+
+/** Max envelopes served for a single resync request. */
+const RESYNC_MAX_ENVELOPES = 200;
+/** Requests allowed per peer per window. */
+const RESYNC_MAX_REQUESTS = 5;
+const RESYNC_WINDOW_MS = 30_000;
 const ResyncResponder = {
+  /** peerUserId → { count, windowStart } */
+  _rate: new Map(),
+
+  /** True if this peer is within its request budget (and books the request). */
+  _allow(peerUserId) {
+    const now = Date.now();
+    const rec = this._rate.get(peerUserId);
+    if (!rec || now - rec.windowStart > RESYNC_WINDOW_MS) {
+      this._rate.set(peerUserId, { count: 1, windowStart: now });
+      return true;
+    }
+    if (rec.count >= RESYNC_MAX_REQUESTS) return false;
+    rec.count++;
+    return true;
+  },
+
+  /**
+   * May `requesterId` read envelopes sent to this channel?
+   *
+   * Public channels: any current member. Private channels, DMs and group DMs:
+   * only listed members. A channel we have no record of is refused rather than
+   * allowed — we cannot show it is safe to share, so we don't.
+   */
+  _mayRead(current, channelId, requesterId) {
+    // Workspace-level envelopes (ch === null) are encrypted to the root key,
+    // which every member holds. Nothing is revealed that membership doesn't.
+    if (!channelId) return true;
+    const ch = current.channels.find(c => c.id === channelId);
+    if (!ch) return false;
+    if (!ch.private && !ch.dm) return true;
+    const members = ch.members || [];
+    return members.some(id => canonUserId(id) === canonUserId(requesterId));
+  },
+
   async serve(workspaceId, req, requesterPeerId) {
     const current = State.current;
     if (!current || current.meta.id !== workspaceId) return;
     if (!req || !req.target || typeof req.from !== "number" || typeof req.to !== "number") return;
+    if (!requesterPeerId) return;
+
+    // The requester has to be someone we recognise. A resync request is a read
+    // of our stored history; a non-member has no claim on it.
+    const isMember = current.members.some(m => canonUserId(m.id) === canonUserId(requesterPeerId));
+    if (!isMember) {
+      console.warn("resync: refusing request from non-member", requesterPeerId);
+      return;
+    }
+    if (!this._allow(requesterPeerId)) {
+      console.warn("resync: rate limit hit for", requesterPeerId);
+      return;
+    }
 
     // Walk the envelopes store. For small stores this is fine;
     // for larger ones we'd want to use the `from` index added in
@@ -9870,6 +10029,8 @@ const ResyncResponder = {
       // Skip ephemeral types — they should never be in the store
       // anyway, but defense in depth.
       if (EPHEMERAL_TYPES.has(env.type)) return false;
+      // M12: the membership filter this file has always claimed to have.
+      if (!this._mayRead(current, env.ch, requesterPeerId)) return false;
       // Find sender's counter in lc.
       const senderEntry = (env.lc || []).find(e => Array.isArray(e) && e[0] === env.from);
       if (!senderEntry) return false;
@@ -9877,13 +10038,31 @@ const ResyncResponder = {
       return counter >= req.from && counter <= req.to;
     });
 
-    // Re-broadcast each match. PeerMgr.sendEnvelope handles
-    // SeenSet marking and avoids reflecting back to ourselves.
+    // Serve the OLDEST first. `idbGetAll` returns envelope-id order, which is
+    // random, so slicing it directly would hand back an arbitrary 200 of the
+    // range — and a requester with a gap larger than the cap could keep asking
+    // and keep getting a different arbitrary slice, never closing the gap.
+    // Ascending by counter means each request advances the requester's hwm and
+    // the next one starts further along.
+    const counterOf = (env) => {
+      const e = (env.lc || []).find(x => Array.isArray(x) && x[0] === env.from);
+      return e ? e[1] : 0;
+    };
+    matches.sort((a, b) => counterOf(a) - counterOf(b));
+    if (matches.length > RESYNC_MAX_ENVELOPES) {
+      console.warn(`resync: serving ${RESYNC_MAX_ENVELOPES} of ${matches.length} matches to ${requesterPeerId} — ask again for the rest`);
+      matches.length = RESYNC_MAX_ENVELOPES;
+    }
+
+    // Answer the requester, not the whole mesh. Broadcasting here would undo
+    // the filter above (everyone gets the envelope regardless of channel
+    // membership) and turn one request into a flood. If other peers are also
+    // missing these, the requester's own rebroadcast on accept covers it.
     for (const env of matches) {
       try {
-        await PeerMgr.sendEnvelope(workspaceId, env);
+        await PeerMgr.sendEnvelopeTo(workspaceId, env, requesterPeerId);
       } catch (e) {
-        console.warn("resync re-broadcast failed for", env.id, e);
+        console.warn("resync re-send failed for", env.id, e);
       }
     }
   }
@@ -10573,6 +10752,13 @@ const EnvelopeDispatch = {
   },
 
   async handle(current, env, inner) {
+    // M7: shape gate. An authentic envelope can still carry a payload no
+    // handler was written for; a throw in here escapes before hwm advances and
+    // strands every later envelope from this sender.
+    if (!validateInnerPayload(env.type, inner)) {
+      console.warn("Dropping envelope with a malformed payload:", env.type, env.id);
+      return;
+    }
     switch (env.type) {
       case "poll.vote": {
         const pollMsg = current.messages.find(m => m.id === inner.target);
@@ -15233,7 +15419,13 @@ function sanitizeUrl(url) {
   return url;
 }
 function initials(name) {
-  return (name || "?").trim().split(/\s+/).slice(0,2).map(w => w[0] || "").join("").toUpperCase() || "?";
+  // M7 belt-and-braces: `typeof` rather than truthiness. A non-string name
+  // (a number, or a null-prototype map from MP.decode) has no .trim and threw
+  // here — inside a render path, which takes the whole view down rather than
+  // degrading one avatar. The payload gate upstream should stop this reaching
+  // us, but a render helper has no business throwing whatever it is handed.
+  const s = typeof name === "string" ? name : "";
+  return s.trim().split(/\s+/).slice(0,2).map(w => w[0] || "").join("").toUpperCase() || "?";
 }
 // Synchronous fingerprint formatter for places where we already have the
 // 16 fp bytes (e.g. the join-verify screen, where they come from the invite
@@ -15473,6 +15665,21 @@ class RelayTransport {
     const wsId = this.workspaceId;
     const known = await SeenSet.has(wsId, env.id);
     if (known) return;
+
+    // H1, relay half: verify BEFORE marking seen, dispatching or rebroadcasting.
+    //
+    // H1 closed this on the WebRTC path but not here, and until Batch D the
+    // relay carried no traffic so it did not matter. It does now. The attack is
+    // the same one: PUT a forged envelope carrying the id of a genuine envelope
+    // that has not been delivered yet, and that id is burned — every peer that
+    // polls the relay marks it seen and gossips it onward, so when the real
+    // envelope arrives it is dropped as a duplicate, mesh-wide. The relay is a
+    // better position for it than a data channel: the attacker needs only the
+    // relay URL and token, not a WebRTC session with anybody.
+    if (!(await Envelope.verify(env))) {
+      console.warn("Relay: dropping unverified envelope at ingest (not marked seen, not relayed):", env.id);
+      return;
+    }
     await SeenSet.add(wsId, env.id);
 
     // Dispatch locally — updates state, persists to IDB, re-renders.
@@ -15899,6 +16106,177 @@ async function joinWorkspaceFromBundle(bundle, relayUrl, relayToken) {
  * Initiator side (Device A — has the identity).
  * Called from Settings → Devices → + Pair a new device.
  */
+/**
+ * SB5 — collect everything a newly-paired device needs to actually USE a
+ * workspace, for one workspace.
+ *
+ * Pairing used to hand over the identity keys, the root key and the general
+ * channel key for the *current* workspace only, then say "it will sync
+ * workspace history via the relay." It does not. `Workspace.open` reads the
+ * `channels` and `members` object stores directly — replay augments them, it
+ * does not create them — so a device seeded with keys alone opens a workspace
+ * with no channels and no members. `State.currentChannel` then names a channel
+ * that isn't in the list, and the first send dereferences `ch.dm` on undefined
+ * and throws. Every other workspace on the old device simply didn't exist on
+ * the new one.
+ *
+ * So transfer the projection, not just the keys: channel and member records,
+ * and every channel key (private channels were undecryptable with only the
+ * general key). Messages are deliberately NOT included — they are the bulk of
+ * a workspace, they are recoverable from peers and the relay, and the relay's
+ * pairing slot is not a history-transfer channel.
+ *
+ * `wsDB` is opened here when the workspace isn't the open one; the caller is
+ * responsible for nothing — we close what we opened.
+ */
+async function buildPairingWorkspacePayload(wsId, newDeviceId, current) {
+  const isCurrent = current && current.meta && current.meta.id === wsId;
+  const wsDB = isCurrent ? current.wsDB : await openWorkspaceDB(wsId);
+  try {
+    const meta = await idbGet(wsDB, "keys", "workspace_meta");
+    if (!meta) return null;
+    const rootRaw = await idbGet(wsDB, "keys", "root");
+    if (!rootRaw) return null;
+    const channels = isCurrent ? current.channels : await idbGetAll(wsDB, "channels");
+    const members  = isCurrent ? current.members  : await idbGetAll(wsDB, "members");
+
+    // Every key in the keys store that is a channel key or a group-DM sender
+    // key. Keyed exactly as Workspace.open expects to find them again.
+    const channelKeys = {};
+    const allKeys = await new Promise((res, rej) => {
+      const tx = wsDB.transaction("keys", "readonly");
+      const req = tx.objectStore("keys").getAllKeys();
+      req.onsuccess = () => res(req.result || []);
+      req.onerror = () => rej(req.error);
+    });
+    for (const k of allKeys) {
+      if (typeof k !== "string") continue;
+      if (!k.startsWith("ch:") && !k.startsWith("sk:")) continue;
+      const raw = await idbGet(wsDB, "keys", k);
+      if (raw) channelKeys[k] = raw;
+    }
+
+    return {
+      id:                  meta.id,
+      name:                meta.name,
+      root_key:            rootRaw,
+      general_channel_id:  meta.general_channel_id,
+      general_channel_key: channelKeys["ch:" + meta.general_channel_id] || null,
+      relays:              meta.relays || [],
+      bridges:             meta.bridges || [],
+      channel_keys:        channelKeys,
+      // Strip the in-memory-only fingerprint fields attachFingerprint adds —
+      // they are derived from `id` and msgpack can't carry them meaningfully.
+      channels:            channels.map(c => ({ ...c })),
+      members:             members.map(({ fp, fpBytes, ...m }) => m),
+      new_device_id:       newDeviceId
+    };
+  } finally {
+    if (!isCurrent) wsDB.close();
+  }
+}
+
+/**
+ * SB5, receiving half — seed every workspace in a pairing bundle into local
+ * IndexedDB so `Workspace.open` finds a usable projection.
+ *
+ * Extracted from the joiner modal's poll callback so it can be driven by the
+ * harness: the bug it fixes is only observable by opening a seeded workspace
+ * and sending in it, and a closure inside a `setInterval` inside a modal
+ * cannot be tested. Returns the ids it seeded.
+ */
+/**
+ * SB5, identity half — import a paired identity WITH a working device key.
+ *
+ * The pairing joiner used to save `{pubkey, privkey_pkcs8, x25519_*}` and stop
+ * there. Since C5 every envelope is signed by a per-device key whose cert
+ * chains to the identity key, and `Identity.deviceSigner` reads
+ * `device_privkey_pkcs8` off the identity record — which pairing never set. So
+ * the first send on a newly-paired device threw "Key data must be a
+ * BufferSource" out of `importSignKey(undefined)`. Nothing lazily minted one
+ * either: the migration that does that lives in `Identity.ensure`, and pairing
+ * calls `Identity.save` directly.
+ *
+ * The second half of the same bug: `new_device_id` is minted by the joiner as
+ * 8 random bytes when it posts its response — before it has the identity key,
+ * so before it can certify anything. That id is what the initiator announces
+ * in `device.add` and what lands in the member's active-device list. If the
+ * device later minted a cert with its own fresh id (which `genDeviceCert`
+ * does), `env.dev` would not match the announced id and every peer would
+ * reject its envelopes. So certify THAT id, not a new one.
+ */
+async function importPairedIdentity(globalDB, bundle, newDeviceId) {
+  const kp = await Crypto.genIdentity();          // this device's own keypair
+  const ts = Date.now();
+  const identityB64 = bytesToB64Url(bundle.ed_pub);
+  const identitySignKey = await Crypto.importSignKey(bundle.ed_pkcs8);
+  const sig = await Crypto.sign(
+    identitySignKey,
+    Crypto.deviceCertBytes(identityB64, newDeviceId, kp.pubkey, ts)
+  );
+  const rec = {
+    pubkey:               bundle.ed_pub,
+    privkey_pkcs8:        bundle.ed_pkcs8,
+    x25519_pub:           bundle.x_pub,
+    x25519_priv_pkcs8:    bundle.x_pkcs8,
+    device_id:            newDeviceId,
+    device_pub:           kp.pubkey,
+    device_privkey_pkcs8: kp.privkey_pkcs8,
+    device_cert:          { device_id: newDeviceId, device_pub: kp.pubkey, ts, sig },
+    created_at:           Date.now(),
+    backed_up:            true
+  };
+  await Identity.save(globalDB, rec);
+  return rec;
+}
+
+async function seedPairedWorkspaces(bundle) {
+  const myUserId = bytesToB64Url(bundle.ed_pub);
+  const seeded = [];
+  for (const ws of (bundle.workspaces || [])) {
+    if (await idbGet(State.globalDB, "workspaces", ws.id)) continue;
+    const wsDB = await openWorkspaceDB(ws.id);
+    await idbPut(wsDB, "keys", {
+      id:                 ws.id,
+      name:               ws.name,
+      general_channel_id: ws.general_channel_id,
+      device_id:          ws.new_device_id,
+      relays:             ws.relays || [],
+      bridges:            ws.bridges || [],
+      created_at:         Date.now()
+    }, "workspace_meta");
+    await idbPut(wsDB, "keys", ws.root_key, "root");
+
+    // All channel keys (and group-DM sender keys), stored under the exact keys
+    // Workspace.open looks them up by. Falls back to the old two-key shape so a
+    // device paired from an older build still gets the general channel.
+    const keyMap = { ...(ws.channel_keys || {}) };
+    if (Object.keys(keyMap).length === 0 && ws.general_channel_key) {
+      keyMap["ch:" + ws.general_channel_id] = ws.general_channel_key;
+    }
+    for (const [k, raw] of Object.entries(keyMap)) {
+      if (raw) await idbPut(wsDB, "keys", raw, k);
+    }
+
+    for (const ch of (ws.channels || [])) await idbPut(wsDB, "channels", ch);
+    for (const m of (ws.members || [])) {
+      // Our own row must list this device, or our first envelope in this
+      // workspace is rejected by every peer's active-device check.
+      if (m.id === myUserId && Array.isArray(m.devices) && !m.devices.includes(ws.new_device_id)) {
+        m.devices = [...m.devices, ws.new_device_id];
+      }
+      await idbPut(wsDB, "members", m);
+    }
+
+    await idbPut(State.globalDB, "workspaces", {
+      id: ws.id, name: ws.name, created_at: Date.now(), last_opened_at: Date.now()
+    });
+    wsDB.close();
+    seeded.push(ws.id);
+  }
+  return seeded;
+}
+
 async function openDevicePairInitiatorModal(current) {
   const relay = (current.relays || [])[0];
   if (!relay) { alert("Add a relay first (Settings → Workspace → Relays)."); return; }
@@ -16028,9 +16406,55 @@ async function openDevicePairInitiatorModal(current) {
           const pubKey  = await Crypto.importX25519Pub(b64ToBytes(response.ephem_x_pub_B));
           const kek     = await Crypto.deriveX25519AesKey(privKey, pubKey);
 
-          const rootRaw = await idbGet(current.wsDB, "keys", "root");
-          const gchRaw  = await idbGet(current.wsDB, "keys", "ch:" + current.meta.general_channel_id);
-          const me      = current.members.find(m => m.id === bytesToB64Url(State.identity.pubkey));
+          const me = current.members.find(m => m.id === bytesToB64Url(State.identity.pubkey));
+
+          // SB5: every workspace this identity has, with its full projection —
+          // not just the open one with two keys. A device paired from inside
+          // workspace X used to come up knowing nothing about workspaces Y and
+          // Z, which is not "your identity on a second device", it is a
+          // different account that happens to share a key.
+          const registered = await idbGetAll(State.globalDB, "workspaces");
+          // Most-recently-opened first, and the open one first of all, so if we
+          // have to shed projections below it is the workspaces the user
+          // touches least that lose theirs.
+          registered.sort((a, b) => {
+            if (a.id === current.meta.id) return -1;
+            if (b.id === current.meta.id) return 1;
+            return (b.last_opened_at || 0) - (a.last_opened_at || 0);
+          });
+          const wsPayloads = [];
+          for (const reg of registered) {
+            try {
+              const payload = await buildPairingWorkspacePayload(reg.id, response.new_device_id, current);
+              if (payload) wsPayloads.push(payload);
+            } catch (e) {
+              console.warn("pairing: skipping workspace", reg.id, e);
+            }
+          }
+
+          // The relay's pairing slot caps payloads at 64KB, and this bundle is
+          // now linear in workspace count — so a user with several large
+          // workspaces could push it over and get a flat 413, failing pairing
+          // entirely. That would be a worse outcome than the bug being fixed.
+          // Shed projections (not keys) from the tail until it fits: a
+          // workspace that loses its projection still pairs with its keys, the
+          // pre-fix behaviour, and can be re-synced from peers. Keys are small
+          // and are what make a workspace recoverable at all, so they always
+          // travel. Budget is under the cap to leave room for the AES + base64
+          // expansion the payload undergoes before it is posted.
+          const PAIRING_PAYLOAD_BUDGET = 40 * 1024;
+          const shed = [];
+          for (let i = wsPayloads.length - 1; i >= 0; i--) {
+            if (MP.encode({ workspaces: wsPayloads }).length <= PAIRING_PAYLOAD_BUDGET) break;
+            const ws = wsPayloads[i];
+            if (!ws.channels?.length && !ws.members?.length) continue; // already bare
+            shed.push(ws.name);
+            ws.channels = [];
+            ws.members = [];
+          }
+          if (shed.length) {
+            console.warn("pairing: bundle too large — sent keys only (no projection) for:", shed.join(", "));
+          }
 
           const keyBundle = MP.encode({
             ed_pkcs8:      State.identity.privkey_pkcs8,
@@ -16038,15 +16462,7 @@ async function openDevicePairInitiatorModal(current) {
             ed_pub:        State.identity.pubkey,
             x_pub:         State.identity.x25519_pub,
             identity_name: me?.name || "",
-            workspaces:    [{
-              id:                  current.meta.id,
-              name:                current.meta.name,
-              root_key:            rootRaw,
-              general_channel_id:  current.meta.general_channel_id,
-              general_channel_key: gchRaw,
-              relays:              current.relays || [],
-              new_device_id:       response.new_device_id
-            }]
+            workspaces:    wsPayloads
           });
 
           const { iv, ct } = await Crypto.aesEncrypt(kek, keyBundle);
@@ -16239,36 +16655,14 @@ function openDevicePairJoinerModal() {
           const bundle  = MP.decode(pt);
 
           // Import identity.
-          const importedIdentity = {
-            pubkey:            bundle.ed_pub,
-            privkey_pkcs8:     bundle.ed_pkcs8,
-            x25519_pub:        bundle.x_pub,
-            x25519_priv_pkcs8: bundle.x_pkcs8,
-            created_at:        Date.now(),
-            backed_up:         true
-          };
-          await Identity.save(State.globalDB, importedIdentity);
-          State.identity = importedIdentity;
+          // Mint + self-certify this device's signing key against the identity
+          // key we just received, using the device id we already announced.
+          State.identity = await importPairedIdentity(
+            State.globalDB, bundle, State.pairingSession.new_device_id
+          );
 
           // Seed workspace(s).
-          for (const ws of (bundle.workspaces || [])) {
-            if (await idbGet(State.globalDB, "workspaces", ws.id)) continue;
-            const wsDB = await openWorkspaceDB(ws.id);
-            await idbPut(wsDB, "keys", {
-              id:                 ws.id,
-              name:               ws.name,
-              general_channel_id: ws.general_channel_id,
-              device_id:          ws.new_device_id,
-              relays:             ws.relays || [],
-              created_at:         Date.now()
-            }, "workspace_meta");
-            await idbPut(wsDB, "keys", ws.root_key,            "root");
-            await idbPut(wsDB, "keys", ws.general_channel_key, "ch:" + ws.general_channel_id);
-            await idbPut(State.globalDB, "workspaces", {
-              id: ws.id, name: ws.name, created_at: Date.now(), last_opened_at: Date.now()
-            });
-            wsDB.close();
-          }
+          await seedPairedWorkspaces(bundle);
 
           State.pairingSession = null;
           wrap.remove();
@@ -16454,12 +16848,19 @@ class BridgeTransport {
       const env   = MP.decode(bytes);
       if (!env?.id) return;
       if (await SeenSet.has(this.workspaceId, env.id)) return;
+      // H1, bridge half: verify BEFORE marking seen, dispatching or
+      // rebroadcasting — same reasoning as the relay path above. On a LAN the
+      // bridge is the easier target of the two: anyone who can reach the
+      // bridge's port can PUT, and the fingerprint pinning authenticates the
+      // bridge to us, not the envelope's author to anybody.
+      if (!(await Envelope.verify(env))) {
+        console.warn("[BridgeTransport] dropping unverified envelope at ingest (not marked seen, not relayed):", env.id);
+        return;
+      }
       await SeenSet.add(this.workspaceId, env.id);
       // H4: receive is (workspaceId, env) — the args were reversed, so every
       // bridge envelope was treated as belonging to a non-open workspace and
       // dropped. Serialize the gossip rebroadcast after receive resolves.
-      // (Gating gossip on *acceptance* is H1/Batch D — receive signals drops
-      // by returning, not throwing, so it isn't gated here.)
       try {
         await EnvelopeDispatch.receive(this.workspaceId, env);
       } catch (e) {
@@ -17072,6 +17473,8 @@ if (/[?&]debug=1/.test(location.search)) {
     // v1.1
     sendDeviceAdd, sendDeviceRevoke, handleSelfRevocation,
     openDevicePairInitiatorModal, openDevicePairJoinerModal,
+    buildPairingWorkspacePayload, seedPairedWorkspaces, importPairedIdentity,
+    validateInnerPayload, initials,
     // v1.2
     sendGroupDmSenderKey, draftPromotion,
     get Y() { return Y; },

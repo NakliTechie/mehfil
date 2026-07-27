@@ -49,7 +49,17 @@
 // The bump matters more than usual anyway — until BOTH ends run v8, the sender
 // may push to the relay while the receiver still fast-forwards past it, so the
 // fix only takes effect once each side has converged.
-const CACHE_NAME = "mehfil-shell-v8";
+// v9: 2026-07-27 autopilot. A1 — the relay and bridge ingest paths verified
+// envelopes only AFTER marking them seen, so a forged envelope pushed to either
+// could suppress a genuine one mesh-wide (the H1 hole, on the two paths H1 did
+// not cover). A3/SB5 — a paired device now receives a usable projection for
+// every workspace and a device key it can actually sign with. A4/M12 — the
+// resync responder enforces the channel ACL its comment always claimed, answers
+// point-to-point instead of broadcasting, and is rate-bounded. A5/M7 — payload
+// shape is validated before any handler runs. NOT a wire break: the envelope
+// format is unchanged and v8/v9 verify each other in both directions. Bumped so
+// the fixes reach cached users, not to force convergence.
+const CACHE_NAME = "mehfil-shell-v9";
 const PRECACHE = [
   "./",
   "./index.html",

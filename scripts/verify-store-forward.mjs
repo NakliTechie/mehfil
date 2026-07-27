@@ -359,6 +359,111 @@ async function main() {
         `an empty first attach is still recorded, so the next start resumes instead of fast-forwarding past the first backlog (got ${JSON.stringify(r6.rec)})`);
     }
 
+    log('[7] H1 (relay half) — a forged envelope must not burn a real id');
+    const r7 = await page.evaluate(async () => {
+      const M = window.__mehfil, cur = M.State.current, meta = cur.meta;
+      // Point the workspace back at the working relay.
+      cur.relays = [{ url: location.origin, token: '' }];
+      // A real member composes a genuine envelope that has NOT been delivered.
+      const other = await M.Crypto.genIdentity();
+      const otherX = await M.Crypto.genX25519();
+      const cert = await M.Crypto.genDeviceCert(other.pubkey, other.privkey_pkcs8);
+      const otherId = M.bytesToB64Url(other.pubkey);
+      cur.members.push({
+        id: otherId, name: 'H1 Sender', role: 'member',
+        devices: [cert.device_id], joined_at: Date.now(), x25519_pub: otherX.x25519_pub
+      });
+      const ds = {
+        signKey: await M.Crypto.importSignKey(cert.device_privkey_pkcs8),
+        cert: cert.device_cert, deviceId: cert.device_id
+      };
+      const genuine = await M.Envelope.build({
+        workspaceId: meta.id, channelId: meta.general_channel_id,
+        channelKey: cur.channelKeys[meta.general_channel_id],
+        signKey: await M.Crypto.importSignKey(other.privkey_pkcs8),
+        signerPubkey: other.pubkey, deviceId: cert.device_id, deviceSigner: ds,
+        type: 'message.create',
+        inner: { body: 'the genuine message an attacker wants suppressed', ts: Date.now() },
+        vectorClock: [[otherId, 1]]
+      });
+      // The forgery: same envelope id (id is SHA256(from|ts|nonce), so keeping
+      // from/ts/n keeps it valid), but the ciphertext is tampered with, so the
+      // device signature over the envelope no longer verifies.
+      const forged = M.MP.decode(M.MP.encode(genuine));
+      forged.ct = new Uint8Array(genuine.ct.length).fill(0x41);
+      return {
+        sameId: forged.id === genuine.id,
+        forgedVerifies: await M.Envelope.verify(forged),
+        genuineVerifies: await M.Envelope.verify(genuine),
+        forgedB64: M.bytesToB64(M.MP.encode(forged)),
+        genuineB64: M.bytesToB64(M.MP.encode(genuine)),
+        id: genuine.id
+      };
+    });
+    check(r7.sameId === true, 'the forgery carries the genuine envelope\'s id');
+    check(r7.forgedVerifies === false, 'the forgery does not verify (it is a forgery)');
+    check(r7.genuineVerifies === true, 'the genuine envelope verifies');
+
+    // Attacker PUTs the forgery to the relay first. Only the relay URL and
+    // token are needed for this — no WebRTC session with anyone.
+    relay.inject(wsId, r7.forgedB64);
+    await page.evaluate(() => window.__mehfil.RelayMgr.startForWorkspace(window.__mehfil.State.current));
+    await sleep(2500);
+    const burned = await page.evaluate((id) => window.__mehfil.SeenSet.has(window.__mehfil.State.current.meta.id, id), r7.id);
+    check(burned === false, 'the forged envelope did NOT mark the id as seen (no mesh-wide suppression)');
+
+    // Now the genuine envelope arrives. It must still be delivered.
+    relay.inject(wsId, r7.genuineB64);
+    await sleep(6000);
+    const gotGenuine = await page.evaluate(() =>
+      (window.__mehfil.State.current.messages || []).some(m => String(m.body || '').startsWith('the genuine message')));
+    check(gotGenuine === true, 'the genuine message was still delivered after the forgery attempt');
+
+    // Bridge half. Standing up a real bridge needs a Go daemon and a
+    // fingerprint-confirmation modal, so this drives BridgeTransport._ingest
+    // directly — still the real method on a real instance, just without the
+    // HTTP hop, which is not what is under test here.
+    const r7b = await page.evaluate(async () => {
+      const M = window.__mehfil, cur = M.State.current, meta = cur.meta;
+      const other = await M.Crypto.genIdentity();
+      const otherX = await M.Crypto.genX25519();
+      const cert = await M.Crypto.genDeviceCert(other.pubkey, other.privkey_pkcs8);
+      const otherId = M.bytesToB64Url(other.pubkey);
+      cur.members.push({
+        id: otherId, name: 'Bridge Sender', role: 'member',
+        devices: [cert.device_id], joined_at: Date.now(), x25519_pub: otherX.x25519_pub
+      });
+      const ds = {
+        signKey: await M.Crypto.importSignKey(cert.device_privkey_pkcs8),
+        cert: cert.device_cert, deviceId: cert.device_id
+      };
+      const genuine = await M.Envelope.build({
+        workspaceId: meta.id, channelId: meta.general_channel_id,
+        channelKey: cur.channelKeys[meta.general_channel_id],
+        signKey: await M.Crypto.importSignKey(other.privkey_pkcs8),
+        signerPubkey: other.pubkey, deviceId: cert.device_id, deviceSigner: ds,
+        type: 'message.create',
+        inner: { body: 'bridge genuine message', ts: Date.now() },
+        vectorClock: [[otherId, 1]]
+      });
+      const forged = M.MP.decode(M.MP.encode(genuine));
+      forged.ct = new Uint8Array(genuine.ct.length).fill(0x41);
+
+      const bt = new M.BridgeTransport({
+        url: location.origin, pinnedFp: 'x', workspaceId: meta.id, wsDB: cur.wsDB,
+        onFpConfirm: async () => true, onFpMismatch: () => {}
+      });
+      await bt._ingest({ data: M.bytesToB64(M.MP.encode(forged)) });
+      const burned = await M.SeenSet.has(meta.id, genuine.id);
+      await bt._ingest({ data: M.bytesToB64(M.MP.encode(genuine)) });
+      const delivered = (cur.messages || []).some(m => String(m.body || '') === 'bridge genuine message');
+      bt.close();
+      return { burned, delivered };
+    });
+    check(r7b.burned === false, 'bridge: the forged envelope did NOT mark the id as seen');
+    check(r7b.delivered === true, 'bridge: the genuine message was still delivered after the forgery');
+
+
     log('\n=== console errors ===');
     log('  ' + (errs.length ? errs.join(' | ') : '(none)'));
   } catch (e) {
