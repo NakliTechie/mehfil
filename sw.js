@@ -59,7 +59,19 @@
 // shape is validated before any handler runs. NOT a wire break: the envelope
 // format is unchanged and v8/v9 verify each other in both directions. Bumped so
 // the fixes reach cached users, not to force convergence.
-const CACHE_NAME = "mehfil-shell-v9";
+// v10: second 2026-07-27 run. W-J2 — a join went unanswered whenever a
+// non-owner invited, so the joiner hung on "Waiting…" forever. device.add now
+// reaches every workspace a paired device was given, not just the open one.
+// Huddles work for the first time: every huddle envelope was throwing
+// ReferenceError on arrival, and the second person to join never saw the first.
+// F2 — a removal rotates only the channels the removed member could actually
+// read, keyed on creator as well as membership.
+//
+// NOT a wire break. `huddle.join` gains an optional `reply` flag, and older
+// shells ignore unknown inner fields — but the question is moot: every shell
+// before this one threw on any huddle envelope, so there is no working
+// mixed-version huddle to break. Everything else is receiver-side.
+const CACHE_NAME = "mehfil-shell-v10";
 const PRECACHE = [
   "./",
   "./index.html",
