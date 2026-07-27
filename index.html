@@ -20,7 +20,7 @@
      The primary XSS defence stays escapeHTML() on all rendered content. -->
 <meta http-equiv="Content-Security-Policy" content="
   default-src 'self';
-  script-src 'self' 'sha256-vfVDU8oFcqTkD0oExOyswDEc47NCykKKTmmdfh1aFwA=' 'sha256-ryup/9GePD9DBWqEdHd8MoluL367/pmDD3fbho0d9d8=' 'sha256-QrzQB4lXSIHMtZIFzY7Tw6/EXpahYwB+ONaJURVhlbM=' https://esm.sh https://cdn.jsdelivr.net;
+  script-src 'self' 'sha256-vfVDU8oFcqTkD0oExOyswDEc47NCykKKTmmdfh1aFwA=' 'sha256-ryup/9GePD9DBWqEdHd8MoluL367/pmDD3fbho0d9d8=' 'sha256-MD8PX/gv2iZZZtQloFrC201vMI5HCz2bMIAI8Cu+Ffc=' https://esm.sh https://cdn.jsdelivr.net;
   style-src 'self' 'unsafe-inline';
   img-src 'self' data: blob:;
   media-src 'self' blob:;
@@ -11869,16 +11869,24 @@ const EnvelopeDispatch = {
         break;
       }
 
+      // All three read `current.meta.id`, not `workspaceId`. This function is
+      // `handle(current, env, inner)` — there has never been a `workspaceId` in
+      // scope here, so every one of these threw ReferenceError the moment a
+      // huddle envelope arrived. Huddles therefore did not work at all: SB2
+      // fixed the *sending* side (a never-assigned sign key) and this is the
+      // matching break on the *receiving* side, which SB2 could not have
+      // surfaced because nothing ever got far enough to be received.
+      // Found by writing the end-to-end test, not by reading the code.
       case "huddle.join":
-        await HuddleMgr.onJoin(workspaceId, env);
+        await HuddleMgr.onJoin(current.meta.id, env, inner);
         break;
 
       case "huddle.leave":
-        HuddleMgr.onLeave(workspaceId, env);
+        HuddleMgr.onLeave(current.meta.id, env);
         break;
 
       case "huddle.signal":
-        await HuddleMgr.onSignal(workspaceId, env, inner);
+        await HuddleMgr.onSignal(current.meta.id, env, inner);
         break;
 
       case "signal.relay":
@@ -17414,7 +17422,7 @@ const HuddleMgr = (() => {
     // ── Dispatch hooks ─────────────────────────────────────
 
     /** Called when a huddle.join envelope arrives from another peer. */
-    async onJoin(wsId, env) {
+    async onJoin(wsId, env, inner) {
       // Only act if we're already in the huddle for this workspace.
       if (_ws !== wsId) return;
       const current = State.current;
@@ -17429,7 +17437,26 @@ const HuddleMgr = (() => {
         _participants.push({ id: member.id, name: member.name });
       }
 
-      // We are the offerer — create and send an offer
+      // Tell the newcomer we are here.
+      //
+      // `huddle.join` is a one-shot announcement, so it only informs people who
+      // were ALREADY in the huddle when it was sent. The second person to join
+      // therefore never learned about the first: media still came up (the
+      // existing participant offers on hearing the join, so audio flows) but
+      // the newcomer's participant list showed only themselves. You could hear
+      // someone the UI said was not there.
+      //
+      // So answer a join with our own announcement. `reply: true` marks it as
+      // an answer rather than a fresh arrival, and we never reply to a reply —
+      // otherwise every join would ping-pong around the huddle forever.
+      if (!(inner && inner.reply)) {
+        await _sendEnvelope(wsId, "huddle.join", { reply: true });
+      }
+
+      // We are the offerer — create and send an offer. Only the original
+      // announcement triggers this; a reply must not, or both sides would
+      // offer and glare.
+      if (inner && inner.reply) { render(); return; }
       const pc    = _getOrCreatePc(wsId, peerId);
       const offer = await pc.createOffer();
       await pc.setLocalDescription(offer);

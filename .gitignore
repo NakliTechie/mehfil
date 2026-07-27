@@ -35,6 +35,7 @@
 !scripts/verify-pairing.mjs
 !scripts/verify-resync.mjs
 !scripts/verify-invite-chain.mjs
+!scripts/verify-huddle.mjs
 !scripts/csp-hash.mjs
 !scripts/scale-test-aws.sh
 !scripts/package.json
