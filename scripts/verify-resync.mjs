@@ -280,6 +280,76 @@ async function main() {
     check(r5.malformedDropped, 'the malformed message never entered the projection');
     check(r5.followUpDelivered, "the sender's next message still arrives (regression guard; also true pre-fix)");
 
+    log('[6] F2 — removal rotates only what the removed member could read');
+    // The saving is only legitimate if it changes nothing about who is cut off.
+    // So assert BOTH halves: private channels they were never in keep their key
+    // (the saving), and every channel they COULD read gets a new one (the point).
+    const r6 = await page.evaluate(async (s) => {
+      const M = window.__mehfil, cur = M.State.current;
+      // Channels: general (public), 'inner-circle' (private, victim IN),
+      // 'not-theirs' (private, victim OUT).
+      const me = M.bytesToB64Url(M.State.identity.pubkey);
+      const victimId = s.outsider;   // already a workspace member from setup
+      const inCh = await M.sendChannelCreate(cur, 'victim-was-here', '', { isPrivate: true, memberIds: [me, victimId] });
+      const outCh = await M.sendChannelCreate(cur, 'not-theirs', '', { isPrivate: true, memberIds: [me] });
+      await new Promise(r => setTimeout(r, 500));
+
+      const keyOf = async (id) => {
+        const raw = await M.idbGet(cur.wsDB, 'keys', 'ch:' + id);
+        return raw ? M.bytesToB64(raw) : null;
+      };
+      const before = {
+        general: await keyOf(cur.meta.general_channel_id),
+        inCh: await keyOf(inCh.id),
+        outCh: await keyOf(outCh.id)
+      };
+      await M.sendMemberRemove(cur, victimId);
+      await new Promise(r => setTimeout(r, 800));
+      const after = {
+        general: await keyOf(cur.meta.general_channel_id),
+        inCh: await keyOf(inCh.id),
+        outCh: await keyOf(outCh.id)
+      };
+      return { before, after };
+    }, setup);
+    check(r6.before.general !== r6.after.general,
+      'the PUBLIC channel key rotated — the removed member held it');
+    check(r6.before.inCh !== r6.after.inCh,
+      'the private channel they WERE in rotated — they held that key too');
+    check(r6.before.outCh === r6.after.outCh,
+      'the private channel they were NEVER in did NOT rotate — that is the saving, and it cuts off nobody');
+
+    // The attack the optimisation opens if it trusts ch.members alone: the
+    // channel.create handler accepts a private channel whose members list omits
+    // the sender, and the sender generated the key, so they hold it. If removal
+    // skipped that channel they would keep reading it — making removal WEAKER
+    // than before the optimisation. Rotation must key on the creator too.
+    const r6b = await page.evaluate(async (s) => {
+      const M = window.__mehfil, cur = M.State.current;
+      const victimId = s.insider;
+      // A channel the victim CREATED but is not listed in.
+      const planted = {
+        id: 'planted-' + M.bytesToB64Url(M.Crypto.rand(6)),
+        name: 'backdoor', topic: '', private: true, dm: false, dm_with: null,
+        announce: false, canvas: false,
+        members: [M.bytesToB64Url(M.State.identity.pubkey)],  // victim omitted
+        created_by: victimId,                                  // but they made it
+        created_at: Date.now()
+      };
+      cur.channels.push(planted);
+      await M.idbPut(cur.wsDB, 'channels', planted);
+      const raw = M.Crypto.rand(32);
+      await M.idbPut(cur.wsDB, 'keys', raw, 'ch:' + planted.id);
+      cur.channelKeys[planted.id] = await M.Crypto.importAesRaw(raw);
+      const before = M.bytesToB64(await M.idbGet(cur.wsDB, 'keys', 'ch:' + planted.id));
+      await M.sendMemberRemove(cur, victimId);
+      await new Promise(r => setTimeout(r, 800));
+      const after = M.bytesToB64(await M.idbGet(cur.wsDB, 'keys', 'ch:' + planted.id));
+      return { rotated: before !== after };
+    }, setup);
+    check(r6b.rotated === true,
+      'a private channel the removed member CREATED but is not listed in still rotates — members[] alone is attacker-controllable');
+
     log('\n=== console errors ===');
     log('  ' + (errs.length ? errs.join(' | ') : '(none)'));
   } catch (e) {

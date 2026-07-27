@@ -30,12 +30,18 @@ const CAPTIONS = {
   '15-settings-devices': ['Settings · Devices', 'Pair additional devices to the same identity, and revoke ones you’ve lost.'],
   '16-settings-workspace': ['Settings · Workspace', 'Notifications and DND, relay/bridge transports for store-and-forward, and workspace-level options.'],
   '17-settings-admin': ['Settings · Admin', 'Member management, promote-by-consensus, and named user groups you can @mention.'],
+  '18-two-person-conversation': ['A real conversation', 'Two people, two devices, one mesh. Priya joined by scanning a QR with no internet involved; her messages arrive over the peer connection and land under the unread divider.'],
+  '19-thread-panel': ['Threads', 'Replies fold into a side panel instead of burying the channel. The parent message keeps a reply count so nothing gets lost.'],
+  '20-poll': ['Polls', 'Ask the room. Votes travel as ordinary encrypted envelopes, so a poll works on an offline mesh exactly like a message does — this tally came from the second device.'],
+  '21-canvas': ['Canvas channels', 'A channel that is a shared whiteboard rather than a message list, backed by the same CRDT that keeps everything else in sync.'],
+  '22-huddle-active': ['Huddles', 'Drop into live audio in a channel. Peer-to-peer like everything else, with mute, screen share and leave in the bar — no dial-in, no bridge, no account.'],
 };
 
 const SECTIONS = [
   ['Getting started', 'Open Mehfil and you’re one click from a working, encrypted workspace — no account, no server, no install.', ['01-landing', '02-how-it-works', '04-create-workspace', '05-workspace-firstrun']],
   ['Connect your team — offline', 'Mehfil’s signature: get a group talking on one WiFi or a phone hotspot with no internet at all. Invite by link or QR; peers self-organize into a mesh that survives the host leaving.', ['10-invite-offline', '03-join-by-scanning']],
-  ['Messaging', 'Channels, threads, reactions, code, slash commands — the daily-driver surface.', ['06-workspace-populated', '07-message-reactions', '08-slash-autocomplete', '09-create-channel']],
+  ['Messaging', 'Channels, threads, reactions, code, slash commands — the daily-driver surface.', ['06-workspace-populated', '18-two-person-conversation', '07-message-reactions', '19-thread-panel', '08-slash-autocomplete', '09-create-channel']],
+  ['Working together', 'The surfaces that need more than one person: decide something, sketch something, or just talk.', ['20-poll', '21-canvas', '22-huddle-active']],
   ['Find & navigate', 'Keyboard-first movement across everything you’ve got.', ['11-search', '12-quick-switcher', '13-shortcuts']],
   ['Settings & admin', 'Identity, devices, transports, and running a workspace.', ['14-settings-identity', '15-settings-devices', '16-settings-workspace', '17-settings-admin']],
 ];

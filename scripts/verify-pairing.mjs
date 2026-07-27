@@ -305,6 +305,57 @@ async function main() {
     check(shedResult.firstKeptProjection === true, 'the current workspace kept its full projection');
     check(shedResult.allKeptKeys === true, 'every workspace kept its keys — none becomes unrecoverable');
 
+    log('[5] The paired device is announced to EVERY workspace, not just the open one');
+    // A3 transfers projections for all workspaces; without this the announcement
+    // only ever went to the current one, so the paired device could READ its other
+    // workspaces while everything it SENT there was rejected by peers'
+    // active-device checks. Readable but mute — a worse failure than not having
+    // the workspace, because nothing tells you.
+    const announce = await A.evaluate(async () => {
+      const M = window.__mehfil;
+      if (typeof M.announceDeviceToWorkspace !== 'function') return { unsupported: true };
+      const regs = await M.idbGetAll(M.State.globalDB, 'workspaces');
+      const other = regs.find(r => r.id !== M.State.current.meta.id);
+      if (!other) return { noOther: true };
+      const newDeviceId = M.bytesToB64Url(M.Crypto.rand(8));
+      const me = M.bytesToB64Url(M.State.identity.pubkey);
+
+      // Before: is that device known in the OTHER workspace?
+      const db1 = await M.openWorkspaceDB(other.id);
+      const before = (await M.idbGetAll(db1, 'members'))
+        .find(m => m.id === me)?.devices?.includes(newDeviceId) || false;
+      const envsBefore = (await M.idbGetAll(db1, 'envelopes')).length;
+      db1.close();
+
+      await M.announceDeviceToWorkspace(other.id, newDeviceId);
+
+      const db2 = await M.openWorkspaceDB(other.id);
+      const memRow = (await M.idbGetAll(db2, 'members')).find(m => m.id === me);
+      const envs = await M.idbGetAll(db2, 'envelopes');
+      const added = envs.filter(e => e.type === 'device.add');
+      let announced = false, verifies = false;
+      if (added.length) {
+        const env = added[added.length - 1];
+        verifies = await M.Envelope.verify(env);
+        const inner = await M.Envelope.decrypt(env, await M.Crypto.importAesRaw(await M.idbGet(db2, 'keys', 'root')));
+        announced = inner && inner.device_id === newDeviceId;
+      }
+      const after = memRow?.devices?.includes(newDeviceId) || false;
+      db2.close();
+      return { before, after, announced, verifies, grew: envs.length > envsBefore };
+    });
+    if (announce.unsupported) {
+      check(false, 'announceDeviceToWorkspace exists (pre-fix build has no multi-workspace announce)');
+    } else if (announce.noOther) {
+      check(false, 'precondition: a second workspace exists to announce into');
+    } else {
+      check(announce.before === false, 'precondition: the device was NOT known in the other workspace');
+      check(announce.grew === true, 'a device.add envelope was written to the other workspace');
+      check(announce.announced === true, 'that envelope announces the right device id');
+      check(announce.verifies === true, 'and it verifies — peers will accept it');
+      check(announce.after === true, "the other workspace's own member row now lists the device");
+    }
+
     log('\n=== console errors ===');
     log('  ' + (errs.length ? errs.join(' | ') : '(none)'));
   } catch (e) {

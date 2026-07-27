@@ -20,7 +20,7 @@
      The primary XSS defence stays escapeHTML() on all rendered content. -->
 <meta http-equiv="Content-Security-Policy" content="
   default-src 'self';
-  script-src 'self' 'sha256-vfVDU8oFcqTkD0oExOyswDEc47NCykKKTmmdfh1aFwA=' 'sha256-ryup/9GePD9DBWqEdHd8MoluL367/pmDD3fbho0d9d8=' 'sha256-8O/lzyH+O4+hk5n9ipV/pRxZESkSaaeJNVx2fcCg7bs=' https://esm.sh https://cdn.jsdelivr.net;
+  script-src 'self' 'sha256-vfVDU8oFcqTkD0oExOyswDEc47NCykKKTmmdfh1aFwA=' 'sha256-ryup/9GePD9DBWqEdHd8MoluL367/pmDD3fbho0d9d8=' 'sha256-4yNpJtI/bDJ5zFohZ/IOw0oU0D0ThBWODeot2P92q/A=' https://esm.sh https://cdn.jsdelivr.net;
   style-src 'self' 'unsafe-inline';
   img-src 'self' data: blob:;
   media-src 'self' blob:;
@@ -2893,6 +2893,11 @@ const Workspace = {
               announce: announceReplay,
               canvas: !!inner.canvas && !inner.private,
               members: inner.members || [],
+              // F2: who created it. A private channel's key goes to everyone in
+              // `members` — AND to whoever generated it, who need not be listed.
+              // Removal-time rotation has to know that, or a member who created
+              // a channel excluding themselves keeps reading it after removal.
+              created_by: env.from,
               created_at: env.ts
             };
             channels.push(chRec);
@@ -11042,6 +11047,7 @@ const EnvelopeDispatch = {
           announce: announceVerified,
           canvas: !!inner.canvas && !inner.private,  // Slice CV1 — public-only
           members: inner.members || [],
+          created_by: env.from,   // F2 — see the replay path
           created_at: env.ts
         };
         current.channels.push(chRec);
@@ -11115,9 +11121,32 @@ const EnvelopeDispatch = {
           current.meta.member_count = current.members.length;
           await idbPut(current.wsDB, "keys", current.meta, "workspace_meta");
         }
-        // If we're the existing member (not the joiner), respond with welcome.
-        const imInviter = current.members[0].id === bytesToB64Url(State.identity.pubkey);
-        if (imInviter && env.from !== current.members[0].id) {
+        // W-J2: exactly one member answers a join, and it is the one who
+        // actually admitted the joiner.
+        //
+        // This used to be `members[0]` — whoever happened to sit first in the
+        // array, which is insertion order, which after a replay is envelope
+        // order. In a star built by the owner that is the owner by luck. It
+        // stops being the owner the moment a non-owner invites someone, and
+        // then either nobody answers the join (the joiner hangs on "Waiting…"
+        // with a live connection) or the wrong member answers with a snapshot
+        // built from a projection the joiner has no reason to trust.
+        //
+        // The admission grant already names the right member: `grant.issuer`
+        // is whoever signed the joiner in, and C2 makes the joiner accept a
+        // welcome only from the inviter it verified out of band — which is
+        // that same member. So responding on issuer is both correct and the
+        // only choice that produces exactly one responder.
+        //
+        // Fallback for a grantless join (a pre-v6 peer): the owner answers,
+        // by role rather than by array position. Still deterministic, still
+        // one responder, and no longer a coincidence.
+        const myUserId2 = canonUserId(bytesToB64Url(State.identity.pubkey));
+        const issuerId = inner.grant && typeof inner.grant.issuer === "string"
+          ? canonUserId(inner.grant.issuer)
+          : canonUserId((current.members.find(m => m.role === "owner") || current.members[0] || {}).id || "");
+        const shouldWelcome = issuerId === myUserId2 && canonUserId(env.from) !== myUserId2;
+        if (shouldWelcome) {
           await sendWelcome(current, env.from, inner.join_nonce);
           // And replay historic envelopes so the joiner sees prior messages.
           await replayHistory(current, env.from);
@@ -11846,16 +11875,24 @@ const EnvelopeDispatch = {
         break;
       }
 
+      // All three read `current.meta.id`, not `workspaceId`. This function is
+      // `handle(current, env, inner)` — there has never been a `workspaceId` in
+      // scope here, so every one of these threw ReferenceError the moment a
+      // huddle envelope arrived. Huddles therefore did not work at all: SB2
+      // fixed the *sending* side (a never-assigned sign key) and this is the
+      // matching break on the *receiving* side, which SB2 could not have
+      // surfaced because nothing ever got far enough to be received.
+      // Found by writing the end-to-end test, not by reading the code.
       case "huddle.join":
-        await HuddleMgr.onJoin(workspaceId, env);
+        await HuddleMgr.onJoin(current.meta.id, env, inner);
         break;
 
       case "huddle.leave":
-        HuddleMgr.onLeave(workspaceId, env);
+        HuddleMgr.onLeave(current.meta.id, env);
         break;
 
       case "huddle.signal":
-        await HuddleMgr.onSignal(workspaceId, env, inner);
+        await HuddleMgr.onSignal(current.meta.id, env, inner);
         break;
 
       case "signal.relay":
@@ -12158,7 +12195,9 @@ async function sendChannelCreate(current, name, topic, { isPrivate = false, isDm
     private: isPrivate, dm: isDm, dm_with: null,
     announce: !!isAnnounce,
     canvas: !!isCanvas,   // Slice CV1
-    members: chosenMembers, created_at: env.ts
+    members: chosenMembers,
+    created_by: bytesToB64Url(State.identity.pubkey),   // F2 — see the replay path
+    created_at: env.ts
   };
   current.channels.push(chRec);
   await idbPut(current.wsDB, "channels", chRec);
@@ -14730,8 +14769,49 @@ async function sendMemberRemove(current, removedUserId) {
   current.rootKey = newRootKey;
 
   // 3. Rekey channels.
+  //
+  // F2: only the channels the removed member could actually READ. This loop
+  // used to rotate every non-DM channel in the workspace, including private
+  // channels they were never a member of — where they never held the key, so
+  // the rotation protects nothing and costs a fresh key plus an X25519 wrap for
+  // every remaining member. On a workspace with many private channels that is
+  // most of the work of a removal, done for no reason.
+  //
+  // Public channels always rotate: the removed member held those keys.
+  // Private channels rotate only if they were in them.
+  //
+  // This is the half of F2 with no security cost. The other half — coalescing
+  // several removals into one rotation — is parked, deliberately: it means a
+  // removed member keeps read access for the length of the coalescing window,
+  // which is a security-timing decision and not one to make unattended. See
+  // plan/pending.md.
+  // "Could the removed member possibly hold this channel's key?"
+  //
+  // They hold it if they were given it — which means being in `ch.members`,
+  // since that is what `wrapped_keys` is built from — OR if they generated it,
+  // which the creator does regardless of whether they list themselves.
+  //
+  // That second case is not hypothetical: the channel.create handler accepts a
+  // private channel whose `members` omits the sender, so a member on a modified
+  // client can plant a channel they are not listed in, keep the key, and — if
+  // the rotation trusted `members` alone — keep reading it after removal. The
+  // optimisation would then have made removal *weaker* than before it. Found by
+  // the checker, not by me.
+  //
+  // Channels created before `created_by` existed have no creator recorded. Those
+  // rotate, unconditionally: an unknown creator is not evidence of safety. The
+  // saving applies to channels created from here on, and grows as they turn over.
+  const removedWasIn = (ch) => {
+    if (!ch.private) return true;                       // public: they had the key
+    if (!ch.created_by) return true;                    // unknown creator: assume the worst
+    if (canonUserId(ch.created_by) === canonUserId(removedUserId)) return true;
+    return (ch.members || []).some(id => canonUserId(id) === canonUserId(removedUserId));
+  };
+
+  let skippedChannels = 0;
   for (const ch of current.channels) {
     if (ch.dm) continue;  // DM keys are bilateral; can't rekey without the other party
+    if (!removedWasIn(ch)) { skippedChannels++; continue; }
     const newChKey = await Crypto.genAesKey();
     const newChRaw = await Crypto.exportAesRaw(newChKey);
 
@@ -14760,6 +14840,9 @@ async function sendMemberRemove(current, removedUserId) {
     current.channelKeys[ch.id] = newChKey;
   }
 
+  if (skippedChannels > 0) {
+    console.info(`member.remove: skipped rotating ${skippedChannels} private channel(s) the removed member was never in`);
+  }
   await idbPut(current.wsDB, "keys", meta, "workspace_meta");
   current.meta.member_count = current.members.length;
 }
@@ -16230,6 +16313,74 @@ async function importPairedIdentity(globalDB, bundle, newDeviceId) {
   return rec;
 }
 
+/**
+ * Announce a newly-paired device to a workspace that is NOT the open one.
+ *
+ * A3 made pairing transfer a usable projection for every workspace, but the
+ * announcement stayed where it always was: `sendDeviceAdd` on the *current*
+ * workspace only. So a paired device could read its other workspaces and every
+ * envelope it sent in them was rejected by peers' active-device checks — it was
+ * never added to the member's device list there. Readable but mute, which is a
+ * worse failure than plainly not having the workspace, because nothing says so.
+ *
+ * Deliberately does NOT start that workspace's transports. Starting a poller for
+ * a workspace that is not `State.current` is exactly the H7 bug: ingest drops the
+ * envelopes (they belong to a non-open workspace) while the cursor advances past
+ * them, so they are lost rather than deferred. Instead a one-shot RelayTransport
+ * is constructed and `send()` called without `start()` — a PUT with no polling.
+ *
+ * The bridge is skipped: `BridgeTransport.send` refuses until `_fpVerified`, which
+ * only `start()` sets, and starting it means polling. A bridge-only workspace
+ * therefore still needs its announcement to travel by peer when next opened —
+ * recorded as a limit rather than papered over.
+ */
+async function announceDeviceToWorkspace(wsId, newDeviceId) {
+  const wsDB = await openWorkspaceDB(wsId);
+  try {
+    const meta = await idbGet(wsDB, "keys", "workspace_meta");
+    const rootRaw = await idbGet(wsDB, "keys", "root");
+    if (!meta || !rootRaw) return false;
+    const myUserId = bytesToB64Url(State.identity.pubkey);
+    const rootKey = await Crypto.importAesRaw(rootRaw);
+    const signKey = await Crypto.importSignKey(State.identity.privkey_pkcs8);
+    const ds = await Identity.deviceSigner(State.identity);
+
+    meta.lc_counter = (meta.lc_counter || 0) + 1;
+    const env = await Envelope.build({
+      workspaceId: meta.id, channelId: null,
+      channelKey: rootKey, signKey,
+      signerPubkey: State.identity.pubkey,
+      deviceId: meta.device_id, deviceSigner: ds,
+      type: "device.add",
+      inner: { device_id: newDeviceId, ts: Date.now() },
+      vectorClock: [[myUserId, meta.lc_counter]]
+    });
+    await idbPut(wsDB, "envelopes", env);
+    await idbPut(wsDB, "keys", meta, "workspace_meta");
+
+    // Apply to our own member row here too, so this workspace's projection is
+    // correct on next open even if the envelope never reaches anyone.
+    const members = await idbGetAll(wsDB, "members");
+    const me = members.find(m => canonUserId(m.id) === canonUserId(myUserId));
+    if (me && Array.isArray(me.devices) && !me.devices.includes(newDeviceId)) {
+      me.devices.push(newDeviceId);
+      await idbPut(wsDB, "members", me);
+    }
+
+    // One-shot PUT to this workspace's relay. No start(), so no poller.
+    const cfg = (meta.relays || [])[0];
+    if (!cfg) return false;
+    const t = new RelayTransport({ url: cfg.url, token: cfg.token, workspaceId: meta.id, wsDB });
+    try { await t.send(MP.encode(env)); return true; }
+    finally { t.close(); }
+  } catch (e) {
+    console.warn("device announce failed for workspace", wsId, e);
+    return false;
+  } finally {
+    wsDB.close();
+  }
+}
+
 async function seedPairedWorkspaces(bundle) {
   const myUserId = bytesToB64Url(bundle.ed_pub);
   const seeded = [];
@@ -16480,6 +16631,13 @@ async function openDevicePairInitiatorModal(current) {
           if (!kr.ok) throw new Error(`Relay returned ${kr.status}`);
 
           await sendDeviceAdd(current, response.new_device_id);
+          // …and to every OTHER workspace we just handed over. Without this the
+          // paired device can read them and everything it sends there is
+          // rejected, because it is not in the member's device list there.
+          for (const ws of wsPayloads) {
+            if (ws.id === current.meta.id) continue;
+            await announceDeviceToWorkspace(ws.id, response.new_device_id);
+          }
           State.pairingSession = null;
 
           $card.innerHTML = `
@@ -17316,7 +17474,7 @@ const HuddleMgr = (() => {
     // ── Dispatch hooks ─────────────────────────────────────
 
     /** Called when a huddle.join envelope arrives from another peer. */
-    async onJoin(wsId, env) {
+    async onJoin(wsId, env, inner) {
       // Only act if we're already in the huddle for this workspace.
       if (_ws !== wsId) return;
       const current = State.current;
@@ -17331,7 +17489,26 @@ const HuddleMgr = (() => {
         _participants.push({ id: member.id, name: member.name });
       }
 
-      // We are the offerer — create and send an offer
+      // Tell the newcomer we are here.
+      //
+      // `huddle.join` is a one-shot announcement, so it only informs people who
+      // were ALREADY in the huddle when it was sent. The second person to join
+      // therefore never learned about the first: media still came up (the
+      // existing participant offers on hearing the join, so audio flows) but
+      // the newcomer's participant list showed only themselves. You could hear
+      // someone the UI said was not there.
+      //
+      // So answer a join with our own announcement. `reply: true` marks it as
+      // an answer rather than a fresh arrival, and we never reply to a reply —
+      // otherwise every join would ping-pong around the huddle forever.
+      if (!(inner && inner.reply)) {
+        await _sendEnvelope(wsId, "huddle.join", { reply: true });
+      }
+
+      // We are the offerer — create and send an offer. Only the original
+      // announcement triggers this; a reply must not, or both sides would
+      // offer and glare.
+      if (inner && inner.reply) { render(); return; }
       const pc    = _getOrCreatePc(wsId, peerId);
       const offer = await pc.createOffer();
       await pc.setLocalDescription(offer);
@@ -17474,6 +17651,7 @@ if (/[?&]debug=1/.test(location.search)) {
     sendDeviceAdd, sendDeviceRevoke, handleSelfRevocation,
     openDevicePairInitiatorModal, openDevicePairJoinerModal,
     buildPairingWorkspacePayload, seedPairedWorkspaces, importPairedIdentity,
+    announceDeviceToWorkspace,
     validateInnerPayload, initials,
     // v1.2
     sendGroupDmSenderKey, draftPromotion,
