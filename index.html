@@ -20,7 +20,7 @@
      The primary XSS defence stays escapeHTML() on all rendered content. -->
 <meta http-equiv="Content-Security-Policy" content="
   default-src 'self';
-  script-src 'self' 'sha256-vfVDU8oFcqTkD0oExOyswDEc47NCykKKTmmdfh1aFwA=' 'sha256-ryup/9GePD9DBWqEdHd8MoluL367/pmDD3fbho0d9d8=' 'sha256-MD8PX/gv2iZZZtQloFrC201vMI5HCz2bMIAI8Cu+Ffc=' https://esm.sh https://cdn.jsdelivr.net;
+  script-src 'self' 'sha256-vfVDU8oFcqTkD0oExOyswDEc47NCykKKTmmdfh1aFwA=' 'sha256-ryup/9GePD9DBWqEdHd8MoluL367/pmDD3fbho0d9d8=' 'sha256-k5+N4xV92gcGWGfXPo0SEOeO7BjH+h1fXlofYxnErT4=' https://esm.sh https://cdn.jsdelivr.net;
   style-src 'self' 'unsafe-inline';
   img-src 'self' data: blob:;
   media-src 'self' blob:;
@@ -14761,8 +14761,29 @@ async function sendMemberRemove(current, removedUserId) {
   current.rootKey = newRootKey;
 
   // 3. Rekey channels.
+  //
+  // F2: only the channels the removed member could actually READ. This loop
+  // used to rotate every non-DM channel in the workspace, including private
+  // channels they were never a member of — where they never held the key, so
+  // the rotation protects nothing and costs a fresh key plus an X25519 wrap for
+  // every remaining member. On a workspace with many private channels that is
+  // most of the work of a removal, done for no reason.
+  //
+  // Public channels always rotate: the removed member held those keys.
+  // Private channels rotate only if they were in them.
+  //
+  // This is the half of F2 with no security cost. The other half — coalescing
+  // several removals into one rotation — is parked, deliberately: it means a
+  // removed member keeps read access for the length of the coalescing window,
+  // which is a security-timing decision and not one to make unattended. See
+  // plan/pending.md.
+  const removedWasIn = (ch) =>
+    !ch.private || (ch.members || []).some(id => canonUserId(id) === canonUserId(removedUserId));
+
+  let skippedChannels = 0;
   for (const ch of current.channels) {
     if (ch.dm) continue;  // DM keys are bilateral; can't rekey without the other party
+    if (!removedWasIn(ch)) { skippedChannels++; continue; }
     const newChKey = await Crypto.genAesKey();
     const newChRaw = await Crypto.exportAesRaw(newChKey);
 
@@ -14791,6 +14812,9 @@ async function sendMemberRemove(current, removedUserId) {
     current.channelKeys[ch.id] = newChKey;
   }
 
+  if (skippedChannels > 0) {
+    console.info(`member.remove: skipped rotating ${skippedChannels} private channel(s) the removed member was never in`);
+  }
   await idbPut(current.wsDB, "keys", meta, "workspace_meta");
   current.meta.member_count = current.members.length;
 }
